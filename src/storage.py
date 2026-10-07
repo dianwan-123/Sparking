@@ -107,6 +107,17 @@ class Storage:
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
+    async def _begin_write(self, db: aiosqlite.Connection) -> None:
+        """开一个写事务（调用方必须已持有 self._write_lock）。
+
+        防御：若上一个路径在异常分支漏了收尾、连接上还挂着事务，先回滚掉——
+        否则后面每一次写都会以 "cannot start a transaction within a transaction"
+        连环失败（实录：用户日志里 ingest_message 整条炸穿，消息直接不入库）。
+        """
+        if getattr(db, "in_transaction", False):
+            await db.rollback()
+        await db.execute("BEGIN IMMEDIATE")
+
     def _conn(self) -> aiosqlite.Connection:
         if self.db is None:
             raise RuntimeError("storage is not open")
@@ -119,7 +130,7 @@ class Storage:
         if current_version > SCHEMA_VERSION:
             raise RuntimeError(f"database schema {current_version} is newer than supported {SCHEMA_VERSION}")
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
@@ -389,7 +400,7 @@ class Storage:
         payload_hash = hashlib.sha256(payload.encode()).hexdigest()
         key = dedupe_key or _event_dedupe_key(message, payload_hash)
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 scope_id = await self._ensure_scope(message.platform, message.account_id, message.conversation_id)
                 existing = await self._fetchone("SELECT event_id FROM event_headers WHERE scope_id=? AND dedupe_key=?", (scope_id, key))
@@ -602,7 +613,7 @@ class Storage:
         db, summary_id, now = self._conn(), uuid.uuid4().hex, utc_now()
         data = manifest or {"messages": message_ids, "summaries": input_summary_ids}
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 await db.execute("INSERT INTO summary_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, _json(list(topics)), _json(data), model, prompt_version, "active", now))
                 await db.executemany("INSERT INTO summary_inputs(summary_id,input_message_id) VALUES(?,?)", [(summary_id, item) for item in message_ids])
@@ -637,19 +648,22 @@ class Storage:
             return 0
         db = self._conn()
         now = utc_now()
-        await db.execute("BEGIN IMMEDIATE")
-        try:
-            for topic in cleaned:
-                await db.execute(
-                    "INSERT INTO group_topics(topic_id,scope_id,title,hits,last_seq,"
-                    "created_at) VALUES(?,?,?,1,?,?) "
-                    "ON CONFLICT(scope_id,title) DO UPDATE SET hits=group_topics.hits+1, "
-                    "last_seq=excluded.last_seq",
-                    (uuid.uuid4().hex, scope_id, topic, int(last_seq), now))
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
+        # 必须持写锁：否则和 ingest/压缩并发时，两边各自 BEGIN IMMEDIATE 会互相踩
+        # （实录：'cannot start a transaction within a transaction'）
+        async with self._write_lock:
+            await self._begin_write(db)
+            try:
+                for topic in cleaned:
+                    await db.execute(
+                        "INSERT INTO group_topics(topic_id,scope_id,title,hits,last_seq,"
+                        "created_at) VALUES(?,?,?,1,?,?) "
+                        "ON CONFLICT(scope_id,title) DO UPDATE SET hits=group_topics.hits+1, "
+                        "last_seq=excluded.last_seq",
+                        (uuid.uuid4().hex, scope_id, topic, int(last_seq), now))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
         return len(cleaned)
 
     async def list_summaries(self, scope_id: str | Sequence[str], limit: int = 8, levels: Sequence[int] | None = None, query: str | None = None) -> list[SummaryRecord]:
@@ -1170,7 +1184,7 @@ class Storage:
         media = await self._fetchall("SELECT path FROM stickers")
         async with self._write_lock:
             db = self._conn()
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 await db.execute("DELETE FROM scopes")
                 await db.execute("DELETE FROM stickers")
@@ -1201,7 +1215,7 @@ class Storage:
         db = self._conn()
         media_paths: list[str] = []
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 for owner_scope, ids in by_scope.items():
                     marks = ",".join("?" for _ in ids)
@@ -1306,7 +1320,7 @@ class Storage:
             clauses.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
             args.extend(kinds)
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await self._begin_write(db)
             try:
                 row = await self._fetchone("SELECT * FROM jobs WHERE " + " AND ".join(clauses) + " ORDER BY created_at LIMIT 1", args)
                 if row is None:
