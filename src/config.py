@@ -135,7 +135,7 @@ class PluginConfig:
             catalog_limit=_int(d.get("catalog_limit"), 24, 5, 100),
             summary_limit=_int(d.get("summary_limit"), 14, 1, 40),
             evidence_limit=_int(d.get("evidence_limit"), 12, 1, 50),
-            context_char_budget=_int(d.get("context_char_budget"), 24000, 4000, 120000),
+            context_char_budget=_int(d.get("context_char_budget"), 16000, 4000, 120000),
             compression_batch_size=_int(d.get("compression_batch_size"), 40, 10, 200),
             autonomous_sample_rate=_float(d.get("autonomous_sample_rate"), 0.35, 0, 1),
             batch_window_min_seconds=bw_min,

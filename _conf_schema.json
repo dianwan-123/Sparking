@@ -68,8 +68,8 @@
   },
   "context_char_budget": {
     "type": "int",
-    "description": "动态记忆最大字符预算",
-    "default": 24000
+    "description": "动态记忆最大字符预算（默认 16000：够用又省 token；调大更聪明但更贵）",
+    "default": 16000
   },
   "compression_batch_size": {
     "type": "int",

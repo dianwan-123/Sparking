@@ -103,6 +103,8 @@ class MediaArchive:
         self._ready = False
 
     async def open(self) -> "MediaArchive":
+        if self._ready and self._db is not None:
+            return self                      # 幂等：重复调用不该开第二个连接
         self.root.mkdir(parents=True, exist_ok=True)
         import aiosqlite
 
@@ -127,6 +129,24 @@ class MediaArchive:
             await self._db.close()
             self._db = None
             self._ready = False
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self._ready and self._db is not None)
+
+    async def ensure_open(self) -> None:
+        """按需重开。
+
+        实录（用户日志）：插件重载后，上一实例里仍在跑的 agent 工具循环继续调本插件的
+        工具，而它持有的归档连接已被 terminate 关掉 → 连环 `media archive is not open`
+        （看图/发图/媒体列表全废，bot 看起来像傻了）。真正要用连接前自动重开一次，
+        幂等且走已有的锁，代价极小。
+        """
+        if self.is_open:
+            return
+        async with self._lock:
+            if not self.is_open:
+                await self.open()
 
     def _conn(self) -> Any:
         if not self._ready or self._db is None:
@@ -303,6 +323,7 @@ class MediaArchive:
                                      source_message_id=source_message_id, mime=_magic_mime(data), note=url)
 
     async def recent(self, scope_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        await self.ensure_open()
         limit = min(max(int(limit), 1), 100)
         if scope_id:
             cursor = await self._conn().execute(
@@ -356,6 +377,7 @@ class MediaArchive:
             return removed
 
     async def get_path(self, item_id: str) -> str:
+        await self.ensure_open()
         cursor = await self._conn().execute(
             "SELECT path,status FROM media WHERE item_id=?", (item_id,))
         row = await cursor.fetchone()
@@ -373,6 +395,7 @@ class MediaArchive:
         return str(path)
 
     async def find_by_message(self, scope_id: str, message_id: str, kind: str | None = None) -> list[ArchiveRecord]:
+        await self.ensure_open()
         cursor = await self._conn().execute(
             "SELECT * FROM media WHERE scope_id=? AND source_message_id=? ORDER BY created_at ASC",
             (scope_id, message_id),
@@ -394,6 +417,7 @@ class MediaArchive:
 
     async def get_base64(self, item_id: str) -> tuple[str, str]:
         """Return (mime, base64) for a saved item."""
+        await self.ensure_open()
         path = await self.get_path(item_id)
         cursor = await self._conn().execute("SELECT mime FROM media WHERE item_id=?", (item_id,))
         row = await cursor.fetchone()

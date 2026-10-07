@@ -1118,6 +1118,14 @@ class LongMemoryAgentPlugin(Star):
         return fallback
 
     @staticmethod
+    def _looks_like_prompt_blocked(error: BaseException) -> bool:
+        """模型侧内容审核拦截：重试也不会通过，必须立刻停。"""
+        text = str(error).lower()
+        return ("prompt_blocked" in text or "prohibited_content" in text
+                or "content_filter" in text or "内容审核" in text
+                or "request blocked by model service" in text)
+
+    @staticmethod
     def _looks_like_provider_missing(error: Exception) -> bool:
         """上游通道已删除/未注册/凭据失效类错误——重试同模型没有意义。"""
         text = str(error).lower()
@@ -1234,6 +1242,14 @@ class LongMemoryAgentPlugin(Star):
                 ) from None
             except Exception as error:
                 last_error = error
+                # 内容审核拦截（400 prompt_blocked / PROHIBITED_CONTENT）：重试毫无意义，
+                # 只会连着烧 5 轮 token（实录：同一条被拦 3 次以上）。直接放弃这一轮。
+                if self._looks_like_prompt_blocked(error):
+                    logger.warning(
+                        "长程记忆：请求被模型侧内容审核拦截，本轮不再重试：%s",
+                        str(error)[:160],
+                    )
+                    raise RuntimeError(f"内容审核拦截：{str(error)[:120]}") from error
                 # 上游已删/未注册的模型（实录 "Provider catapi/xxx not found" 烧满
                 # 5 次重试）：拉黑 + 立刻换候选模型重试
                 if self._looks_like_provider_missing(error):
@@ -4115,20 +4131,29 @@ class LongMemoryAgentPlugin(Star):
         tools = list(getattr(tool_set, "tools", []) or [])
         if not tools:
             return ""
+        # 省 token：清单只留"名字 + 一句话"，并设总长上限。
+        # 实录：清单越滚越长（AstrBot 内置 + 各插件 + 拓展），每轮都重复灌进上下文，
+        # 模型反而抓不住重点、还挤掉了记忆与任务说明。
         lines: list[str] = []
+        budget = 1600
+        used = 0
         for tool in tools[:60]:
             name = str(getattr(tool, "name", "") or "")
             if not name:
                 continue
             description = str(getattr(tool, "description", "") or "").strip()
-            description = re.sub(r"\s+", " ", description)[:80]
-            lines.append(f"- {name}：{description}" if description else f"- {name}")
+            description = re.sub(r"\s+", " ", description)[:42]
+            line = f"- {name}：{description}" if description else f"- {name}"
+            if used + len(line) > budget:
+                break
+            used += len(line)
+            lines.append(line)
         # 已装自定义拓展（HTTP 工具经 extension_call 调用）
         if self._extensions is not None:
             pairs = self._extensions.dynamic_tools()
             if pairs:
                 lines.append("【已装拓展（用 extension_call 调用）】")
-                for extension, tool in pairs[:12]:
+                for extension, tool in pairs[:6]:
                     lines.append(
                         f"- {extension.id}.{tool.name}：{tool.description[:60]}"
                     )
@@ -4136,7 +4161,7 @@ class LongMemoryAgentPlugin(Star):
         script_tools = self._script_manager().tool_catalog()
         if script_tools:
             lines.append("【scripts 拓展工具（用 script_call(script, tool, params_json) 调用）】")
-            for row in script_tools[:16]:
+            for row in script_tools[:8]:
                 params = "、".join(
                     f"{key}:{value}" for key, value in
                     (row.get("params") or {}).items()) if row.get("params") else "无参数"
@@ -4147,9 +4172,9 @@ class LongMemoryAgentPlugin(Star):
         if not lines:
             return ""
         return (
-            "【可用工具清单（本回合真实可调用，来自 AstrBot 内置与已装插件）】\n"
+            "【可用工具（本回合真实可调用；名字+一句话）】\n"
             + "\n".join(lines)
-            + "\n需要这些能力时直接发起真正的工具调用，不要在文本里描述调用。"
+            + "\n需要细节用 find_tools(query) 查；要用就直接发起调用，别在文本里描述调用。"
         )
 
     # ---------------------------------------------------- 媒体段直发（bot 自主选择）
@@ -4186,6 +4211,14 @@ class LongMemoryAgentPlugin(Star):
             return ""
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
+            # 相对路径不只认插件 workspace：AstrBot 自带工具写进 data/workspaces/… 的文件
+            # 也要找得到（实录：run_script("pelican_gif.py") 报"脚本不存在"、其实在别处）
+            try:
+                found = self._workspace().resolve_existing(candidate)
+                if found.is_file():
+                    return str(found)
+            except Exception:
+                pass
             candidate = self._workspace().root / candidate
         try:
             candidate = candidate.resolve()
@@ -8898,6 +8931,9 @@ class LongMemoryAgentPlugin(Star):
         Args:
             url(string): 要打开的网址；留空则刷新当前页面。
         """
+        remembered = self._nav_failure_note(str(url or "").strip())
+        if remembered:
+            return f"这个站点刚试过、打不开（{remembered}）。别再换工具重试同一站点。"
         driver = self._pw_driver()
         try:
             if str(url or "").strip():
@@ -8965,6 +9001,11 @@ class LongMemoryAgentPlugin(Star):
         if not self.media:
             return "媒体归档未启用，无法保存截图"
         target = str(url or "").strip()
+        if target:
+            remembered = self._nav_failure_note(target)
+            if remembered:
+                return (f"这个站点刚试过、打不开（{remembered}）。别再换工具重试同一站点——"
+                        "要么换一个能打开的网址，要么直接告诉用户这个站这边访问不了。")
         driver = self._pw_driver()
         if not target:
             # screenshot the CURRENT page (no navigation) — used to re-check after
@@ -8997,7 +9038,59 @@ class LongMemoryAgentPlugin(Star):
         if nav_error:
             logger.info("长程记忆：浏览器实时导航失败(%s)，已用抓取的HTML降级渲染 %s",
                         nav_error, target)
+            self._remember_nav_failure(target, nav_error)
+        elif len(png) < 8000:
+            # 降级渲染的空白页：抓回来的 HTML 是个 JS 壳（bilibili 这类），渲染出来啥也没有
+            logger.info("长程记忆：截图疑似空白（%d 字节），提示模型别当内容用", len(png))
+            return compact_json({
+                "ok": False, "media_id": "",
+                "note": ("这张图基本是空白的——该站是 JS 渲染的单页应用，"
+                         "浏览器这边拿不到内容；别把空白图发给用户，"
+                         "换 browse 读文字或直接说明打不开。"),
+            }, 1200)
         return await self._save_and_report_shot(png, target, nav_error)
+
+    _NAV_FAIL_TTL = 300.0        # 同一个站点失败后 5 分钟内不再硬试
+
+    def _nav_failure_note(self, url: str) -> str:
+        """这个站点最近失败过吗？返回当时的失败原因（否则空串）。"""
+        cache = getattr(self, "_nav_fail_cache", None)
+        if not cache:
+            return ""
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            return ""
+        if not host:
+            return ""
+        hit = cache.get(host)
+        if not hit:
+            return ""
+        when, reason = hit
+        if time.monotonic() - when > self._NAV_FAIL_TTL:
+            cache.pop(host, None)
+            return ""
+        return str(reason)
+
+    def _remember_nav_failure(self, url: str, reason: str) -> None:
+        """记下失败：实录里模型在同一个站点上连着试 browser_screenshot→browser_dom→
+        ssh_screenshot→python_exec，四条路全废还烧了十几轮 token。"""
+        if not url or not reason:
+            return
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            return
+        if not host:
+            return
+        cache = getattr(self, "_nav_fail_cache", None)
+        if cache is None:
+            cache = self._nav_fail_cache = {}
+        cache[host] = (time.monotonic(), str(reason)[:120])
 
     async def _save_and_report_shot(self, png: bytes, label: str, nav_error: str):
         scope_id = next(iter(dict.fromkeys(self._known_scopes.values())), "") or ""

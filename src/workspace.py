@@ -52,6 +52,61 @@ class Workspace:
         self.max_read_chars = int(max_read_chars)
         self.max_write_bytes = int(max_write_bytes)
 
+    def resolve_existing(self, path: str | Path) -> Path:
+        """解析路径；相对路径先按主目录找，找不到再到其它允许根里找同名相对路径。
+
+        实录（用户日志）：模型用 AstrBot 自带工具把脚本写进
+        `data/workspaces/default_GroupMessage_xxx/pelican_gif.py`，随后
+        `run_script("pelican_gif.py")` 只在插件 workspace 里找 → "脚本不存在"（其实就在）。
+        """
+        try:
+            candidate = self.resolve(path)
+        except WorkspaceError:
+            candidate = None
+        if candidate is not None and candidate.exists():
+            return candidate
+        raw = Path(str(path))
+        if not raw.is_absolute():
+            for base in self.roots:
+                other = (base / raw).resolve()
+                if other.exists() and any(
+                        other == one or one in other.parents for one in self.roots):
+                    return other
+            # 还没找到就按文件名在允许根里做一次受限递归查找——AstrBot 自带工具把文件写在
+            # `data/workspaces/<会话>/` 这类**子目录**里，模型只会给个裸文件名。
+            found = self._find_by_name(raw.name)
+            if found is not None:
+                return found
+        if candidate is not None:
+            return candidate
+        raise WorkspaceError(f"路径不在允许的工作区内：{path}")
+
+    def _find_by_name(self, name: str, *, scan_limit: int = 4000) -> Path | None:
+        """在允许根里按文件名找（限次、跳过隐藏目录），找不到返回 None。"""
+        if not name or name in {".", ".."}:
+            return None
+        scanned = 0
+        newest: Path | None = None
+        newest_mtime = -1.0
+        for base in self.roots:
+            for item in base.rglob(name):
+                scanned += 1
+                if scanned > scan_limit:
+                    break
+                try:
+                    if not item.is_file():
+                        continue
+                    if any(part.startswith(".") for part in item.parts):
+                        continue
+                    mtime = item.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest, newest_mtime = item, mtime
+            if scanned > scan_limit:
+                break
+        return newest
+
     @property
     def root(self) -> Path:
         """主工作目录（相对路径的基准）。"""
@@ -107,7 +162,7 @@ class Workspace:
 
     def read(self, path: str, *, offset: int = 0,
              max_chars: int = MAX_READ_CHARS) -> dict[str, Any]:
-        target = self.resolve(path)
+        target = self.resolve_existing(path)
         if not target.is_file():
             raise WorkspaceError(f"文件不存在：{target}")
         if target.stat().st_size > self.max_write_bytes * 4:
@@ -207,7 +262,7 @@ class Workspace:
 
     async def run_script(self, path: str, *, args: str = "",
                          timeout: int = 60) -> dict[str, Any]:
-        script = self.resolve(path)
+        script = self.resolve_existing(path)
         if not script.is_file():
             raise WorkspaceError(f"脚本不存在：{script}")
         limit = min(max(5, int(timeout or 60)), SCRIPT_TIMEOUT_LIMIT)
