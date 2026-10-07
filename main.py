@@ -4324,7 +4324,23 @@ class LongMemoryAgentPlugin(Star):
             return None
         try:
             target.relative_to(root)
+            inside = True
         except ValueError:
+            inside = False
+        if not inside:
+            # 不在表情库目录里的图（比如归档/工作区里的那份副本）也可能是表情包：
+            # 按**内容 sha256** 认出来，照样缩到表情规格发出去。
+            # 实录（用户）：表情包还是发很大的图，gif 却正常——因为走的不是同一条路。
+            try:
+                import hashlib
+
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                record = stickers.resolve(digest[:32]) or stickers.resolve(digest[:16])
+                if record is not None:
+                    scaled = Path(stickers.send_path(record))
+                    return scaled if str(scaled) != str(target) else None
+            except Exception:
+                return None
             return None
         if target.parent.name == "_send":
             return None

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import asyncio
 import base64
 import binascii
@@ -333,9 +335,12 @@ class StickerManager:
         if suffix == ".gif":  # 动图不缩（缩放会丢帧）
             return str(path)
         cache_dir = path.parent / "_send"
-        target = cache_dir / f"{path.stem}_{max_edge}{suffix or '.png'}"
+        # 缓存名带 v2：老版本的副本可能本身就是大图（那时还没按像素尺寸判断），
+        # 换名字直接绕开历史遗留，别让一次旧错误永久生效。
+        target = cache_dir / f"{path.stem}_{max_edge}_v2{suffix or '.png'}"
         try:
-            if target.is_file() and target.stat().st_size > 0:
+            if target.is_file() and target.stat().st_size > 0 \
+                    and self._cache_size_ok(target, max_edge):
                 return str(target)
         except OSError:
             return str(path)
@@ -359,8 +364,36 @@ class StickerManager:
                     save_kwargs = {"quality": 88}
                 resized.save(target, **save_kwargs)
             return str(target)
-        except Exception:
+        except ImportError as error:
+            self._warn_no_pil(error)
             return str(path)
+        except Exception as error:
+            logger.info("长程记忆：表情缩放失败（按原图发）：%s", str(error)[:120])
+            return str(path)
+
+    @staticmethod
+    def _cache_size_ok(target: Path, max_edge: int) -> bool:
+        """缓存副本必须真的是"小图"。
+
+        实录（用户）：表情包还是发很大的图，gif/动图却正常——因为 gif 走早返回、
+        不进这个缓存，而静态图的缓存副本**只要存在就被无条件信任**：历史遗留的大图
+        副本于是被永久复用（那版还没按像素尺寸判断，或尺寸上限不同）。
+        """
+        try:
+            from PIL import Image
+
+            with Image.open(target) as cached:
+                return max(cached.size) <= int(max_edge) + 2
+        except Exception:
+            return False          # 打不开或没法判断 → 当作不可用，重新生成
+
+    def _warn_no_pil(self, error: Exception) -> None:
+        """缩放需要 Pillow；没有它就只能发原图（大图），必须说出来而不是悄悄退化。"""
+        if getattr(self, "_pil_warned", False):
+            return
+        self._pil_warned = True
+        logger.warning("长程记忆：表情缩放不可用（Pillow 缺失或损坏：%s），"
+                       "这张会按原尺寸发出去——装一下 Pillow 就好", str(error)[:120])
 
     def delete(self, sha256: str) -> bool:
         if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256.lower()):
