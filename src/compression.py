@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import inspect
 import json
-import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -11,7 +12,7 @@ from .models import StoredMessage, SummaryRecord
 from .prompts import SUMMARY_SYSTEM_PROMPT
 from .storage import Storage
 
-logger = logging.getLogger(__name__)
+# 市场规范：日志器必须取自 astrbot.api，插件不自建日志器
 LLMCallback = Callable[..., Awaitable[str]]
 _REQUIRED_ARRAYS = ("topics", "timeline", "facts", "decisions", "tasks", "open_questions", "conflicts", "citations", "memory_proposals")
 

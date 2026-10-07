@@ -30,7 +30,25 @@ _CJK_FONT_CANDIDATES = (
 )
 
 
+_ALLOW_AUTO_INSTALL = True
+
+
+def set_auto_install(enabled: bool) -> None:
+    """是否允许运行时自动 pip 安装（主人授权项，市场审查要求显式可关）。
+
+    关掉后不缺依赖照常跑；缺依赖就返回失败与安装提示，绝不擅自动网络安装。
+    """
+    global _ALLOW_AUTO_INSTALL
+    _ALLOW_AUTO_INSTALL = bool(enabled)
+
+
+def auto_install_allowed() -> bool:
+    return _ALLOW_AUTO_INSTALL
+
+
 def _pip_install(names: tuple[str, ...]) -> bool:
+    if not _ALLOW_AUTO_INSTALL:
+        return False
     for index in ("https://pypi.tuna.tsinghua.edu.cn/simple", ""):
         command = [sys.executable, "-m", "pip", "install", "--quiet", *names]
         if index:

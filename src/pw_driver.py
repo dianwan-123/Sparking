@@ -10,9 +10,10 @@ missing, so the calling tools can degrade gracefully.
 """
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import asyncio
 import glob
-import logging
 import os
 import random
 import re
@@ -22,7 +23,7 @@ from typing import Any
 
 from .browser import BrowserError, assert_browsable
 
-logger = logging.getLogger(__name__)
+# 市场规范：日志器必须取自 astrbot.api，插件不自建日志器
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

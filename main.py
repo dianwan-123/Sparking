@@ -132,6 +132,7 @@ from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
 from .src import timeutil
+from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
 from .src.web_tools import WebToolError, fetch_text, search_web
 
@@ -334,6 +335,7 @@ class LongMemoryAgentPlugin(Star):
         try:
             self.settings = PluginConfig.from_mapping(self.raw_config)
             logger.info("长程记忆：检测到配置热更新，已重建运行参数")
+            self._apply_auto_install_setting()
             # 后补的 SSH 配置：把 paramiko 安装/环境探测补跑一次
             try:
                 if self._ssh_config().configured and not self._ssh_env.get("checked"):
@@ -344,6 +346,16 @@ class LongMemoryAgentPlugin(Star):
         except Exception as error:
             logger.warning("长程记忆：配置热更新失败：%s", str(error)[:150])
         return True
+
+    def _apply_auto_install_setting(self) -> None:
+        """把"允许按需 pip 安装"的主人授权项同步给各模块（市场审查要求显式可关）。"""
+        allow = bool(getattr(self.settings, "auto_install_deps", True))
+        for module in (data_tools, pdf_reader, program_host):
+            try:
+                module.set_auto_install(allow)
+            except Exception:
+                pass
+        logger.info("长程记忆：运行时自动安装依赖 = %s", "允许" if allow else "已关闭")
 
     def _persist_raw_config(self) -> None:
         """把内存里的 raw_config 落盘——AstrBotConfig 不会自动保存 setitem 的改动，
@@ -454,6 +466,7 @@ class LongMemoryAgentPlugin(Star):
             zone = timeutil.configure(None)
         logger.info("长程记忆：时间基准 = %s（存储 UTC / 展示本地）",
                     zone or timeutil.zone_name() or "本机时区")
+        self._apply_auto_install_setting()
         root = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_long_memory_agent"
         root.mkdir(parents=True, exist_ok=True)
         (root / "backups").mkdir(exist_ok=True)
@@ -5639,7 +5652,9 @@ class LongMemoryAgentPlugin(Star):
         if self.storage is not None:
             log_file = self.storage.path.parent / "browser_setup.log"
         self._browser_env = await ensure_browser_environment(
-            auto_install=bool(self.settings.browser_auto_install),
+            # 浏览器环境安装也归总开关管：关掉 auto_install_deps 就一律不自动装
+            auto_install=bool(self.settings.browser_auto_install
+                              and self.settings.auto_install_deps),
             logger=lambda msg: logger.info("长程记忆：%s", str(msg)[:200]),
             log_file=log_file,
         )
@@ -5842,7 +5857,7 @@ class LongMemoryAgentPlugin(Star):
     async def _ssh_setup_task(self) -> None:
         """Install-time paramiko provisioning (only when SSH is configured)."""
         self._ssh_env = await ensure_paramiko(
-            auto_install=True,
+            auto_install=bool(self.settings.auto_install_deps),
             logger=lambda msg: logger.info("长程记忆：%s", str(msg)[:200]),
         )
         self._ssh_env["checked"] = True

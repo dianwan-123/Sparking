@@ -16,6 +16,22 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+
+
+_ALLOW_AUTO_INSTALL = True
+
+
+def set_auto_install(enabled: bool) -> None:
+    """是否允许运行时自动 pip 安装（主人授权项，市场审查要求显式可关）。
+
+    关掉后不缺依赖照常跑；缺依赖就返回失败与安装提示，绝不擅自动网络安装。
+    """
+    global _ALLOW_AUTO_INSTALL
+    _ALLOW_AUTO_INSTALL = bool(enabled)
+
+
+def auto_install_allowed() -> bool:
+    return _ALLOW_AUTO_INSTALL
 import sys
 import threading
 import time
@@ -45,6 +61,9 @@ def ensure_flask() -> FlaskState:
         return _flask_state
     except Exception:
         pass
+    if not _ALLOW_AUTO_INSTALL:
+        _flask_state = (False, "缺少 flask，且 auto_install_deps 已关闭（可自行 pip install flask）")
+        return _flask_state
     for index in ("https://pypi.tuna.tsinghua.edu.cn/simple", ""):
         command = [sys.executable, "-m", "pip", "install", "--quiet", "flask>=3.0"]
         if index:
