@@ -53,6 +53,7 @@ from .src.humanization import (
     humanize_plan,
     is_local_path_leak,
     is_tool_markup_leak,
+    is_tool_status_narration,
     is_plan_json_leak,
     parse_message_plan,
     salvage_message_plan,
@@ -3422,7 +3423,8 @@ class LongMemoryAgentPlugin(Star):
         lines = [line for line in lines
                  if line and not is_plan_json_leak(line)
                  and not is_local_path_leak(line)
-                 and not is_tool_markup_leak(line)]
+                 and not is_tool_markup_leak(line)
+                 and not is_tool_status_narration(line)]
         if not lines:
             return None
         actions = tuple(

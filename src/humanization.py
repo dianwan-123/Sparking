@@ -359,6 +359,30 @@ _TOOL_MARKUP_RE = re.compile(
     r"|send_sticker\s*\(|\w+_tool\s*\(")
 
 
+_MEDIA_NOUN = r"(?:表情包|表情|图片|图|照片|卡片|聊天记录|文件|语音|视频|转发|合并转发|消息)"
+_STATUS_VERB = r"(?:已发|已发送|已发出|已送达|已发送完毕|发送成功|发送完成|已发出去了|已发出去|已完成|完成)"
+# 允许"媒体名词 + 状态动词"或"状态动词 + 媒体名词"两种语序：
+# 表情包已发 / 已发表情包 / 转发已完成 / 合并转发已发出
+_STATUS_NARRATION_RE = re.compile(
+    r"^[\s（(【\[－—-]*(?:"
+    + _MEDIA_NOUN + r"?\s*" + _STATUS_VERB
+    + r"|" + _STATUS_VERB + r"\s*" + _MEDIA_NOUN + r"?"
+    + r")[\s！!。.~～）)】\]－—-]*$")
+
+
+def is_tool_status_narration(text: Any) -> bool:
+    """整条消息就是"工具干完活了"的状态播报（表情包已发 / 图片已发送 / 转发完成）。
+
+    实录（用户截图）：bot 先发一条"（表情包已发）"再发那张表情——那是我们工具的
+    返回值（`已发表情包到群X`）被它改写成了聊天内容。工具结果不是台词，不该出现在群里；
+    要报告进度就得说人话（"发你了"），整条只有状态词的，直接丢掉。
+    """
+    stripped = str(text or "").strip()
+    if not stripped or len(stripped) > 24:
+        return False
+    return bool(_STATUS_NARRATION_RE.match(stripped))
+
+
 def is_tool_markup_leak(text: Any) -> bool:
     """文本里带了"工具/伪 XML 标记"——那是模型把调用语法当消息发出来了。
 
