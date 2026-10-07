@@ -356,7 +356,7 @@
   },
   "ssh_host": {
     "type": "string",
-    "description": "SSH 远程主机 IP 或域名（留空则 SSH 功能整体不启用）。目前仅面向 Ubuntu 机器",
+    "description": "【实验性功能】SSH 远程运维的主机 IP 或域名（留空则整体不启用）。接口与行为仍可能随版本调整，不建议在生产环境依赖；目前仅面向 Ubuntu 机器",
     "default": ""
   },
   "ssh_port": {
@@ -371,13 +371,13 @@
   },
   "ssh_password": {
     "type": "string",
-    "description": "SSH 登录密码（必填，否则 SSH 功能不启用）",
+    "description": "【实验性功能】SSH 登录密码（必填，否则 SSH 功能不启用）",
     "secret": true,
     "default": ""
   },
   "ssh_notes": {
     "type": "text",
-    "description": "SSH 机器注释：说明该机器的配置、网络限制、开放端口等，会作为上下文交给 LLM/子agent 参考（例：4C8G Ubuntu22.04，仅开放 22/80/443，国内访问需用清华镜像）",
+    "description": "【实验性功能】SSH 机器注释：说明该机器的配置、网络限制、开放端口等，会作为上下文交给 LLM/子agent 参考（例：4C8G Ubuntu22.04，仅开放 22/80/443，国内访问需用清华镜像）",
     "default": ""
   },
   "ssh_command_timeout": {

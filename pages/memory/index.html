@@ -17,6 +17,7 @@
           <div class="brand-sub" id="brand-version">加载中…</div>
         </div>
       </div>
+      <div class="nav-label">控制台</div>
       <nav id="nav"></nav>
       <div class="sidebar-foot">
         <label class="scope-picker">
@@ -28,7 +29,10 @@
 
     <main class="content">
       <header class="topbar">
-        <h1 id="page-title">概览</h1>
+        <div>
+          <h1 id="page-title">概览</h1>
+          <p class="page-sub" id="page-sub"></p>
+        </div>
         <div class="topbar-actions">
           <span class="pill" id="pill-status">—</span>
           <button class="btn ghost" id="btn-refresh" title="重新加载当前面板">刷新</button>
@@ -192,6 +196,7 @@
         </div>
         <div class="card">
           <h2>拓展与技能</h2>
+          <p class="muted">手写拓展（scripts/）仍是实验性功能：接口可能随版本调整，不建议依赖它做关键流程。</p>
           <div id="extensions" class="list"></div>
         </div>
       </section>

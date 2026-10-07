@@ -7,15 +7,16 @@
   "use strict";
 
   const NS = "http://www.w3.org/2000/svg";
+  // 亮色主题下调过的配色：节点色够深，白色文字/白描边才压得住（主色跟 AstrBot 的 #3c96ca 同族）
   const COLORS = {
-    scope: "#6ea8fe",       // 会话（群/私聊）
-    category: "#8b7bf7",    // 类目
-    summary: "#3ecf8e",     // 分层摘要
-    catalog: "#f0b429",     // 记忆账本
-    impression: "#e879b9",  // 人物印象
-    topic: "#59c2d6",       // 群话题
-    message: "#8d97a8",     // 证据消息
-    default: "#98a2b3",
+    scope: "#3c96ca",       // 会话（群/私聊）
+    category: "#7c6bd6",    // 类目
+    summary: "#2fa87a",     // 分层摘要
+    catalog: "#e0a01c",     // 记忆账本
+    impression: "#d2699f",  // 人物印象
+    topic: "#2aa8bf",       // 群话题
+    message: "#93a0b4",     // 证据消息
+    default: "#a3adba",
   };
   const ROW_GAP = 46;
   const COL_GAP = 210;
@@ -60,6 +61,22 @@
     menu.className = "forest-menu";
     menu.hidden = true;
     container.appendChild(menu);
+
+    // 提示条（空树/加载失败）：单独一个元素，别用 container.innerHTML 覆盖——
+    // 那会把上面已经建好的 svg/tip/menu 一起销毁，之后再刷新就永远画不出图了（实录踩过）。
+    const notice = document.createElement("div");
+    notice.className = "forest-empty";
+    notice.hidden = true;
+    container.appendChild(notice);
+
+    function showNotice(text) {
+      notice.textContent = text;
+      notice.hidden = false;
+      state.roots = [];
+      state.nodes.clear();
+      state.children.clear();
+      render();
+    }
 
     function applyTransform() {
       viewport.setAttribute("transform",
@@ -117,7 +134,7 @@
         edges.appendChild(svgEl("path", {
           d: `M ${from.x + NODE_R} ${from.y} C ${mid} ${from.y}, ${mid} ${to.y}, ${to.x - NODE_R} ${to.y}`,
           fill: "none",
-          stroke: "#39424f",
+          stroke: "#cfd8e3",
           "stroke-width": 1.5,
         }));
       });
@@ -132,14 +149,14 @@
         const circle = svgEl("circle", {
           r: NODE_R + (node.type === "scope" ? 4 : 0),
           fill: colorOf(node),
-          stroke: state.selected === node.id ? "#ffffff" : "#10141a",
+          stroke: state.selected === node.id ? "#1565c0" : "#ffffff",
           "stroke-width": state.selected === node.id ? 2.5 : 1.5,
         });
         group.appendChild(circle);
 
         const label = svgEl("text", {
           x: NODE_R + 10, y: 5,
-          fill: "#e6e9ef", "font-size": "12.5px",
+          fill: "#1b1c1d", "font-size": "12.5px",
         });
         label.textContent = String(node.label || node.id).slice(0, 26);
         group.appendChild(label);
@@ -147,7 +164,7 @@
         if (node.count) {
           const badge = svgEl("text", {
             x: 0, y: 4, "text-anchor": "middle",
-            fill: "#0b0e13", "font-size": "10px", "font-weight": "700",
+            fill: "#ffffff", "font-size": "10px", "font-weight": "700",
           });
           badge.textContent = state.expanded.has(node.id) ? String(node.count)
             : `${node.count}+`;
@@ -302,9 +319,10 @@
       try {
         data = await state.api.getTree(null);
       } catch (error) {
-        container.innerHTML = `<div class="forest-empty">加载失败：${escapeHtml(String(error.message || error))}</div>`;
+        showNotice(`加载失败：${String(error.message || error)}`);
         return;
       }
+      notice.hidden = true;
       const keyword = String(filter || "").trim();
       state.roots = ((data && data.roots) || [])
         .filter((node) => !keyword || String(node.label || "").includes(keyword))
@@ -313,8 +331,8 @@
           return node.id;
         });
       if (!state.roots.length) {
-        container.appendChild(Object.assign(document.createElement("div"),
-          { className: "forest-empty", textContent: "还没有记忆——先去群里聊几句，或点「新增记忆」" }));
+        showNotice("还没有记忆——先去群里聊几句，或点「新增记忆」");
+        return;
       }
       render();
     }

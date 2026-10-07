@@ -1,6 +1,6 @@
 // ===== 记忆森林渲染器（与 pages/tree/forest.js 同源，内联以保证插件页可用）=====
-// 说明：AstrBot 插件页里跨页相对路径（../tree/forest.js）会 404，所以这里内联一份；
-// 改渲染逻辑时请两个文件一起改。
+// 改渲染器请改 pages/tree/forest.js，然后跑 tools/sync_forest.py 同步这一份。
+
 // Sparking 记忆森林 —— 圆形节点 + 连线 的真实可视化（零依赖，纯 SVG）
 // 用法：window.SparkingForest.mount(container, { getTree, onEdit, onDelete, onAddChild })
 //   getTree(nodeId|null) -> Promise<{roots:[...]}|{children:[...]}>
@@ -10,15 +10,16 @@
   "use strict";
 
   const NS = "http://www.w3.org/2000/svg";
+  // 亮色主题下调过的配色：节点色够深，白色文字/白描边才压得住（主色跟 AstrBot 的 #3c96ca 同族）
   const COLORS = {
-    scope: "#6ea8fe",       // 会话（群/私聊）
-    category: "#8b7bf7",    // 类目
-    summary: "#3ecf8e",     // 分层摘要
-    catalog: "#f0b429",     // 记忆账本
-    impression: "#e879b9",  // 人物印象
-    topic: "#59c2d6",       // 群话题
-    message: "#8d97a8",     // 证据消息
-    default: "#98a2b3",
+    scope: "#3c96ca",       // 会话（群/私聊）
+    category: "#7c6bd6",    // 类目
+    summary: "#2fa87a",     // 分层摘要
+    catalog: "#e0a01c",     // 记忆账本
+    impression: "#d2699f",  // 人物印象
+    topic: "#2aa8bf",       // 群话题
+    message: "#93a0b4",     // 证据消息
+    default: "#a3adba",
   };
   const ROW_GAP = 46;
   const COL_GAP = 210;
@@ -63,6 +64,22 @@
     menu.className = "forest-menu";
     menu.hidden = true;
     container.appendChild(menu);
+
+    // 提示条（空树/加载失败）：单独一个元素，别用 container.innerHTML 覆盖——
+    // 那会把上面已经建好的 svg/tip/menu 一起销毁，之后再刷新就永远画不出图了（实录踩过）。
+    const notice = document.createElement("div");
+    notice.className = "forest-empty";
+    notice.hidden = true;
+    container.appendChild(notice);
+
+    function showNotice(text) {
+      notice.textContent = text;
+      notice.hidden = false;
+      state.roots = [];
+      state.nodes.clear();
+      state.children.clear();
+      render();
+    }
 
     function applyTransform() {
       viewport.setAttribute("transform",
@@ -120,7 +137,7 @@
         edges.appendChild(svgEl("path", {
           d: `M ${from.x + NODE_R} ${from.y} C ${mid} ${from.y}, ${mid} ${to.y}, ${to.x - NODE_R} ${to.y}`,
           fill: "none",
-          stroke: "#39424f",
+          stroke: "#cfd8e3",
           "stroke-width": 1.5,
         }));
       });
@@ -135,14 +152,14 @@
         const circle = svgEl("circle", {
           r: NODE_R + (node.type === "scope" ? 4 : 0),
           fill: colorOf(node),
-          stroke: state.selected === node.id ? "#ffffff" : "#10141a",
+          stroke: state.selected === node.id ? "#1565c0" : "#ffffff",
           "stroke-width": state.selected === node.id ? 2.5 : 1.5,
         });
         group.appendChild(circle);
 
         const label = svgEl("text", {
           x: NODE_R + 10, y: 5,
-          fill: "#e6e9ef", "font-size": "12.5px",
+          fill: "#1b1c1d", "font-size": "12.5px",
         });
         label.textContent = String(node.label || node.id).slice(0, 26);
         group.appendChild(label);
@@ -150,7 +167,7 @@
         if (node.count) {
           const badge = svgEl("text", {
             x: 0, y: 4, "text-anchor": "middle",
-            fill: "#0b0e13", "font-size": "10px", "font-weight": "700",
+            fill: "#ffffff", "font-size": "10px", "font-weight": "700",
           });
           badge.textContent = state.expanded.has(node.id) ? String(node.count)
             : `${node.count}+`;
@@ -305,9 +322,10 @@
       try {
         data = await state.api.getTree(null);
       } catch (error) {
-        container.innerHTML = `<div class="forest-empty">加载失败：${escapeHtml(String(error.message || error))}</div>`;
+        showNotice(`加载失败：${String(error.message || error)}`);
         return;
       }
+      notice.hidden = true;
       const keyword = String(filter || "").trim();
       state.roots = ((data && data.roots) || [])
         .filter((node) => !keyword || String(node.label || "").includes(keyword))
@@ -316,8 +334,8 @@
           return node.id;
         });
       if (!state.roots.length) {
-        container.appendChild(Object.assign(document.createElement("div"),
-          { className: "forest-empty", textContent: "还没有记忆——先去群里聊几句，或点「新增记忆」" }));
+        showNotice("还没有记忆——先去群里聊几句，或点「新增记忆」");
+        return;
       }
       render();
     }
@@ -349,16 +367,39 @@
   // 插件名（同源 fetch 兜底时拼路径用）——与后端 _PAGE_PREFIX 一致
   const PLUGIN = "astrbot_plugin_long_memory_agent";
   const PANELS = [
-    { id: "overview", icon: "◉", title: "概览" },
-    { id: "memory", icon: "❖", title: "记忆" },
-    { id: "forest", icon: "🌳", title: "记忆森林" },
-    { id: "people", icon: "☺", title: "人物" },
-    { id: "groups", icon: "▤", title: "群与会话" },
-    { id: "schedule", icon: "⏱", title: "日程与任务" },
-    { id: "caps", icon: "✦", title: "能力与拓展" },
-    { id: "config", icon: "⚙", title: "配置" },
-    { id: "ops", icon: "⌘", title: "运维" },
+    { id: "overview", icon: "overview", title: "概览", desc: "运行状态、给 bot 下令、模型用量" },
+    { id: "memory", icon: "memory", title: "记忆", desc: "消息、分层摘要与记忆账本" },
+    { id: "forest", icon: "forest", title: "记忆森林", desc: "圆形节点＝一条记忆，连线＝关系；点节点可编辑" },
+    { id: "people", icon: "people", title: "人物", desc: "人物印象（跨群互通）、好感度与说话风格" },
+    { id: "groups", icon: "groups", title: "群与会话", desc: "会话列表、白名单与群话题" },
+    { id: "schedule", icon: "schedule", title: "日程与任务", desc: "任务队列、待办与事件条件指令" },
+    { id: "caps", icon: "caps", title: "能力与拓展", desc: "bot 实际可调用的工具与已装载技能" },
+    { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
+    { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
   ];
+
+  // 侧栏图标：零依赖内联 SVG（描边风格，跟 AstrBot 的线性图标一致）
+  const ICONS = {
+    overview: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/>'
+      + '<rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/>',
+    memory: '<rect x="4" y="3.5" width="16" height="17" rx="2.2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+    forest: '<circle cx="5.5" cy="12" r="2.4"/><circle cx="18.5" cy="6.5" r="2.4"/><circle cx="18.5" cy="17.5" r="2.4"/>'
+      + '<path d="M7.7 11.1 16.3 7.4M7.7 12.9 16.3 16.6"/>',
+    people: '<circle cx="12" cy="8" r="3.4"/><path d="M5.2 20c0-3.7 3.1-6.2 6.8-6.2S18.8 16.3 18.8 20"/>',
+    groups: '<rect x="3.5" y="5" width="13.5" height="11" rx="2.4"/><path d="M7.5 19h10.6a2.4 2.4 0 0 0 2.4-2.4V9.2"/>',
+    schedule: '<circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.1 2.1"/>',
+    caps: '<path d="M12 3.6 14.7 9l6 .9-4.3 4.2 1 6-5.4-2.9-5.4 2.9 1-6L3.3 9.9l6-.9Z"/>',
+    config: '<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9.5" cy="7" r="2.1"/><circle cx="15" cy="12" r="2.1"/><circle cx="8" cy="17" r="2.1"/>',
+    ops: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.4"/><path d="M7.8 10 10.6 12.4 7.8 14.8M12.8 15h3.6"/>',
+  };
+
+  function iconSvg(name) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.innerHTML = ICONS[name] || "";
+    return svg;
+  }
 
   const state = {
     panel: "overview",
@@ -623,7 +664,10 @@
       const node = $("panel-" + panel.id);
       if (node) node.hidden = panel.id !== panelId;
     });
-    $("page-title").textContent = (PANELS.find((p) => p.id === panelId) || {}).title || "";
+    const current = PANELS.find((p) => p.id === panelId) || {};
+    $("page-title").textContent = current.title || "";
+    const sub = $("page-sub");
+    if (sub) sub.textContent = current.desc || "";
     location.hash = "#" + panelId;
     try {
       await refresh();
@@ -702,10 +746,17 @@
     usageBox.textContent = "";
     const totalCalls = usage.total_calls ?? usage.calls ?? 0;
     usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${usage.prompt_tokens ?? 0} tokens · 输出 ${usage.completion_tokens ?? 0} tokens`));
-    const daily = usage.days || usage.daily || [];
-    daily.slice(-7).forEach((row) => {
-      const line = el("div", "");
-      line.appendChild(el("div", "", `${row.day}：${row.calls} 次`));
+    const daily = (usage.days || usage.daily || []).slice(-7);
+    const peak = daily.reduce((top, row) => Math.max(top, Number(row.calls) || 0), 0) || 1;
+    daily.forEach((row) => {
+      const line = el("div", "usage-row");
+      line.appendChild(el("span", "usage-day", row.day));
+      const track = el("div", "usage-track");
+      const bar = el("div", "bar");
+      bar.style.width = Math.max(2, Math.round(((Number(row.calls) || 0) / peak) * 100)) + "%";
+      track.appendChild(bar);
+      line.appendChild(track);
+      line.appendChild(el("span", "usage-count", `${row.calls} 次`));
       usageBox.appendChild(line);
     });
     if (!daily.length && !totalCalls) usageBox.appendChild(el("div", "muted", "近 7 天暂无调用记录"));
@@ -1285,8 +1336,10 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     PANELS.forEach((panel) => {
       const btn = el("button");
       btn.dataset.panel = panel.id;
-      btn.appendChild(el("span", "ico", panel.icon));
-      btn.appendChild(el("span", "", panel.title));
+      const ico = el("span", "ico");
+      ico.appendChild(iconSvg(panel.icon));
+      btn.appendChild(ico);
+      btn.appendChild(el("span", "nav-text", panel.title));
       btn.addEventListener("click", () => showPanel(panel.id));
       nav.appendChild(btn);
     });
