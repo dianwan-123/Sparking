@@ -17,6 +17,10 @@ import aiosqlite
 from .models import CatalogEntry, NormalizedMessage, StoredMessage, SummaryRecord, utc_now
 
 SCHEMA_VERSION = 1
+
+# 各表的真实列名（导入记忆时用来过滤包里多余的字段；open() 时用 PRAGMA 预热）
+_TABLE_COLUMNS: dict[str, frozenset] = {}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scopes(scope_id TEXT PRIMARY KEY,platform TEXT NOT NULL,account_id TEXT NOT NULL,conversation_id TEXT NOT NULL,display_name TEXT NOT NULL DEFAULT '',next_seq INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,UNIQUE(platform,account_id,conversation_id));
 CREATE TABLE IF NOT EXISTS event_headers(event_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,scope_seq INTEGER NOT NULL,event_type TEXT NOT NULL,upstream_message_id TEXT NOT NULL,sender_id TEXT NOT NULL,occurred_at TEXT NOT NULL,dedupe_key TEXT NOT NULL,payload_hash TEXT NOT NULL,schema_version INTEGER NOT NULL DEFAULT 1,ingested_at TEXT NOT NULL,UNIQUE(scope_id,scope_seq),UNIQUE(scope_id,dedupe_key));
@@ -99,6 +103,7 @@ class Storage:
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
+        await self._load_table_columns()
         return self
 
     async def close(self) -> None:
@@ -1706,6 +1711,258 @@ class Storage:
 
     async def request_rebuild(self, scope_id: str, reason: str = "manual") -> str:
         return await self.enqueue_job("rebuild", {"reason": reason[:500]}, scope_id, f"rebuild:{scope_id}:{reason}")
+
+    # ---------------------------------------------------------- 记忆导出 / 导入
+    async def export_memory(self, *, scope_ids: "Sequence[str] | None" = None) -> dict[str, list[dict[str, Any]]]:
+        """按表导出记忆行（打包在 src/memory_export.py，那里也定义了表清单）。
+
+        scope_ids 给了就只导这些会话（按会话导；不给=全导）。
+        """
+        from .memory_export import TABLES
+
+        wanted = {str(item) for item in scope_ids} if scope_ids else None
+        tables: dict[str, list[dict[str, Any]]] = {}
+        for name, _keys in TABLES:
+            try:
+                rows = await self._fetchall(f"SELECT * FROM {name}")
+            except Exception:
+                rows = []
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                if wanted is not None:
+                    scope = item.get("scope_id")
+                    if scope is not None and str(scope) not in wanted:
+                        continue
+                out.append(item)
+            tables[name] = out
+        if wanted is not None:
+            # 全局表（不属于任何会话）按"跟着包走"处理：注入与立指令是用户自己的东西
+            for name in ("prompt_injections", "standing_intents", "agent_todos", "agent_plans"):
+                keep = []
+                for row in tables.get(name, []):
+                    scope = row.get("scope_id")
+                    if name in ("prompt_injections",) or scope in (None, "") \
+                            or str(scope) in wanted:
+                        keep.append(row)
+                tables[name] = keep
+        return tables
+
+    async def import_memory(self, tables: Mapping[str, Any], *,
+                            embed_ok: bool = False,
+                            embed_note: str = "") -> dict[str, Any]:
+        """把导出的记忆行合并进库（去重、按会话平移 scope_seq）。
+
+        - 会话按 (平台/账号/会话) 认领：同一条会话在目标库里是同一个 scope；
+        - 消息按 (scope, 上游消息 id) 去重：重复导入同一份不会重复计数；
+         - `scope_seq` 按目标库的 next_seq 整体平移（摘要的起止序号一起平移，
+          所以摘要与消息的对应关系保持），源库里已删消息留下的空洞不影响；
+        - `embed_ok=False`（嵌入模型不匹配）时**不导向量**，只导文本与理解层数据。
+        """
+        from .memory_export import TABLES, remap_row
+
+        source = {str(name): [dict(row) for row in (tables.get(name) or [])]
+                  for name, _keys in TABLES}
+        report: dict[str, Any] = {"tables": {}, "messages": 0, "reused_messages": 0,
+                                  "scopes": 0, "embeddings_skipped": 0,
+                                  "embeddings": 0, "embed_note": str(embed_note or "")}
+        db = self._conn()
+
+        def bump(table: str, *, added: int = 0, skipped: int = 0) -> None:
+            slot = report["tables"].setdefault(table, {"added": 0, "skipped": 0})
+            slot["added"] += added
+            slot["skipped"] += skipped
+
+        async with self._write_lock:
+            await self._begin_write(db)
+            try:
+                # ---- 1) 会话：按自然键认领（scope_id 是 uuid5，同一会话天然同一个 id）
+                scope_map: dict[str, str] = {}
+                for row in source.get("scopes", []):
+                    platform = str(row.get("platform") or "")
+                    account = str(row.get("account_id") or "")
+                    conversation = str(row.get("conversation_id") or "")
+                    if not (platform and account and conversation):
+                        continue
+                    await self._ensure_scope(platform, account, conversation,
+                                             str(row.get("display_name") or ""))
+                    resolved = await self._fetchone(
+                        "SELECT scope_id FROM scopes WHERE platform=? AND account_id=? "
+                        "AND conversation_id=?", (platform, account, conversation))
+                    if resolved is None:
+                        continue
+                    scope_map[str(row.get("scope_id") or "")] = str(resolved["scope_id"])
+                    report["scopes"] += 1
+                # ---- 2) 序号平移：目标 next_seq - 源最小 seq（同一条会话整体搬）
+                seq_shift: dict[str, int] = {}
+                for old_id, new_id in scope_map.items():
+                    seqs = [int(row["scope_seq"]) for row in source.get("event_headers", [])
+                            if str(row.get("scope_id")) == old_id
+                            and row.get("scope_seq") is not None]
+                    if not seqs:
+                        seq_shift[new_id] = 0
+                        continue
+                    current = await self._fetchone(
+                        "SELECT next_seq FROM scopes WHERE scope_id=?", (new_id,))
+                    next_seq = int(current["next_seq"]) if current else 1
+                    seq_shift[new_id] = max(0, next_seq - min(seqs))
+                # ---- 3) 事件头 → 消息身份 → 修订/当前（顺序即外键顺序）
+                live_events: set[str] = set()
+                for row in source.get("event_headers", []):
+                    mapped = remap_row(row, scope_map=scope_map, message_map={},
+                                       seq_shift=seq_shift, seq_columns=("scope_seq",))
+                    if mapped is None:
+                        bump("event_headers", skipped=1)
+                        continue
+                    mapped = self._drop_unknown_columns("event_headers", mapped)
+                    cursor = await db.execute(
+                        self._insert_sql("event_headers", mapped, ignore=True),
+                        tuple(mapped.values()))
+                    if cursor.rowcount:
+                        live_events.add(str(mapped.get("event_id")))
+                        bump("event_headers", added=1)
+                    else:
+                        bump("event_headers", skipped=1)
+                message_map: dict[str, str] = {}
+                fresh_messages: list[dict[str, Any]] = []
+                fresh_text: dict[str, str] = {}
+                # message_current/revisions 没有 scope_id 列 → 平移量按"这条消息
+                # 属于哪个会话"记一份（按旧 message_id 索引）
+                message_shift: dict[str, int] = {}
+                for row in source.get("message_identities", []):
+                    old_id = str(row.get("message_id") or "")
+                    # message_id 在这里是这行自己的身份，不是引用 → 不参与映射
+                    mapped = remap_row(row, scope_map=scope_map, message_map={},
+                                       self_keys=("message_id",))
+                    if mapped is None:
+                        bump("message_identities", skipped=1)
+                        continue
+                    mapped = self._drop_unknown_columns("message_identities", mapped)
+                    cursor = await db.execute(
+                        self._insert_sql("message_identities", mapped, ignore=True),
+                        tuple(mapped.values()))
+                    scope_id = str(mapped.get("scope_id") or "")
+                    message_shift[old_id] = int(seq_shift.get(scope_id, 0))
+                    if cursor.rowcount:
+                        message_map[old_id] = old_id
+                        fresh_messages.append(mapped)
+                        report["messages"] += 1
+                        bump("message_identities", added=1)
+                    else:
+                        existing = await self._fetchone(
+                            "SELECT message_id FROM message_identities "
+                            "WHERE scope_id=? AND upstream_message_id=?",
+                            (scope_id, str(mapped.get("upstream_message_id") or "")))
+                        if existing is not None:
+                            message_map[old_id] = str(existing["message_id"])
+                        report["reused_messages"] += 1
+                        bump("message_identities", skipped=1)
+                for table in ("message_revisions", "message_current"):
+                    for row in source.get(table, []):
+                        if str(row.get("event_id") or "") not in live_events \
+                                and table == "message_revisions":
+                            bump(table, skipped=1)
+                            continue
+                        old_message_id = str(row.get("message_id") or "")
+                        mapped = remap_row(row, scope_map=scope_map, message_map=message_map)
+                        if mapped is None or str(mapped.get("message_id")) not in message_map.values():
+                            bump(table, skipped=1)
+                            continue
+                        # 这两张表没有 scope_id 列：平移量按"这条消息属于哪个会话"取
+                        if mapped.get("scope_seq") is not None:
+                            mapped["scope_seq"] = (int(mapped["scope_seq"])
+                                                   + message_shift.get(old_message_id, 0))
+                        mapped = self._drop_unknown_columns(table, mapped)
+                        cursor = await db.execute(
+                            self._insert_sql(table, mapped, ignore=True), tuple(mapped.values()))
+                        if cursor.rowcount and table == "message_revisions":
+                            fresh_text[str(mapped.get("message_id") or "")] =                                 str(mapped.get("text") or "")
+                        bump(table, added=1 if cursor.rowcount else 0,
+                             skipped=0 if cursor.rowcount else 1)
+                # ---- 4) 其余表：按映射改写后插入（主键冲突=已有，跳过）
+                for name, keys in TABLES:
+                    if name in ("scopes", "event_headers", "message_identities",
+                                "message_revisions", "message_current", "embeddings"):
+                        continue
+                    for row in source.get(name, []):
+                        mapped = remap_row(row, scope_map=scope_map, message_map=message_map,
+                                           seq_shift=seq_shift, seq_columns=("last_seq",))
+                        if mapped is None:
+                            bump(name, skipped=1)
+                            continue
+                        mapped = self._drop_unknown_columns(name, mapped)
+                        cursor = await db.execute(
+                            self._insert_sql(name, mapped, ignore=True), tuple(mapped.values()))
+                        bump(name, added=1 if cursor.rowcount else 0,
+                             skipped=0 if cursor.rowcount else 1)
+                # ---- 5) 向量（只有嵌入模型一致才导；否则明说跳过了多少条）
+                embedding_rows = source.get("embeddings", [])
+                if not embed_ok:
+                    report["embeddings_skipped"] = len(embedding_rows)
+                else:
+                    for row in embedding_rows:
+                        mapped = remap_row(row, scope_map=scope_map, message_map=message_map)
+                        if mapped is None:
+                            report["embeddings_skipped"] += 1
+                            continue
+                        mapped = self._drop_unknown_columns("embeddings", mapped)
+                        cursor = await db.execute(
+                            self._insert_sql("embeddings", mapped, ignore=True),
+                            tuple(mapped.values()))
+                        if cursor.rowcount:
+                            report["embeddings"] += 1
+                        else:
+                            report["embeddings_skipped"] += 1
+                # ---- 6) 搜索索引 + 会话游标
+                for mapped in fresh_messages:
+                    message_id = str(mapped.get("message_id") or "")
+                    await self._sync_search(message_id, str(mapped.get("scope_id") or ""),
+                                            fresh_text.get(message_id, ""), False)
+                for old_id, new_id in scope_map.items():
+                    rows = [int(row["scope_seq"]) + seq_shift.get(new_id, 0)
+                            for row in source.get("event_headers", [])
+                            if str(row.get("scope_id")) == old_id
+                            and row.get("scope_seq") is not None]
+                    if not rows:
+                        continue
+                    await db.execute(
+                        "UPDATE scopes SET next_seq=? WHERE scope_id=? AND next_seq<?",
+                        (max(rows) + 1, new_id, max(rows) + 1))
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return report
+
+    @staticmethod
+    def _insert_sql(table: str, row: Mapping[str, Any], *, ignore: bool = False) -> str:
+        columns = ", ".join(row.keys())
+        marks = ", ".join("?" for _ in row)
+        verb = "INSERT OR IGNORE" if ignore else "INSERT"
+        return f"{verb} INTO {table}({columns}) VALUES({marks})"
+
+    def _drop_unknown_columns(self, table: str, row: Mapping[str, Any]) -> dict[str, Any]:
+        """只保留目标表真实存在的列（包与库版本不一致时不至于整行失败）。"""
+        allowed = _TABLE_COLUMNS.get(table)
+        if not allowed:
+            return dict(row)
+        return {key: value for key, value in row.items() if key in allowed}
+
+    async def _load_table_columns(self) -> None:
+        """把各表的真实列名缓存下来（导入时用来过滤多余字段）。"""
+        for name in ("scopes", "event_headers", "message_identities", "message_revisions",
+                     "message_current", "summary_nodes", "summary_inputs",
+                     "summary_citations", "memory_items", "memory_revisions",
+                     "memory_evidence", "catalog_entries", "user_impressions",
+                     "user_styles", "user_affinity", "person_profiles",
+                     "group_style_rules", "group_lexicon", "group_topics",
+                     "mood_events", "embeddings", "prompt_injections",
+                     "standing_intents", "agent_todos", "agent_plans"):
+            try:
+                rows = await self._fetchall(f"PRAGMA table_info({name})")
+            except Exception:
+                continue
+            _TABLE_COLUMNS[name] = frozenset(str(row["name"]) for row in rows)
 
 
     async def backup(self, destination: str | Path) -> Path:

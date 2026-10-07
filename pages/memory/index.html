@@ -260,6 +260,35 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-backup" hidden>
+        <div class="card">
+          <h2>记忆导出与导入 <span class="muted">把它的记忆打包带走，也能再喂回来</span></h2>
+          <p class="muted">导出的 zip 里是<b>理解层数据</b>：会话、消息、分层摘要、记忆账本、
+            人物印象与档案、好感度、群说话风格、群内黑话、群话题、情绪记忆、提示词注入与日程。
+            媒体与表情包文件、用量统计不进包。
+            <b>重新导入时要匹配同一个嵌入模型</b>：对不上就只导文本与记忆、跳过向量（面板会写明原因）。</p>
+          <div class="row wrap">
+            <button class="btn primary" id="btn-export-memory">导出并下载</button>
+            <button class="btn ghost" id="btn-export-server">只在服务器上存一份</button>
+            <span class="muted" id="export-embed"></span>
+          </div>
+          <pre class="output" id="export-log" hidden></pre>
+        </div>
+        <div class="card">
+          <h2>导入记忆包 <span class="muted">从别的 bot 或备份里搬回来</span></h2>
+          <div class="row wrap">
+            <input type="file" id="backup-file" accept=".zip">
+            <button class="btn primary" id="btn-import-memory">导入</button>
+            <button class="btn ghost" id="btn-backup-refresh">刷新</button>
+          </div>
+          <pre class="output" id="import-log" hidden></pre>
+        </div>
+        <div class="card">
+          <h2>已导出的包 <span class="muted">服务器上的 exports 目录</span></h2>
+          <div id="backup-files" class="list"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-config" hidden>
         <div class="toolbar">
           <input type="search" id="cfg-search" placeholder="搜配置项…">

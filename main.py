@@ -143,6 +143,7 @@ from .src import timeutil
 from .src import style_learning
 from .src import qq_import
 from .src import injections as prompt_injections
+from .src import memory_export
 from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
 from .src.web_tools import WebToolError, fetch_text, search_web
@@ -235,11 +236,36 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
+PLUGIN_VERSION = "1.0.6"
+
+
+def _binary_response(payload: bytes, filename: str) -> Any:
+    """把字节包成文件响应；拿不到 Response 类就返回 None（调用方退化成 base64）。"""
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"',
+               "Content-Type": "application/zip"}
+    for module_name in ("quart", "astrbot.api.web"):
+        try:
+            module = __import__(module_name, fromlist=["Response"])
+        except Exception:
+            continue
+        response_class = getattr(module, "Response", None)
+        if response_class is None:
+            continue
+        try:
+            return response_class(payload, headers=headers)
+        except Exception:
+            try:
+                return response_class(response=payload, status=200, headers=headers)
+            except Exception:
+                continue
+    return None
+
+
 @register(
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
     "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
-    "1.0.5",
+    PLUGIN_VERSION,
 )
 class LongMemoryAgentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -6118,18 +6144,132 @@ class LongMemoryAgentPlugin(Star):
         if self.storage is None:
             return []
         try:
-            limit = min(max(int(len(group.messages) or 0), 200), 400)
+            limit = min(max(int(len(group.messages) or 0), 300), 600)
             messages = await self.storage.recent_messages(scope_id, limit)
         except Exception:
             return []
-        if len(messages) <= 200:
+        if len(messages) <= 300:
             return messages
-        step = max(1, len(messages) // 200)
-        return messages[::step][:200]
+        step = max(1, len(messages) // 300)
+        return messages[::step][:300]
 
     async def import_chatlog_abort(self, upload_id: str) -> dict[str, Any]:
         self._import_part_path(upload_id).unlink(missing_ok=True)
         return {"ok": True}
+
+    # ---------------------------------------------------------------- 记忆导出 / 导入
+    def _exports_dir(self) -> Path:
+        base = (self.storage.path.parent if self.storage is not None
+                else Path(get_astrbot_data_path()) / "plugin_data"
+                / "astrbot_plugin_long_memory_agent")
+        path = base / "exports"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _memory_export_part(self, upload_id: str) -> Path:
+        safe = re.sub(r"[^0-9a-zA-Z_-]", "", str(upload_id or ""))[:48] or "upload"
+        return self._imports_dir() / f"{safe}.memory.part"
+
+    async def export_memory(self, *, scope_ids: "list[str] | None" = None,
+                            save: bool = True) -> dict[str, Any]:
+        """把记忆打成一个 zip（返回字节 + 名单），同时落盘到 exports/ 一份。
+
+        落盘那份是兜底：插件页的下载要走宿主页面转发（沙箱里自己点不动下载），
+        万一转发不通，用户在服务器上也能直接拿到这个文件。
+        """
+        if self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        tables = await self.storage.export_memory(scope_ids=scope_ids)
+        embed_model = self._embedding_model_name()
+        payload = memory_export.build_package(
+            tables, plugin_version=str(PLUGIN_VERSION),
+            embedding_model=embed_model, platform="aiocqhttp",
+            extra={"scope_count": len({str(r.get("scope_id")) for r in tables.get("scopes", [])})})
+        name = memory_export.package_name()
+        result = {"name": name, "size": len(payload), "embedding_model": embed_model,
+                  "counts": {key: len(value) for key, value in tables.items() if value},
+                  "saved_to": ""}
+        if save:
+            path = self._exports_dir() / name
+            try:
+                await asyncio.to_thread(path.write_bytes, payload)
+                result["saved_to"] = str(path)
+            except Exception as error:
+                logger.info("长程记忆：导出包落盘失败（不影响下载）：%s", str(error)[:120])
+        self._last_export = {"name": name, "payload": payload}
+        return result
+
+    def _embedding_model_name(self) -> str:
+        """当前用的嵌入模型名（导入时要拿它跟包里的比）。"""
+        try:
+            pid = str(getattr(self.settings, "embedding_provider_id", "") or "")
+        except Exception:
+            pid = ""
+        if pid:
+            return pid
+        try:
+            for provider in self._known_providers():
+                config = getattr(provider, "provider_config", None) or {}
+                if str(config.get("provider_type") or "") == "embedding" \
+                        or "embedding" in str(config.get("type") or ""):
+                    return str(config.get("id") or config.get("model") or "")
+        except Exception:
+            pass
+        return ""
+
+    async def memory_import_upload(self, upload_id: str, index: int,
+                                   data_b64: str) -> dict[str, Any]:
+        """分片上传记忆包（复用快速学习那套切片上传：插件页桥接只发 JSON）。"""
+        raw = str(data_b64 or "")
+        if not raw:
+            raise RuntimeError("空分片")
+        import base64 as _b64
+
+        try:
+            payload = _b64.b64decode(raw.split(",", 1)[-1])
+        except Exception as error:
+            raise RuntimeError(f"分片解码失败：{str(error)[:80]}") from error
+        part = self._memory_export_part(upload_id)
+        mode = "wb" if int(index or 0) == 0 else "ab"
+        await asyncio.to_thread(self._append_bytes, part, payload, mode)
+        size = await asyncio.to_thread(lambda: part.stat().st_size)
+        if size > 512 * 1024 * 1024:
+            part.unlink(missing_ok=True)
+            raise RuntimeError("记忆包超过 512MB，太大了")
+        return {"ok": True, "received": size}
+
+    async def memory_import_finish(self, upload_id: str, filename: str = "") -> dict[str, Any]:
+        """收完就合并进库：去重、按会话平移序号、嵌入模型不匹配则只导文本。"""
+        part = self._memory_export_part(upload_id)
+        if not part.is_file() or part.stat().st_size == 0:
+            raise RuntimeError("没收到记忆包（先上传分片）")
+        if self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        try:
+            raw = await asyncio.to_thread(part.read_bytes)
+        finally:
+            part.unlink(missing_ok=True)
+        manifest, tables = memory_export.read_package(raw)
+        current = self._embedding_model_name()
+        embed_ok, note = memory_export.embedding_verdict(manifest, current)
+        report = await self.storage.import_memory(tables, embed_ok=embed_ok, embed_note=note)
+        report.update({
+            "file": str(filename or part.name),
+            "package": {
+                "plugin_version": str(manifest.get("plugin_version") or ""),
+                "exported_at": str(manifest.get("exported_at") or ""),
+                "embedding_model": str(manifest.get("embedding_model") or ""),
+                "counts": manifest.get("counts") or {},
+                "messages": int(manifest.get("messages") or 0),
+            },
+            "embedding_ok": bool(embed_ok),
+            "embedding_note": note,
+            "current_embedding_model": current,
+        })
+        logger.info("长程记忆：记忆导入完成 —— %s 条消息（复用 %s）/ %s 个会话 / 向量 %s（跳过 %s）：%s",
+                    report["messages"], report["reused_messages"], report["scopes"],
+                    report["embeddings"], report["embeddings_skipped"], note)
+        return report
 
     async def _ingest_imported_group(self, group: "qq_import.ImportedGroup") -> int:
         """把一个群的消息写进记忆（**不需要在白名单里**：导入只写库，不影响是否接管）。"""
@@ -6264,7 +6404,7 @@ class LongMemoryAgentPlugin(Star):
         当成"用户发来的东西"去回答（样本里提到德国劳动法，它就讲德国劳动法）。
         现在把任务交代写进用户消息，并挑真正有信息量的样本（见 usable_samples）。
         """
-        samples = qq_import.usable_samples(texts, 14)
+        samples = qq_import.usable_samples(texts)          # 60~120 条，越多越准
         if not samples:
             return None, "empty"
         prompt = style_learning.IMPORT_IMPRESSION_TASK.format(
@@ -7957,6 +8097,32 @@ class LongMemoryAgentPlugin(Star):
             return self._page_ok(data)
 
         register(f"{_PAGE_PREFIX}/action", _write, ["POST"], "执行操作")
+
+        async def _export():
+            """记忆导出下载：宿主页面用 blob 转发（沙箱里点不动下载）。
+
+            端点直出 zip 字节；万一这个 AstrBot 版本的响应层不支持二进制，
+            就退化成 JSON（前端认出 content-type 后自己存）。
+            """
+            guard = self._page_gate()
+            if guard is not None:
+                return guard
+            try:
+                result = await self.export_memory()
+            except Exception as error:
+                logger.warning("长程记忆：导出记忆失败：%s", error)
+                return error_response(f"{type(error).__name__}: {error}"[:250],
+                                      status_code=400)
+            payload = (getattr(self, "_last_export", None) or {}).get("payload") or b""
+            name = str(result.get("name") or "sparking-memory.zip")
+            response = _binary_response(payload, name)
+            if response is not None:
+                return response
+            self._last_export = None
+            return self._page_ok({"base64": base64.b64encode(payload).decode("ascii"),
+                                  "name": name, "size": len(payload)})
+
+        register(f"{_PAGE_PREFIX}/memory_export", _export, ["GET"], "下载记忆导出包")
 
     def _unregister_page_routes(self) -> None:
         routes = getattr(self.context, "registered_web_apis", None)

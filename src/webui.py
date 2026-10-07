@@ -51,6 +51,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("injections", "提示词注入"),
     ("culture", "群风格与心理"),
     ("imports", "快速学习"),
+    ("backup_memory", "记忆导出与导入"),
 )
 
 WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
@@ -68,6 +69,9 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("import_chatlog_upload", "上传聊天记录分片"),
     ("import_chatlog_finish", "解析导入聊天记录"),
     ("import_chatlog_abort", "取消导入"),
+    ("memory_import_upload", "上传记忆包分片"),
+    ("memory_import_finish", "导入记忆包"),
+    ("memory_export_save", "导出一份记忆包到服务器"),
     ("style_rule_delete", "删一条群说话风格"),
     ("lexicon_save", "改/加一条群内词条"),
     ("lexicon_delete", "删一条群内词条"),
@@ -395,6 +399,40 @@ class PageAPI:
     async def _read_plans(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         limit = min(max(int(query.get("limit", 30) or 30), 1), 200)
         return list(await self.storage.pending_plans(limit))
+
+    async def _read_backup_memory(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """记忆导出/导入面板：能导出什么、之前导出过哪些包。"""
+        directory = self.host._exports_dir()
+        files = []
+        try:
+            for item in sorted(directory.iterdir(), key=lambda f: f.name, reverse=True)[:20]:
+                if item.is_file() and item.suffix == ".zip":
+                    files.append({"name": item.name, "size": item.stat().st_size})
+        except Exception:
+            pass
+        stats = await self.storage.stats()
+        embed = ""
+        try:
+            embed = self.host._embedding_model_name()
+        except Exception:
+            pass
+        last = getattr(self.host, "_last_export", None) or {}
+        return {
+            "current_embedding_model": embed,
+            "exports": files,
+            "last": {"name": str(last.get("name") or "")},
+            "counts": {
+                "scopes": int(stats.get("scopes", 0) or 0),
+                "messages": int(stats.get("message_identities", 0) or 0),
+                "summaries": int(stats.get("summary_nodes", 0) or 0),
+                "memories": int(stats.get("memory_items", 0) or 0),
+                "catalog": int(stats.get("catalog_entries", 0) or 0),
+                "embeddings": int(stats.get("embeddings", 0) or 0),
+            },
+            "note": ("导出的包可以在别的 bot 上导入（会话、消息、分层摘要、记忆账本、人物印象、"
+                     "群文化、情绪记忆、注入与日程）。**重新导入时要匹配同一个嵌入模型**："
+                     "对不上就只导文本与记忆、跳过向量，面板会写明。"),
+        }
 
     async def _read_imports(self, query: Mapping[str, Any]) -> dict[str, Any]:
         """快速学习面板：能导入什么格式、已导入过哪些群。"""
@@ -1104,6 +1142,21 @@ class PageAPI:
 
     async def _do_import_chatlog_abort(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return await self.host.import_chatlog_abort(str(body.get("upload_id") or ""))
+
+    async def _do_memory_export_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        result = await self.host.export_memory(save=True)
+        return {"ok": True, "name": result.get("name"), "size": result.get("size"),
+                "saved_to": result.get("saved_to"), "counts": result.get("counts"),
+                "embedding_model": result.get("embedding_model")}
+
+    async def _do_memory_import_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return await self.host.memory_import_upload(
+            str(body.get("upload_id") or ""), int(body.get("index") or 0),
+            str(body.get("data") or ""))
+
+    async def _do_memory_import_finish(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return await self.host.memory_import_finish(
+            str(body.get("upload_id") or ""), str(body.get("filename") or ""))
 
     async def _do_style_rule_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
         rule_id = str(body.get("rule_id") or "").strip()

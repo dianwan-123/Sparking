@@ -377,6 +377,7 @@
     { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
     { id: "culture", icon: "culture", title: "群风格与心理", desc: "它学到的说话习惯、群内黑话、对你的了解与情绪记忆" },
     { id: "learn", icon: "learn", title: "快速学习", desc: "导入导出的群聊天记录，让它一次学会这些群" },
+    { id: "backup", icon: "backup", title: "记忆备份", desc: "导出/导入它的记忆（跨 bot 搬运，嵌入模型要一致）" },
     { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
     { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
   ];
@@ -398,6 +399,7 @@
       + '<path d="M5.5 6.5h4M5.5 10h3M14.5 6.5h4M14.5 10h3"/>',
     culture: '<path d="M4 5.5h16v11H8.5L4.5 20z"/><path d="M8 10h8M8 13h5"/>',
     learn: '<path d="M12 4 3.5 8.5 12 13l8.5-4.5z"/><path d="M6 10.5V16c0 1.7 2.7 3 6 3s6-1.3 6-3v-5.5"/><path d="M20.5 8.5V14"/>',
+    backup: '<path d="M12 3.5v10"/><path d="M8 9.5 12 13.5 16 9.5"/>' + '<path d="M4.5 16.5v2.2a1.8 1.8 0 0 0 1.8 1.8h11.4a1.8 1.8 0 0 0 1.8-1.8v-2.2"/>',
   };
 
   function iconSvg(name) {
@@ -695,6 +697,7 @@
       case "inject": return loadInjections();
       case "culture": return loadCulture();
       case "learn": return loadLearn();
+      case "backup": return loadBackup();
       case "config": return loadConfig();
       case "ops": return loadOps();
       default: return undefined;
@@ -1265,6 +1268,116 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     }, "还没有导入过任何群");
   }
 
+  // ---------------------------------------------------------------- 记忆导出 / 导入
+  function formatSize(bytes) {
+    const value = Number(bytes || 0);
+    if (value >= 1024 * 1024) return (value / 1024 / 1024).toFixed(1) + " MB";
+    if (value >= 1024) return Math.round(value / 1024) + " KB";
+    return value + " B";
+  }
+
+  async function loadBackup() {
+    const box = $("backup-files");
+    if (!box) return;
+    box.textContent = "";
+    box.appendChild(el("div", "muted", "加载中…"));
+    let data;
+    try {
+      data = await get("backup_memory");
+    } catch (error) {
+      box.textContent = "";
+      box.appendChild(el("div", "empty", String(error.message || error)));
+      return;
+    }
+    const embed = $("export-embed");
+    if (embed) {
+      const counts = data.counts || {};
+      embed.textContent = "当前嵌入模型：" + (data.current_embedding_model || "（未配置）")
+        + "；库里现有 " + (counts.messages || 0) + " 条消息 / " + (counts.summaries || 0)
+        + " 条摘要 / " + (counts.memories || 0) + " 条记忆账本 / " + (counts.embeddings || 0) + " 条向量";
+    }
+    renderList(box, data.exports || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.name));
+      title.appendChild(el("span", "tag", formatSize(row.size)));
+      return itemShell(title, "服务器 exports 目录", "", []);
+    }, "还没有导出过（点上面的「导出并下载」）");
+  }
+
+  async function runExport(download) {
+    const log = $("export-log");
+    const show = (value) => { if (log) { log.hidden = false; log.textContent = value; } };
+    show(download ? "正在打包记忆…" : "正在打包并写入服务器…");
+    const bridge = await bridgeReady();
+    try {
+      if (download && bridge && typeof bridge.download === "function") {
+        const result = await bridge.download(endpointOf("memory_export"), {}, "");
+        show("已开始下载：" + ((result && result.filename) || "记忆包")
+          + "\n（若浏览器没弹出下载，改用「只在服务器上存一份」，文件会写进插件数据目录的 exports/）");
+        toast("导出完成", "ok");
+        loadBackup();
+        return;
+      }
+      const data = await post("memory_export_save", {});
+      show("导出包已生成在服务器：" + (data.name || "")
+        + "\n（插件数据目录 / exports/ 下）");
+      toast("已存到服务器", "ok");
+      loadBackup();
+    } catch (error) {
+      show("导出失败：" + String(error.message || error));
+      toast(String(error.message || error), "error");
+    }
+  }
+
+  function readPart(file, start, end) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || "").split(",", 2)[1] || "");
+      reader.onerror = () => reject(new Error("读取文件失败"));
+      reader.readAsDataURL(file.slice(start, end));
+    });
+  }
+
+  async function runMemoryImport() {
+    const input = $("backup-file");
+    const log = $("import-log");
+    const file = input && input.files && input.files[0];
+    if (!file) return toast("先选一个记忆包（.zip）", "error");
+    const show = (value) => { if (log) { log.hidden = false; log.textContent = value; } };
+    const uploadId = "mem_" + Date.now().toString(36);
+    const chunk = 512 * 1024;
+    try {
+      const total = Math.max(1, Math.ceil(file.size / chunk));
+      show("开始上传 " + file.name + "（" + formatSize(file.size) + "，" + total + " 片）");
+      for (let index = 0; index < total; index += 1) {
+        const data = await readPart(file, index * chunk, (index + 1) * chunk);
+        await post("memory_import_upload", { upload_id: uploadId, index, data });
+        if (index % 5 === 4 || index === total - 1) show("  已上传 " + (index + 1) + "/" + total + " 片");
+      }
+      show("上传完成，正在合并进记忆…（包大的话要等一会儿）");
+      const report = await post("memory_import_finish", { upload_id: uploadId, filename: file.name });
+      const pkg = report.package || {};
+      const lines = [];
+      lines.push("包来自插件 " + (pkg.plugin_version || "未知版本") + "，导出时间 " + String(pkg.exported_at || "").slice(0, 19));
+      lines.push("导入 " + report.messages + " 条消息（其中 " + report.reused_messages
+        + " 条库里已有、跳过）；涉及 " + report.scopes + " 个会话");
+      lines.push("嵌入模型：" + (report.embedding_note || ""));
+      if (report.embeddings_skipped) {
+        lines.push("（跳过 " + report.embeddings_skipped + " 条向量——文本与记忆照常可用）");
+      }
+      const tables = report.tables || {};
+      const parts = Object.keys(tables).filter((key) => tables[key] && tables[key].added)
+        .map((key) => key + " " + tables[key].added);
+      if (parts.length) lines.push("各表新增：" + parts.join("、"));
+      show(lines.join("\n"));
+      toast("记忆导入完成", "ok");
+      loadBackup();
+    } catch (error) {
+      show("导入失败：" + String(error.message || error));
+      toast(String(error.message || error), "error");
+    }
+  }
+
   // ---------------------------------------------------------------- 群风格与心理
   async function loadCulture() {
     const groups = [["styleRules", "style_rules"], ["lexicon", "lexicon"],
@@ -1643,6 +1756,10 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     $("btn-refresh-culture").addEventListener("click", loadCulture);
     $("btn-learn-run").addEventListener("click", runImport);
     $("btn-learn-refresh").addEventListener("click", loadLearn);
+    $("btn-export-memory").addEventListener("click", () => runExport(true));
+    $("btn-export-server").addEventListener("click", () => runExport(false));
+    $("btn-backup-refresh").addEventListener("click", loadBackup);
+    $("btn-import-memory").addEventListener("click", runMemoryImport);
     $("forest-filter").addEventListener("input", loadForest);
     $("btn-forest-new").addEventListener("click", () => forestEdit(null, null));
     $("btn-imp-save").addEventListener("click", async () => {

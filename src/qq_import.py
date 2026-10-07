@@ -275,12 +275,19 @@ def parse_export_folder(folder: Path, *, max_messages: int = 0) -> ImportedGroup
 _PLACEHOLDER_TEXT = frozenset(_ELEMENT_PLACEHOLDER.values())
 
 
-def usable_samples(texts: Iterable[str], limit: int = 14) -> list[str]:
+# 给模型看一个人：样本越多越准（用户明确要求 60~120 条，不怕耗上下文）
+SAMPLE_MIN = 60
+SAMPLE_MAX = 120
+
+
+def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
+                   *, min_count: int = SAMPLE_MIN) -> list[str]:
     """挑出真正能看出「这个人是什么样」的发言样本。
 
     实录：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
     模型只能回一句"你发的是聊天记录片段，想让我做什么？"——样本本身没信息量。
-    这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾）。
+    这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾），
+    数量尽量落在 60~120 条之间；可用样本不足时有多少用多少。
     """
     usable: list[str] = []
     for raw in texts:
@@ -292,11 +299,15 @@ def usable_samples(texts: Iterable[str], limit: int = 14) -> list[str]:
             stripped = stripped.replace(token, "")
         if len(stripped.strip(" ：:，,。.！!？?~～、")) < 4:
             continue
-        usable.append(text[:80])
+        usable.append(text[:100])
     if len(usable) <= limit:
         return usable
+    # 均匀取样：先按上限抽，若抽出来不足下限，说明步长太大 → 缩小步长重抽
     step = max(1, len(usable) // limit)
     picked = usable[::step][:limit]
+    if len(picked) < min_count:
+        step = max(1, len(usable) // min_count)
+        picked = usable[::step][:limit]
     return picked
 
 
