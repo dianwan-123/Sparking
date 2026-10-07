@@ -51,6 +51,7 @@ from .src.humanization import (
     PlanValidationError,
     analyze_recent_style,
     humanize_plan,
+    is_local_path_leak,
     is_plan_json_leak,
     parse_message_plan,
     salvage_message_plan,
@@ -2419,6 +2420,23 @@ class LongMemoryAgentPlugin(Star):
                     "可改用 design_render 自己拼，或如实告诉用户画不成")
         return compact_json(result, 1200)
 
+    async def _recent_message_ids(self, scope_id: str, count: int) -> list[str]:
+        """取某会话最近 N 条消息的内部 id（旧→新，含 bot 自己发的）。
+
+        实录：让 bot "把你自己的最后一条消息做成卡片"，它手里没有任何 id（卡片/转发
+        工具当时只认 id），于是绕去 design_render 手搓 HTML 画了个丑页面。
+        有了这个，模型只要给条数就能干活——顺手的路不该比歪路更难走。
+        """
+        if self.storage is None or not str(scope_id or "").strip():
+            return []
+        limit = max(1, min(int(count or 1), 20))
+        try:
+            rows = await self.storage.recent_messages(str(scope_id), limit)
+        except Exception as error:
+            logger.info("长程记忆：取最近消息失败：%s", str(error)[:120])
+            return []
+        return [str(row.message_id) for row in rows if str(row.message_id or "")]
+
     async def _fetch_message_details(
         self, message_ids: list[str], scope_id: str | None,
     ) -> list[dict[str, Any]]:
@@ -2433,6 +2451,12 @@ class LongMemoryAgentPlugin(Star):
                 self._bind_gateway_client()
                 response = await self.gateway.execute("get_msg", message_id=mid)
                 data = qq_payload(response)
+                # 形状校验：网关偶尔回一个非空但没有消息字段的壳（错误对象/空信封）。
+                # 那种"数据"过不了下面，会把 detail 建成空署名+空内容（实录：转发节点署名
+                # 全变"群友"）——形状不对就当没取到，回落本地库存。
+                if data and not ({"message", "raw_message", "sender"} & set(data)):
+                    logger.info("长程记忆：get_msg %s 返回的形状不是消息，回落库存", mid[:16])
+                    data = {}
                 if data:
                     sender = data.get("sender") or {}
                     message = data.get("message")
@@ -2661,7 +2685,7 @@ class LongMemoryAgentPlugin(Star):
     async def forward_messages_tool(
         self, event: AstrMessageEvent, message_ids_json: str = "",
         nodes_json: str = "", target_group_id: str = "", target_user_id: str = "",
-        summary: str = "",
+        summary: str = "", latest_count: int = 0,
     ):
         """把一批消息做成**合并聊天记录**发出去（挂人、留证据、把神人发言拼成一册）。
         两种用法，任选其一：
@@ -2679,12 +2703,27 @@ class LongMemoryAgentPlugin(Star):
             target_group_id(string): 目标群号（留空=当前会话）。
             target_user_id(string): 目标 QQ（与群号二选一）。
             summary(string): 外层摘要，留空自动取第一条内容。
+            latest_count(number): 不用 id：直接取当前会话（或 target 指定的群）最近 N 条
+                消息打包（含 bot 自己发的，最多 20）。"把最近 5 条打包"就填 5。
         """
         ids = self._parse_media_ids(message_ids_json)
         custom_nodes = self._parse_forward_nodes(nodes_json)
+        if not ids and not custom_nodes and int(latest_count or 0) > 0:
+            group_ref = str(target_group_id or "").strip()
+            source_scope = None
+            if group_ref:
+                resolved, _key, hint = await self._resolve_scope_ref(group_ref)
+                if not resolved:
+                    return f"没能定位目标群：{hint}"
+                source_scope = resolved
+            else:
+                source_scope = await self._scope_for_event(event) if event is not None else None
+            ids = await self._recent_message_ids(source_scope or "", latest_count)
+            if not ids:
+                return "这个会话最近没有可用消息（可用 message_ids_json 指定消息 id）"
         if not ids and not custom_nodes:
-            return ("需要 message_ids_json（转发已有消息）或 nodes_json（自己拼一条"
-                    "记录：名字/QQ号/原话）——两种用法见工具说明")
+            return ("需要 message_ids_json（转发已有消息）/ latest_count（取最近几条）"
+                    "或 nodes_json（自己拼一条记录：名字/QQ号/原话）——见工具说明")
         for node in custom_nodes[:20]:
             node["custom"] = True
         target_group = str(target_group_id or "").strip()
@@ -2765,27 +2804,37 @@ class LongMemoryAgentPlugin(Star):
     @filter.llm_tool(name="screenshot_messages")
     async def screenshot_messages_tool(
         self, event: AstrMessageEvent, message_ids_json: str = "", title: str = "",
-        group_id: str = "",
+        group_id: str = "", latest_count: int = 0,
     ):
         """把一批消息做成 QQ 风格的聊天卡片图片发到当前会话（伪截图：头像+昵称+
         内容气泡，支持图文混排、合并转发占位）。比真实转发更直观，任何会话都能发；
         "挂人"、留档、展示聊天记录都用它。
 
+        **要做聊天记录样子的卡片一律用它**——不要用 design_render 自己写 HTML 画聊天界面
+        （实录：那样会画成大字报，字号溢出、也不像聊天记录）。
+        不知道消息 id 时：latest_count=1 就是"我最近一条"，5 就是最近五条。
+
         Args:
-            message_ids_json(string): 消息 id 数组 JSON，按时间顺序。
+            message_ids_json(string): 消息 id 数组 JSON，按时间顺序（与 latest_count 二选一）。
             title(string): 卡片标题，留空默认"聊天记录"。
             group_id(string): 这些消息属于哪个群（群号或群名，如"数学指令讨论群"）；
                 消息来自别的群/会话时必须给，留空按当前会话找。
+            latest_count(number): 不用 id：直接取该会话最近 N 条消息（含 bot 自己发的，
+                最多 20）。想把自己刚说的一句做成卡片就填 1。
         """
         ids = self._parse_media_ids(message_ids_json)
-        if not ids:
-            return "需要 message_ids_json（消息 id 数组 JSON）"
         scope_id = await self._scope_for_event(event) if event is not None else None
         if str(group_id or "").strip():
             resolved, _key, hint = await self._resolve_scope_ref(group_id)
             if not resolved:
                 return f"没能定位这个群：{hint}"
             scope_id = resolved
+        if not ids and int(latest_count or 0) > 0:
+            ids = await self._recent_message_ids(scope_id or "", latest_count)
+            if not ids:
+                return f"这个会话最近没有可用消息（group_id={group_id or '当前会话'}）"
+        if not ids:
+            return "需要 message_ids_json（消息 id 数组）或 latest_count（取最近几条）"
         details = await self._fetch_message_details(ids, scope_id)
         if not details:
             return "一条消息都没取到（可能已删除或 id 无效）"
@@ -3177,7 +3226,9 @@ class LongMemoryAgentPlugin(Star):
 
         lines = [" ".join(line.strip().split())
                  for line in text.splitlines() if line.strip()][:8]
-        lines = [line for line in lines if line and not is_plan_json_leak(line)]
+        lines = [line for line in lines
+                 if line and not is_plan_json_leak(line)
+                 and not is_local_path_leak(line)]
         if not lines:
             return None
         actions = tuple(
@@ -9095,6 +9146,8 @@ class LongMemoryAgentPlugin(Star):
         """绘图/设计：用 HTML 或 SVG 画一张图，渲染成图片（拿 media_id 用 send_image 发）。
         渲染窗口最多存在 60 秒，期间可用 browser_dom/browser_screenshot(url=返回的url) 访问。
         save=true 时存为项目（必须给 title 和 description，会加入记忆）。
+        **聊天记录样子的卡片不要用它**——那种一律 screenshot_messages（latest_count 可以直接
+        给条数）；转发聊天记录用 forward_messages。手搓 HTML 画聊天界面会做成大字报。
 
         Args:
             html(string): 完整 HTML 页面内容（含 CSS/JS）；与 svg 二选一。

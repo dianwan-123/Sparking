@@ -347,6 +347,27 @@ def is_plan_json_leak(text: Any) -> bool:
     return any(marker in head for marker in _PLAN_JSON_MARKERS)
 
 
+_LOCAL_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:\\[^\s\"'，。；]*|\\\\[^\s]+|/(?:tmp|var|home|root|Users)/[^\s\"'，。；]*)")
+_PHANTOM_CALL_RE = re.compile(
+    r"(?:请(?:立即)?(?:调用|执行|使用)|需(?:要)?调用|调用)\s*[a-z_][a-z0-9_]{2,}\s*\(")
+
+
+def is_local_path_leak(text: Any) -> bool:
+    """文本里掺了服务器本地文件路径，或让用户去调用某个"工具(参数)"。
+
+    实录（截图）：bot 把 `C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\custom_xxx.png`
+    和自己的臆想调用 `push_image_to_device(image_path=..., page_id=...)` 当回复发给了用户。
+    这是把"工具产出的中间结果"当"要对人说的话"——必须拦在发送层。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if _PHANTOM_CALL_RE.search(stripped):
+        return True
+    return bool(_LOCAL_PATH_RE.search(stripped))
+
+
 def salvage_message_plan(raw: Any, config: HumanizationConfig | None = None) -> MessagePlan:
     """Recover a plan from a malformed LLM reply; raises when nothing is usable.
 
