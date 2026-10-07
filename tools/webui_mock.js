@@ -96,6 +96,26 @@
     backups: [{ name: "sparking-2026-10-07.db", size: 288000, created_at: "2026-10-07 03:00" }],
     events: [{ kind: "friend_request", text: "小明 请求加好友", created_at: "2026-10-07 10:00", handled: true }],
     mood: { mood: "雀跃", intensity: 0.62, note: "群里在夸它" },
+    culture: {
+      scope: "123456789",
+      note: "说话风格与黑话是按群学的；人物档案与情绪记忆跨群共用一份。",
+      style_rules: [
+        { rule_id: "r1", situation: "有人发癫", style: "用 又在这串", hits: 7 },
+        { rule_id: "r2", situation: "被夸", style: "用 太强了", hits: 3 },
+      ],
+      lexicon: [
+        { term_id: "l1", term: "蚌埠住", meaning: "绷不住，笑到控制不住", uses: 5 },
+        { term_id: "l2", term: "沙子", meaning: "", uses: 1 },
+      ],
+      profiles: [
+        { person_id: "p1", user_id: "10001", display_name: "小明", know_counts: 34,
+          points: ["身份:高二学生:5", "喜好:爱吃辣:4", "雷点:别提成绩:4"] },
+      ],
+      mood_events: [
+        { event_id: "m1", valence: 0.4, reason: "「你画得真好」让我挺开心", created_at: "2026-10-07T14:20:00+00:00" },
+        { event_id: "m2", valence: -0.5, reason: "「你就是个废物」让我不太舒服", created_at: "2026-10-07T12:05:00+00:00" },
+      ],
+    },
     injections: {
       note: "注入会以【强制规则】的形式追加到系统提示；自带预设立即可用，可改内容。",
       enabled: ["short-bubbles"],
