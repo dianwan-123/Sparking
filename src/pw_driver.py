@@ -46,6 +46,10 @@ _LAUNCH_ARGS = [
     "--disable-background-networking",
     "--no-first-run",
     "--no-default-browser-check",
+    # 反自动化特征：实录用户服务器上 Cent Browser 能开的站，我们这套打不开——
+    # 除去"页面卡死"，headless 被识别也是一大类原因，顺手关掉最明显的标记。
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
 ]
 
 
@@ -172,8 +176,12 @@ class PlaywrightDriver:
 
     def __init__(self, *, user_data_dir: str | Path | None = None,
                  timeout: float = 30.0,
-                 executable_path: str | Path | None = None) -> None:
+                 executable_path: str | Path | None = None,
+                 headful: bool = False) -> None:
         self._timeout = max(5.0, float(timeout))
+        # 有头模式：服务器上有桌面会话时（比如你在 RDP 里挂着），像真人浏览器一样开窗口，
+        # 反爬/风控最不敏感。默认无头，出问题可在配置里打开。
+        self._headful = bool(headful)
         self._user_data_dir = str(user_data_dir) if user_data_dir else ""
         self._executable_path = str(executable_path) if executable_path else ""
         self._pw: Any = None
@@ -216,22 +224,24 @@ class PlaywrightDriver:
             if exe:
                 try:
                     return await launch(
-                        self._user_data_dir, executable_path=exe, headless=True,
+                        self._user_data_dir, executable_path=exe,
+                        headless=not self._headful,
                         args=_LAUNCH_ARGS, viewport=viewport, user_agent=_USER_AGENT)
                 except Exception:
                     pass  # bad/incompatible binary → default launch below
             return await launch(
-                self._user_data_dir, headless=True, args=_LAUNCH_ARGS,
+                self._user_data_dir, headless=not self._headful, args=_LAUNCH_ARGS,
                 viewport=viewport, user_agent=_USER_AGENT)
         browser = None
         if exe:
             try:
                 browser = await self._pw.chromium.launch(
-                    executable_path=exe, headless=True, args=_LAUNCH_ARGS)
+                    executable_path=exe, headless=not self._headful, args=_LAUNCH_ARGS)
             except Exception:
                 browser = None
         if browser is None:
-            browser = await self._pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            browser = await self._pw.chromium.launch(headless=not self._headful,
+                                                    args=_LAUNCH_ARGS)
         self._browser = browser
         return await browser.new_context(viewport=viewport, user_agent=_USER_AGENT)
 
@@ -295,21 +305,62 @@ class PlaywrightDriver:
             pass
         return await self._context.new_page()
 
-    async def goto(self, url: str) -> dict[str, Any]:
-        """Slow sites must not stall 30s: commit as soon as the server answers,
-        then a short settle for the first paint."""
-        page = await self._page_or_raise()
-        try:
-            await page.goto(assert_browsable(url), wait_until="commit",
-                            timeout=int(self._timeout * 1000))
-        except Exception as error:
-            raise BrowserError(
-                f"页面打不开（站点无响应或被墙）：{str(error)[:140]}") from error
+    async def _discard_page(self) -> None:
+        """丢掉当前共享页面。
+
+        实录（用户日志）：bilibili 在服务器上用 Cent Browser 打得开，但我们的
+        Chromium 首次导航超时后**那个页面还挂在"半路"状态**——之后每次调用复用同一个
+        页面，于是截图超时、browser_dom 再超时 30s、连环失败。导航一失败就把页面丢掉，
+        下次调用自然拿到新页面。
+        """
+        async with self._lock:
+            page, self._page = self._page, None
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _navigate(self, page: Any, url: str, *, timeout_ms: int,
+                        wait_until: str = "commit") -> None:
+        await page.goto(assert_browsable(url), wait_until=wait_until,
+                        timeout=int(timeout_ms))
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=8000)
         except Exception:
-            pass  # slow site: work with whatever has rendered so far
+            pass  # 慢站：先用手上已经渲染出来的东西
         await page.wait_for_timeout(900)
+
+    async def goto_with_retry(self, url: str) -> tuple[Any, str]:
+        """导航到 url；失败则丢掉页面、换一张新页面重试一次。返回 (page, 失败原因)。
+
+        第一次用短超时（15s，快速失败），第二次用完整超时——多数"首次导航卡住"
+        其实是被上一次残留状态拖住的，换新页面就好了。
+        """
+        first_timeout = min(self._timeout, 15.0) * 1000
+        page = await self._page_or_raise()
+        try:
+            await self._navigate(page, url, timeout_ms=first_timeout)
+            return page, ""
+        except Exception as error:
+            reason = str(error).splitlines()[0][:160]
+        await self._discard_page()
+        page = await self._page_or_raise()
+        try:
+            await self._navigate(page, url, timeout_ms=self._timeout * 1000)
+            return page, ""
+        except Exception as error:
+            reason = str(error).splitlines()[0][:160]
+            await self._discard_page()
+            return None, reason
+
+    async def goto(self, url: str) -> dict[str, Any]:
+        """慢站不要卡满 30s：先短超时快速失败，失败就换新页面重试一次。"""
+        page, reason = await self.goto_with_retry(url)
+        if page is None:
+            self.last_nav_error = reason
+            raise BrowserError(f"页面打不开：{reason}")
+        self.last_nav_error = ""
         return {"url": page.url, "title": await page.title()}
 
     async def dom_snapshot(self, limit: int = 60) -> dict[str, Any]:
@@ -423,36 +474,27 @@ class PlaywrightDriver:
                 except Exception:
                     pass
 
+            first_page = page
             try:
-                page.on("requestfailed", _on_failed)
+                first_page.on("requestfailed", _on_failed)
             except Exception:
                 pass
-            # fail fast so the fallback isn't gated behind the full 30s timeout
-            nav_timeout = int(min(self._timeout, 15.0) * 1000)
             try:
-                await page.goto(assert_browsable(url), wait_until="commit",
-                                timeout=nav_timeout)
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=8000)
-                except Exception:
-                    pass  # slow site: capture whatever rendered
-                await page.wait_for_timeout(900)
-            except Exception as error:
-                detail = nav_failures[-1] if nav_failures else str(error).splitlines()[0]
-                self.last_nav_error = str(detail)[:160]
-                if not fallback_html:
-                    raise BrowserError(
-                        f"页面打不开（站点无响应或被墙）：{self.last_nav_error}") from error
-                # The failed navigation leaves this page mid-flight, so calling
-                # set_content on it dies with "Execution context was destroyed".
-                # Render the fetched HTML on a FRESH page instead.
-                return await self._screenshot_html(
-                    fallback_html, base_url or url, full_page)
+                page, nav_error = await self.goto_with_retry(url)
             finally:
                 try:
-                    page.remove_listener("requestfailed", _on_failed)
+                    first_page.remove_listener("requestfailed", _on_failed)
                 except Exception:
                     pass
+            if page is None:
+                detail = nav_failures[-1] if nav_failures else nav_error
+                self.last_nav_error = str(detail)[:160]
+                if not fallback_html:
+                    raise BrowserError(f"页面打不开：{self.last_nav_error}")
+                # 降级：用抓回来的 HTML 在**新页面**上渲染（失败导航留下的页面已丢弃）
+                return await self._screenshot_html(
+                    fallback_html, base_url or url, full_page)
+            self.last_nav_error = ""
         if grid:
             return await self._screenshot_with_grid(page, full_page)
         return await page.screenshot(full_page=bool(full_page))

@@ -6059,9 +6059,13 @@ class LongMemoryAgentPlugin(Star):
             profile = None
             if getattr(self.settings, "browser_persist", True) and self.storage is not None:
                 profile = self.storage.path.parent / "browser_profile"
+            headful = bool(getattr(self.settings, "browser_headful", False))
             self._pw = PlaywrightDriver(
                 user_data_dir=profile,
-                executable_path=self.settings.browser_executable_path or None)
+                executable_path=self.settings.browser_executable_path or None,
+                headful=headful)
+            logger.info("长程记忆：浏览器启动模式 = %s（heads-up 在服务器上更像真人浏览器）",
+                        "有头(真实窗口)" if headful else "无头")
         return self._pw
 
     # ------------------------------------------------------------------ studio（designer / programmer）
@@ -9050,7 +9054,7 @@ class LongMemoryAgentPlugin(Star):
             }, 1200)
         return await self._save_and_report_shot(png, target, nav_error)
 
-    _NAV_FAIL_TTL = 300.0        # 同一个站点失败后 5 分钟内不再硬试
+    _NAV_FAIL_TTL = 120.0        # 同一个站点失败后 2 分钟内不再硬试（已能自愈，别长期拉黑）
 
     def _nav_failure_note(self, url: str) -> str:
         """这个站点最近失败过吗？返回当时的失败原因（否则空串）。"""

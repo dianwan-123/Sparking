@@ -80,6 +80,7 @@ class PluginConfig:
     origin_wake_prefixes: str
     style_learn_hours: int
     auto_install_deps: bool
+    browser_headful: bool
     browser_auto_install: bool
     browser_persist: bool
     browser_executable_path: str
@@ -183,6 +184,7 @@ class PluginConfig:
             origin_wake_prefixes=str(d.get("origin_wake_prefixes", "/") or "/"),
             style_learn_hours=_int(d.get("style_learn_hours"), 3, 0, 168),
             auto_install_deps=bool(d.get("auto_install_deps", True)),
+            browser_headful=bool(d.get("browser_headful", False)),
             browser_auto_install=bool(d.get("browser_auto_install", True)),
             browser_persist=bool(d.get("browser_persist", True)),
             browser_executable_path=str(d.get("browser_executable_path", "")).strip(),

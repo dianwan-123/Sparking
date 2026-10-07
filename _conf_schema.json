@@ -359,6 +359,11 @@
     "description": "可选：手动指定浏览器可执行文件（完整 chrome.exe，而非 headless_shell）。留空自动探测 ms-playwright 下的完整 chromium。当安全软件拦截 headless_shell.exe 导致截图超时时，指到 ...\\ms-playwright\\chromium-<版本>\\chrome-win64\\chrome.exe 即可",
     "default": ""
   },
+  "browser_headful": {
+    "type": "bool",
+    "description": "浏览器用有头模式（真的开一个窗口，需要服务器上有桌面会话，比如你挂着 RDP）。有些站点会把无头浏览器当成机器人直接卡住，截图一直超时的话把它打开试试。",
+    "default": false
+  },
   "ssh_host": {
     "type": "string",
     "description": "【实验性功能】SSH 远程运维的主机 IP 或域名（留空则整体不启用）。接口与行为仍可能随版本调整，不建议在生产环境依赖；目前仅面向 Ubuntu 机器",
