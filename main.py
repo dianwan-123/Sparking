@@ -52,6 +52,7 @@ from .src.humanization import (
     analyze_recent_style,
     humanize_plan,
     is_local_path_leak,
+    is_tool_markup_leak,
     is_plan_json_leak,
     parse_message_plan,
     salvage_message_plan,
@@ -988,16 +989,27 @@ class LongMemoryAgentPlugin(Star):
         messages, only their distilled memory with origin labels. The plugin's
         own traces (web browsing / studio designs & programs) count as the
         bot's personal experience and always participate."""
-        scopes: list[str] = []
+        groups: list[str] = []
+        privates: list[str] = []
+        others: list[str] = []
         for key, scope_id in self._known_scopes.items():
-            if key.startswith("private:") and not self.settings.enable_private_memory:
+            if key.startswith("private:"):
+                if self.settings.enable_private_memory:
+                    privates.append(scope_id)
                 continue
-            if key in {"web", "studio"} or key.startswith("private:") \
-                    or self.settings.allows_group(key):
-                scopes.append(scope_id)
-        if current and current not in scopes:
-            scopes.insert(0, current)
-        return tuple(scopes[:9])
+            if key in {"web", "studio"}:
+                others.append(scope_id)
+                continue
+            if self.settings.allows_group(key):
+                groups.append(scope_id)
+        # 顺序即优先级：当前会话 → 白名单群（群聊是主场景）→ 私聊 → 插件自身痕迹。
+        # 原来按"首次出现顺序"截前 9 个，群一多就会有群被无声挤出去（实录：记忆"没互通"）。
+        ordered = ([current] if current else []) + groups + privates + others
+        unique: list[str] = []
+        for scope_id in ordered:
+            if scope_id and scope_id not in unique:
+                unique.append(scope_id)
+        return tuple(unique[:16])
 
     async def _scope_for_event(self, event: AstrMessageEvent, create: bool = False) -> str | None:
         if not self.storage or not self._is_managed_conversation(event):
@@ -2438,7 +2450,8 @@ class LongMemoryAgentPlugin(Star):
         return [str(row.message_id) for row in rows if str(row.message_id or "")]
 
     async def _fetch_message_details(
-        self, message_ids: list[str], scope_id: str | None,
+        self, message_ids: list[str], scope_id: str | None, *,
+        enrich: bool = True, depth: int = 0,
     ) -> list[dict[str, Any]]:
         """逐条拉取消息原文（网关 get_msg 优先，回落本地库存）——转发与卡片共用。
 
@@ -2495,16 +2508,128 @@ class LongMemoryAgentPlugin(Star):
                 else:
                     row = None
                 if row is not None:
+                    stored_parts = [dict(part) for part in (getattr(row, "parts", None) or [])
+                                    if isinstance(part, Mapping)]
                     detail = {
                         "id": mid, "uin": str(row.sender_id),
                         "name": str(row.sender_name),
                         "time": timeutil.to_text(row.occurred_at, "%Y-%m-%d %H:%M"),
-                        "segments": [{"type": "text",
-                                      "data": {"text": str(row.text or "")}}],
+                        # 入库时存的是原始段（@/图片/表情/引用都在），别再压成纯文本——
+                        # 实录：卡片里 @、表情包、引用全丢了，就是这么丢的
+                        "segments": stored_parts or [{"type": "text",
+                                                      "data": {"text": str(row.text or "")}}],
+                        "reply_to": str(getattr(row, "reply_to", "") or ""),
                     }
             if detail is not None:
                 details.append(detail)
+        if enrich and details:
+            for item in details:
+                await self._enrich_card_detail(item, scope_id, depth=depth)
         return details
+
+    @staticmethod
+    def _reply_id_of(item: Mapping[str, Any]) -> str:
+        """这条消息在引用谁：库里存的 reply_to，或段里的 reply.id。"""
+        ref = str(item.get("reply_to") or "").strip()
+        if ref:
+            return ref
+        for segment in list(item.get("segments") or []):
+            if str(segment.get("type")) == "reply":
+                return str((segment.get("data") or {}).get("id") or "").strip()
+        return ""
+
+    async def _enrich_card_detail(self, item: dict[str, Any],
+                                  scope_id: str | None, *, depth: int = 0) -> None:
+        """把一条消息补齐成"能画成卡片"的样子：引用源消息、图片内联、转发子消息。
+
+        实录（用户两张截图）：卡片里引用、表情包、@、转发全丢了——因为旧代码只把
+        `text` 交给渲染器，而原始段（parts）、引用目标（reply_to）都没用上。
+        """
+        segments = [seg for seg in list(item.get("segments") or [])
+                    if isinstance(seg, Mapping)]
+        # ① 图片/表情：抓成本地 base64，画卡片与转发都不再依赖会过期的 CDN 链接
+        for index, segment in enumerate(segments):
+            kind = str(segment.get("type") or "")
+            if kind not in {"image", "mface", "marketface"}:
+                continue
+            data = dict(segment.get("data") or {})
+            if self._segment_already_inline(data):
+                continue
+            payload = await self._fetch_media_bytes(data, "image")
+            if not payload:
+                continue
+            encoded = base64.b64encode(payload).decode("ascii")
+            segments[index] = {"type": "image",
+                               "data": {**data, "file": "base64://" + encoded, "url": ""}}
+        # ② 引用的源消息：把被引用的那条也取出来（只一层，防递归）
+        reply_id = self._reply_id_of(item)
+        if reply_id and depth < 1:
+            quoted = await self._fetch_message_details(
+                [reply_id], scope_id, enrich=True, depth=depth + 1)
+            if quoted:
+                source = quoted[0]
+                item["reply_name"] = str(source.get("name") or source.get("uin") or "")
+                item["reply_segments"] = list(source.get("segments") or [])
+                item["reply_text"] = str(source.get("text") or "")
+        # ③ 合并转发段：展开成子消息（一层），卡片里渲染成嵌套块
+        forward_ids: list[str] = []
+        for segment in segments:
+            if str(segment.get("type")) in {"forward", "node", "forwardtransfer", "flashtransfer"}:
+                found = self._forward_ids({"message": [dict(segment)]})
+                forward_ids.extend(fid for fid in found if fid not in forward_ids)
+        if forward_ids and depth < 1 and self.gateway is not None:
+            children = await self._forward_children(forward_ids[0], scope_id)
+            if children:
+                item["children"] = children
+        item["segments"] = segments
+
+    async def _forward_children(self, forward_id: str,
+                                scope_id: str | None) -> list[dict[str, Any]]:
+        """把一份合并转发展开成卡片能画的子消息（名字 + 段），图片顺带内联。"""
+        nodes: list[dict[str, Any]] = []
+        self._bind_gateway_client()
+        for params in ({"message_id": forward_id}, {"id": forward_id, "message_id": forward_id},
+                       {"id": forward_id}):
+            try:
+                response = await self.gateway.execute("get_forward_msg", **params)
+                nodes = messages_of(response)
+            except Exception as error:
+                logger.info("长程记忆：卡片展开转发失败：%s", str(error)[:120])
+                nodes = []
+            if nodes:
+                break
+        children: list[dict[str, Any]] = []
+        for node in nodes[:20]:
+            if not isinstance(node, Mapping):
+                continue
+            raw_segments = node.get("message") if isinstance(node.get("message"), list) else None
+            if raw_segments is None:
+                inner = node.get("content")
+                if isinstance(inner, Mapping) and isinstance(inner.get("content"), list):
+                    raw_segments = inner["content"]
+                elif isinstance(node.get("data"), Mapping):
+                    candidate = (node["data"] or {}).get("content")
+                    raw_segments = candidate if isinstance(candidate, list) else None
+            segments: list[dict[str, Any]] = []
+            for segment in list(raw_segments or []):
+                if not isinstance(segment, Mapping):
+                    continue
+                kind = str(segment.get("type") or "")
+                data = dict(segment.get("data") or {})
+                if kind in {"image", "mface", "marketface"}:
+                    payload = await self._fetch_media_bytes(data, "image")
+                    if payload:
+                        segments.append({"type": "image", "data": {
+                            **data, "file": "base64://" + base64.b64encode(payload).decode("ascii"),
+                            "url": ""}})
+                        continue
+                if kind in {"text", "at", "face", "image"}:
+                    segments.append({"type": kind, "data": data})
+            if not segments:
+                continue
+            children.append({"name": _forward_node_name(node) or "群友",
+                             "segments": segments})
+        return children
 
     @staticmethod
     def _parse_forward_nodes(raw: str) -> list[dict[str, Any]]:
@@ -2566,6 +2691,19 @@ class LongMemoryAgentPlugin(Star):
         return str(data.get("file") or "").lower().startswith(
             ("base64://", "base://", "data:"))
 
+    @staticmethod
+    def _looks_like_image(payload: bytes) -> bool:
+        """魔数校验：图片抓回来必须真是图片。
+
+        实录：CDN 链接过期后常返回一个 404 的 HTML 页，旧代码照样当图片内联，
+        卡片上就是一块乱码/空白。不是图片就当抓取失败（卡片回退原 URL、转发走占位）。
+        """
+        head = bytes(payload[:16])
+        return (head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8")
+                or head.startswith(b"GIF8") or head.startswith(b"BM")
+                or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+                or head.lstrip()[:5] in {b"<svg ", b"<?xml"})
+
     async def _fetch_media_bytes(self, data: Mapping[str, Any],
                                  kind: str = "image") -> bytes:
         """媒体段 → 原始字节。依次试：远端 URL → 本地文件 → 网关 get_image。
@@ -2595,13 +2733,18 @@ class LongMemoryAgentPlugin(Star):
                     logger.info("长程记忆：转发媒体下载失败（试下一来源）：%s",
                                 str(error)[:120])
                     payload = b""
-                if payload:
+                if payload and (kind != "image" or self._looks_like_image(payload)):
                     return payload
+                if payload:
+                    logger.info("长程记忆：抓回的内容不是图片（%s 字节），改用下一来源",
+                                len(payload))
                 continue
             try:
                 path = Path(source)
                 if path.is_file():
-                    return await asyncio.to_thread(path.read_bytes)
+                    payload = await asyncio.to_thread(path.read_bytes)
+                    if kind != "image" or self._looks_like_image(payload):
+                        return payload
             except Exception:
                 continue
         # 网关兜底：把裸文件名换成真内容（图片走 get_image，语音走 get_record 转码）
@@ -3228,7 +3371,8 @@ class LongMemoryAgentPlugin(Star):
                  for line in text.splitlines() if line.strip()][:8]
         lines = [line for line in lines
                  if line and not is_plan_json_leak(line)
-                 and not is_local_path_leak(line)]
+                 and not is_local_path_leak(line)
+                 and not is_tool_markup_leak(line)]
         if not lines:
             return None
         actions = tuple(
@@ -5492,6 +5636,20 @@ class LongMemoryAgentPlugin(Star):
             if self.storage and done:
                 await self.storage.complete_plan(str(plan.get("plan_id", "")), done)
 
+    async def _scope_labels(self) -> dict[str, str]:
+        """scope_id → "群名（群号）"：跨会话记忆与各会话近况都靠它标注出处。"""
+        labels: dict[str, str] = {}
+        for row in await self._scope_directory():
+            scope_id = str(row.get("scope_id") or "")
+            key = str(row.get("key") or "")
+            if not scope_id or not key:
+                continue
+            name = str(row.get("name") or "").strip()
+            labels[scope_id] = f"{name}（{key}）" if name else key
+        for key, scope_id in (self._known_scopes or {}).items():
+            labels.setdefault(str(scope_id), str(key))
+        return labels
+
     def _plan_target_group(self, detail: str) -> tuple[str, str]:
         """Find a whitelist group mentioned in a plan detail (id or known key)."""
         for key in self._known_scopes:
@@ -6994,7 +7152,7 @@ class LongMemoryAgentPlugin(Star):
         if not pending:
             self._save_event_watermark()
             return
-        labels = {v: k for k, v in self._known_scopes.items()}
+        labels = await self._scope_labels()
         listing = compact_json(
             [
                 {"message_id": e.message_id, "origin": labels.get(e.scope_id, e.scope_id[:8]),
@@ -8114,6 +8272,54 @@ class LongMemoryAgentPlugin(Star):
         return await self._send_sticker_action({
             "sticker_id": sticker_id, "query": query, "group_id": resolved,
         })
+
+    @filter.llm_tool(name="group_memory")
+    async def group_memory_tool(
+        self, event: AstrMessageEvent, group_id: str = "", level: int = 0,
+        limit: int = 6,
+    ):
+        """深入看**某个会话**的分层记忆：L1（分钟级，刚聊的）/ L2（天级）/ L3（月级），
+        外加该群话题与记忆账本。上下文里的 conversation_overview 只给一句话近况，
+        想知道"那个群具体在聊什么"就用这个工具查。
+
+        Args:
+            group_id(string): 群号或群名（如"数学指令讨论群"）；留空=当前会话。
+            level(number): 只看某一层：1/2/3；0=全部层。
+            limit(number): 每层返回条数，最大 20。
+        """
+        scope_id = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个会话：{hint}"
+            scope_id = resolved
+        if not scope_id or self.storage is None:
+            return "记忆系统未就绪或会话未记录"
+        levels = [level] if int(level or 0) in {1, 2, 3} else [1, 2, 3]
+        rows = await self.storage.list_summaries(
+            [scope_id], max(1, min(int(limit or 6), 20)), levels=levels)
+        labels = await self._scope_labels()
+        payload = {
+            "origin": labels.get(scope_id, scope_id[:8]),
+            "layers": {},
+            "topics": [row.get("topic") for row in await self.storage.recent_topics(scope_id, 10)],
+        }
+        for row in rows:
+            payload["layers"].setdefault(f"L{row.level}", []).append({
+                "time": timeutil.to_text(row.created_at, "%m-%d %H:%M"),
+                "title": row.title, "body": " ".join(str(row.body).split())[:400],
+            })
+        if self.ledger is not None:
+            entries = await self.ledger.catalog([scope_id], 8)
+            payload["memory_catalog"] = [
+                {"kind": item.kind, "subject": item.subject,
+                 "value": " ".join(str(item.value).split())[:160]}
+                for item in entries
+            ]
+        if not payload["layers"] and not payload.get("memory_catalog"):
+            return (f"{payload['origin']} 还没有可用的分层记忆（可能刚进群/刚被清空，"
+                    "继续聊几句就会攒出来）")
+        return compact_json(payload, 12000)
 
     @filter.llm_tool(name="get_affinity")
     async def get_affinity_tool(self, event: AstrMessageEvent, user_id: str = ""):

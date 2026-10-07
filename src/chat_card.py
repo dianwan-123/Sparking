@@ -33,6 +33,38 @@ def _escape(text: str) -> str:
     return html.escape(str(text or ""), quote=True)
 
 
+def _mime_of(payload: bytes) -> str:
+    """从魔数猜图片类型（内联图片拼 data URI 用）。"""
+    if payload.startswith(b"\x89PNG"):
+        return "image/png"
+    if payload.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if payload.startswith(b"GIF8"):
+        return "image/gif"
+    if payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return "image/webp"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    return "image/png"
+
+
+def _inline_image_src(data: dict[str, Any]) -> str:
+    """图片段 → 可直接放进 <img src> 的值（data URI 优先，其次远端 URL）。"""
+    encoded = str(data.get("file") or "")
+    if encoded.startswith(("base64://", "base://")):
+        import base64 as _b64
+
+        try:
+            payload = _b64.b64decode(encoded.split("//", 1)[1])
+        except Exception:
+            return ""
+        return f"data:{_mime_of(payload)};base64,{encoded.split('//', 1)[1]}"
+    if encoded.startswith("data:"):
+        return encoded
+    url = str(data.get("url") or data.get("file") or "")
+    return url if url.startswith(("http://", "https://")) else ""
+
+
 def _inline_segment(seg: dict[str, Any]) -> str:
     """一段 OneBot 段 → 行内 HTML。未识别的段渲染成占位 chip，不炸。"""
     data = seg.get("data") or {}
@@ -44,13 +76,13 @@ def _inline_segment(seg: dict[str, Any]) -> str:
         return f'<span class="at">@{_escape(who)}</span>'
     if kind == "face":
         return f'<span class="chip">[表情]</span>'
-    if kind == "image":
-        url = str(data.get("url") or data.get("file") or "")
-        if url.startswith(("http://", "https://")):
-            return (f'<img class="msg-img" src="{_escape(url)}" '
+    if kind in ("image", "mface", "marketface", "sticker"):
+        src = _inline_image_src(data)
+        if src:
+            return (f'<img class="msg-img" src="{_escape(src)}" '
                     'onerror="this.replaceWith(Object.assign(document.createElement(\'span\'),'
                     '{className:\'chip\',textContent:\'[图片加载失败]\'}))">')
-        return '<span class="chip">[图片]</span>'
+        return '<span class="chip">[表情]</span>' if kind != "image" else '<span class="chip">[图片]</span>'
     if kind == "forward":
         return '<span class="chip forward">『合并转发』</span>'
     if kind == "reply":
@@ -79,16 +111,36 @@ def _render_message(item: dict[str, Any]) -> str:
         segments = [{"type": "text", "data": {"text": str(item["text"])}}]
     body = "".join(_inline_segment(seg) for seg in (segments or [])) or "&nbsp;"
     reply = ""
-    if item.get("reply_text"):
+    reply_segments = item.get("reply_segments")
+    if isinstance(reply_segments, list) and reply_segments:
+        # 引用的源消息：原文 +（可能有图/表情），按 QQ 的"引用条"样式渲染
+        inner = "".join(_inline_segment(seg) for seg in reply_segments[:6])
+        reply = (f'<div class="quote"><div class="quote-name">'
+                 f'{_escape(item.get("reply_name") or "")}：</div>{inner}</div>')
+    elif item.get("reply_text"):
         reply = (f'<div class="quote">回复 {_escape(item.get("reply_name") or "")}'
                  f'：{_escape(item["reply_text"])}</div>')
+    children = item.get("children")
+    forward_block = ""
+    if isinstance(children, list) and children:
+        rows_out: list[str] = []
+        for child in children[:20]:
+            if not isinstance(child, dict):
+                continue
+            inner = "".join(_inline_segment(seg) for seg in (child.get("segments") or [])[:8])
+            rows_out.append(
+                f'<div class="fwd-row"><span class="fwd-name">'
+                f'{_escape(child.get("name") or "群友")}</span>{inner or "&nbsp;"}</div>')
+        forward_block = (
+            f'<div class="fwd"><div class="fwd-title">合并转发 · {len(rows_out)}条</div>'
+            + "".join(rows_out) + "</div>")
     time_html = f'<span class="time">{_escape(when)}</span>' if when else ""
     return (
         f'<div class="msg">'
         f'<img class="avatar" src="{avatar_url(uin)}" alt="">'
         f'<div class="col">'
         f'<div class="name" style="color:{_name_color(name)}">{_escape(name)}{time_html}</div>'
-        f'<div class="bubble">{reply}{body}</div>'
+        f'<div class="bubble">{reply}{forward_block}{body}</div>'
         f'</div></div>'
     )
 
@@ -127,8 +179,16 @@ def build_card_html(messages: list[dict[str, Any]], *, title: str = "聊天记�
         "font-size:13px;}}"
         ".chip.forward{background:#e7f0fb;color:#4a90d9;font-weight:bold;}"
         ".quote{background:#f5f6f8;border-left:3px solid #c9ced6;color:#8a92a0;"
-        "font-size:12px;padding:4px 8px;border-radius:4px;margin-bottom:5px;"
-        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+        "font-size:12px;padding:5px 8px;border-radius:4px;margin-bottom:5px;"
+        "max-width:100%;overflow:hidden;}"
+        ".quote-name{color:#9aa3ae;margin-bottom:2px;}"
+        ".quote .msg-img{max-width:180px;max-height:120px;margin:2px 0;}"
+        ".fwd{border:1px solid #e3e6eb;border-radius:6px;padding:6px 8px;"
+        "margin-bottom:6px;background:#fafbfc;}"
+        ".fwd-title{color:#7d8590;font-size:12px;margin-bottom:4px;}"
+        ".fwd-row{font-size:13px;line-height:1.5;margin:2px 0;word-break:break-word;}"
+        ".fwd-name{color:#5a9e31;font-weight:600;margin-right:5px;}"
+        ".fwd .msg-img{max-width:140px;max-height:100px;display:inline-block;margin:2px 0;}"
         f".footer{{text-align:center;color:{_TIME_COLOR};font-size:11px;margin-top:10px;}}"
         "</style></head><body>"
         # data-shot-fit：让截图管线按这个盒子的真实尺寸定画布（否则固定宽视口

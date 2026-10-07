@@ -353,6 +353,24 @@ _PHANTOM_CALL_RE = re.compile(
     r"(?:请(?:立即)?(?:调用|执行|使用)|需(?:要)?调用|调用)\s*[a-z_][a-z0-9_]{2,}\s*\(")
 
 
+_TOOL_MARKUP_RE = re.compile(
+    r"<\s*(?:sticker|image|img|at|face|file|record|video|node|tool|function|invoke)\b"
+    r"|</\s*(?:sticker|image|at|face|tool|function|invoke)\s*>"
+    r"|send_sticker\s*\(|\w+_tool\s*\(")
+
+
+def is_tool_markup_leak(text: Any) -> bool:
+    """文本里带了"工具/伪 XML 标记"——那是模型把调用语法当消息发出来了。
+
+    实录（用户截图）：私聊里发出去一条 `<sticker sticker_id="9dc8..."/>`，
+    用户看到的就是这段源码。真发表情包要走 send_sticker 或计划里的 sticker 段。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    return bool(_TOOL_MARKUP_RE.search(stripped))
+
+
 def is_local_path_leak(text: Any) -> bool:
     """文本里掺了服务器本地文件路径，或让用户去调用某个"工具(参数)"。
 

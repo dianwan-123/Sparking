@@ -1014,6 +1014,53 @@ class Storage:
         ordered = sorted(merged.values(), key=lambda x: x.get("updated_at") or "", reverse=True)
         return ordered[:limit]
 
+    async def latest_summaries_by_scope(
+        self, scope_ids: Sequence[str], *, levels: Sequence[int] = (2, 3),
+        per_scope: int = 1,
+    ) -> dict[str, list[SummaryRecord]]:
+        """每个会话最新的高层摘要（默认 L2/L3）——给"各群一句话近况"用。
+
+        一次查询搞定所有会话（窗口函数），避免 N 个会话 N 次查询。
+        """
+        scopes = [s for s in dict.fromkeys(scope_ids) if s]
+        valid = [x for x in (levels or ()) if x in {1, 2, 3}]
+        if not scopes or not valid:
+            return {}
+        marks = ",".join("?" for _ in scopes)
+        level_marks = ",".join("?" for _ in valid)
+        rows = await self._fetchall(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY scope_id "
+            "ORDER BY level DESC, end_seq DESC) AS rn FROM summary_nodes "
+            f"WHERE scope_id IN ({marks}) AND status='active' AND level IN ({level_marks})) "
+            "WHERE rn <= ?",
+            (*scopes, *valid, max(1, int(per_scope))),
+        )
+        grouped: dict[str, list[SummaryRecord]] = {}
+        for row in rows:
+            record = SummaryRecord(
+                str(row["summary_id"]), str(row["scope_id"]), int(row["level"]),
+                int(row["start_seq"]), int(row["end_seq"]), str(row["title"]),
+                str(row["body"]), json.loads(row["topics_json"]), [],
+                str(row["created_at"]))
+            grouped.setdefault(record.scope_id, []).append(record)
+        return grouped
+
+    async def scope_activity(self, scope_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """每个会话的活跃度：最后一条消息时间 + 总条数。"""
+        scopes = [s for s in dict.fromkeys(scope_ids) if s]
+        if not scopes:
+            return {}
+        marks = ",".join("?" for _ in scopes)
+        rows = await self._fetchall(
+            "SELECT mi.scope_id AS sid, MAX(mr.occurred_at) AS last_at, COUNT(*) AS total "
+            "FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id "
+            "JOIN message_revisions mr ON mr.revision_id=mc.revision_id "
+            f"WHERE mi.scope_id IN ({marks}) AND mc.is_deleted=0 GROUP BY mi.scope_id",
+            (*scopes,),
+        )
+        return {str(row["sid"]): {"last_active": str(row["last_at"] or ""),
+                                  "messages": int(row["total"] or 0)} for row in rows}
+
     async def recent_topics(self, scope_id: str, limit: int = 10) -> list[dict[str, Any]]:
         rows = await self._fetchall(
             "SELECT title,hits,last_seq,created_at FROM group_topics WHERE scope_id=? ORDER BY last_seq DESC LIMIT ?",
