@@ -103,6 +103,16 @@
         { group_id: "1046398077", name: "BE指令饮品店☕️", messages: 10422, last_active: "2026-09-12T10:58:02+00:00", whitelisted: false },
       ],
     },
+    backup_memory: {
+      current_embedding_model: "bge-m3",
+      counts: { scopes: 3, messages: 17844, summaries: 126, memories: 412, catalog: 88, embeddings: 2931 },
+      exports: [
+        { name: "sparking-memory-20261007T143012Z.zip", size: 4_182_000 },
+        { name: "sparking-memory-20261005T090000Z.zip", size: 3_960_412 },
+      ],
+      last: { name: "sparking-memory-20261007T143012Z.zip" },
+      note: "导出的包可以在别的 bot 上导入（会话、消息、分层摘要、记忆账本、人物印象、群文化、情绪记忆、注入与日程）。重新导入时要匹配同一个嵌入模型：对不上就只导文本与记忆、跳过向量，面板会写明。",
+    },
     culture: {
       scope: "123456789",
       note: "说话风格与黑话是按群学的；人物档案与情绪记忆跨群共用一份。",
