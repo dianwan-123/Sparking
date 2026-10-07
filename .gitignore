@@ -33,3 +33,6 @@ tools/*
 .chat_out.txt
 .cfg_body.json
 tests_last_run.txt
+
+# 临时提交信息文件（git commit -F 用），不提交
+.commit_msg.txt
