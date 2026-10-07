@@ -706,7 +706,7 @@
     const logo = document.querySelector(".brand .logo");
     if (logo && !logo.dataset.image) {
       const img = document.createElement("img");
-      img.src = "../../logo.png";
+      img.src = "logo.png";   // 页面同级副本：跨出插件目录的路径在插件页里会 404
       img.alt = "Sparking";
       img.width = 34;
       img.height = 34;
@@ -748,13 +748,21 @@
     const usage = data.usage || {};
     const usageBox = $("overview-usage");
     usageBox.textContent = "";
-    const totalCalls = usage.total_calls ?? usage.calls ?? 0;
-    usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${usage.prompt_tokens ?? 0} tokens · 输出 ${usage.completion_tokens ?? 0} tokens`));
-    const daily = (usage.days || usage.daily || []).slice(-7);
+    // 后端给的是 totals.{calls,prompt_tokens,completion_tokens}（webui._read_overview）
+    // ——以前这里读 total_calls/prompt_tokens，于是条形图有数、上面一行全是 0
+    const totals = usage.totals || {};
+    const totalCalls = totals.calls ?? usage.total_calls ?? usage.calls ?? 0;
+    const promptTokens = totals.prompt_tokens ?? usage.prompt_tokens ?? 0;
+    const completionTokens = totals.completion_tokens ?? usage.completion_tokens ?? 0;
+    usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens · 输出 ${completionTokens} tokens`));
+    const daily = (usage.daily || usage.days || []).slice(-7);
     const peak = daily.reduce((top, row) => Math.max(top, Number(row.calls) || 0), 0) || 1;
     daily.forEach((row) => {
       const line = el("div", "usage-row");
-      line.appendChild(el("span", "usage-day", row.day));
+      const dayLabel = String(row.day || "").slice(5) || String(row.day || "");
+      const dayNode = el("span", "usage-day", dayLabel);
+      dayNode.title = String(row.day || "");
+      line.appendChild(dayNode);
       const track = el("div", "usage-track");
       const bar = el("div", "bar");
       bar.style.width = Math.max(2, Math.round(((Number(row.calls) || 0) / peak) * 100)) + "%";

@@ -45,16 +45,21 @@
 
   const data = {
     overview: {
-      enabled: true, version: "1.0.0",
+      enabled: true, version: "1.0.2",
       counts: { scopes: 3, messages: 17844, summaries: 126, memories: 412, catalog: 88, jobs: 5 },
       models: { judge: "mimo-v2.6-flash", reply: "mimo-v2.6-flash", summary: "deepseek-v3.2", persona: "小铃" },
       groups: ["123456789", "987654321"], mood: { mood: "雀跃", intensity: 0.62 },
       scripts: { custom: 2, learned: 7 },
       usage: {
-        total_calls: 1284, prompt_tokens: 892140, completion_tokens: 143002,
-        days: [{ day: "10-01", calls: 120 }, { day: "10-02", calls: 210 }, { day: "10-03", calls: 180 },
-               { day: "10-04", calls: 150 }, { day: "10-05", calls: 300 }, { day: "10-06", calls: 220 },
-               { day: "10-07", calls: 104 }],
+        // 与后端 storage.usage_summary 的真实形状一致（totals 对象 + daily 数组）
+        daily: [{ day: "2026-10-01", calls: 120, prompt_tokens: 82000, completion_tokens: 14000 },
+                { day: "2026-10-02", calls: 210, prompt_tokens: 143000, completion_tokens: 21000 },
+                { day: "2026-10-03", calls: 180, prompt_tokens: 121000, completion_tokens: 18000 },
+                { day: "2026-10-04", calls: 150, prompt_tokens: 98000, completion_tokens: 15000 },
+                { day: "2026-10-05", calls: 300, prompt_tokens: 205000, completion_tokens: 33000 },
+                { day: "2026-10-06", calls: 220, prompt_tokens: 151000, completion_tokens: 24000 },
+                { day: "2026-10-07", calls: 104, prompt_tokens: 71000, completion_tokens: 11000 }],
+        totals: { calls: 1284, prompt_tokens: 871000, completion_tokens: 136000 },
       },
     },
     scopes: [

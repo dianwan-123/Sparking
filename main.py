@@ -231,7 +231,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
     "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
-    "1.0.1",
+    "1.0.2",
 )
 class LongMemoryAgentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
