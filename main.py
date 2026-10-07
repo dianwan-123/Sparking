@@ -1612,14 +1612,22 @@ class LongMemoryAgentPlugin(Star):
             affinity=affinity,
         )
         context_data = parse_json_object(context) or {}
+        merged_affinity = affinity
+        try:
+            # 一个人的好感度跨群只有一份（写仍分群，读一律合并）
+            merged_affinity = await self.storage.get_affinity_any(
+                self._shared_scope_ids(scope_id), str(event.get_sender_id()))
+        except Exception:
+            merged_affinity = affinity
         context_data["sender_affinity"] = {
             "user_id": str(event.get_sender_id()),
-            **affinity,
+            **merged_affinity,
             "hint": "warmth是你对TA的好感度（0-100），影响你的态度和回复意愿，但你仍可自主决定",
         }
         try:
-            sender_impression = await self.storage.get_impression(
-                scope_id, str(event.get_sender_id())
+            # 同一个人只有一个印象：跨群合并（实录"人物印象每个群不互通"）
+            sender_impression = await self.storage.get_impression_any(
+                self._shared_scope_ids(scope_id), str(event.get_sender_id())
             )
         except Exception:
             sender_impression = {}
@@ -1949,9 +1957,11 @@ class LongMemoryAgentPlugin(Star):
                 image_urls=image_urls, batch_mode=batch_mode,
             )
             try:
-                await self.storage.adjust_affinity(
-                    scope_id, str(event.get_sender_id()), 1.0
-                )
+                nudge, why = self._affinity_nudge(text=str(stored.text or ""))
+                if nudge:
+                    await self.storage.adjust_affinity(
+                        scope_id, str(event.get_sender_id()), nudge, note=why or None
+                    )
             except Exception:
                 pass
             try:
@@ -5650,6 +5660,25 @@ class LongMemoryAgentPlugin(Star):
             labels.setdefault(str(scope_id), str(key))
         return labels
 
+    @staticmethod
+    def _affinity_nudge(*, text: str) -> tuple[float, str]:
+        """按这条消息的语气决定好感度涨跌（确定性规则，不指望模型自觉）。
+
+        实录：旧代码每回复一次就 `adjust_affinity(+1.0)`，**好感只涨不跌**——
+        用户做了次冒犯性测试（"你当我爸爸要不要"），好感度反而升了。
+        现在负面明显重于正面：好感涨得慢、掉得快，才像真人。
+        """
+        from .src.emotions import classify_interaction
+
+        delta = classify_interaction(text)
+        if delta is None:
+            return 0.0, ""
+        if delta.valence > 0:
+            return 0.5, ""
+        if delta.valence < 0:
+            return -1.5, "这条话说得不太客气"
+        return 0.0, ""
+
     def _plan_target_group(self, detail: str) -> tuple[str, str]:
         """Find a whitelist group mentioned in a plan detail (id or known key)."""
         for key in self._known_scopes:
@@ -8134,7 +8163,8 @@ class LongMemoryAgentPlugin(Star):
         if not scope:
             return "当前会话未启用记忆"
         affinity = await self.storage.get_affinity(scope, user_id)
-        impression = await self.storage.get_impression(scope, user_id)
+        impression = await self.storage.get_impression_any(
+            self._shared_scope_ids(scope), str(user_id))
         return compact_json({"user_id": user_id, "affinity": affinity,
                              "impression": impression}, 2000)
 
@@ -8331,8 +8361,10 @@ class LongMemoryAgentPlugin(Star):
         if not self.storage:
             raise RuntimeError("存储未就绪")
         scope = await self._scope_for_event(event, create=True)
-        target = user_id or event.get_sender_id()
-        return compact_json(await self.storage.get_affinity(scope, str(target)), 2000)
+        target = str(user_id or event.get_sender_id())
+        merged = await self.storage.get_affinity_any(
+            self._shared_scope_ids(scope), target)
+        return compact_json(merged, 2000)
 
     @filter.llm_tool(name="adjust_affinity")
     async def adjust_affinity_tool(

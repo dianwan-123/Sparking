@@ -156,10 +156,31 @@ def _positive_words(text: str) -> bool:
         "哈哈", "笑死", "乐", "草", "可爱", "夸", "成功", "好评"))
 
 
+# 占便宜/挑衅句式：字面上可能没有脏词，但明显是在耍人/占人便宜（实录：
+# "你当我老婆就不会了嘛""我当你爸爸要不要"——这类发言旧规则判不出负面，好感度还涨）
+_PROVOCATION_PATTERNS = (
+    r"当(我|你|他)?(老婆|老公|爸爸|爹|妈|儿子|女儿|狗|工具人)",
+    r"叫(我|你)?(爸爸|爹|妈|爷爷)",
+    r"(我|爷)是(你|他)(爹|爸|爷)",
+    r"(你|给我)(滚|闭嘴|去死|爬)",
+    r"(你|你他|你丫)(懂个|算个|配)",
+    r"你(有病|神经病|没事吧|有病吧)",
+)
+
+
+def _provocation(text: str) -> bool:
+    import re as _re
+
+    return any(_re.search(pattern, text) for pattern in _PROVOCATION_PATTERNS)
+
+
 def _negative_words(text: str) -> bool:
     return any(w in text for w in (
         "难过", "生气", "焦虑", "累", "困", "不舒服", "失望", "烦", "滚", "闭嘴",
-        "傻", "笨", "垃圾", "没用", "讨厌", "投诉", "失败", "崩了", "寄"))
+        "傻", "笨", "垃圾", "没用", "讨厌", "投诉", "失败", "崩了", "寄",
+        # 冒犯/挑衅（实录：被"你当我爸爸要不要"这类占便宜发言骚扰，好感度反而涨了）
+        "废物", "杂鱼", "去死", "滚开", "沙币", "傻逼", "神经病", "有病", "烦人",
+        "闭嘴", "你懂什么", "凭什么", "别烦", "恶心", "贱"))
 
 
 def classify_interaction(text: str) -> AffectDelta | None:
@@ -174,6 +195,9 @@ def classify_interaction(text: str) -> AffectDelta | None:
     if _negative_words(cleaned):
         valence -= 0.45
         arousal += 0.25
+    if _provocation(cleaned):
+        valence -= 0.5
+        arousal += 0.3
     if any(m in cleaned for m in ("！", "！", "??", "？？", "草", "乐")):
         arousal += 0.1
     if abs(valence) < 0.05 and abs(arousal) < 0.05:

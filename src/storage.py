@@ -894,6 +894,59 @@ class Storage:
             "updated_at": str(row["updated_at"]),
         }
 
+    async def get_affinity_any(self, scope_ids: Sequence[str], user_id: str) -> dict[str, Any]:
+        """跨会话合并读好感度：同一个人在哪都只算一份。
+
+        取"最近更新的那条"的 warmth（避免把不同群的好感平均成一个没意义的数），
+        互动数累加，备注取最新非空，并附 groups 说明在哪见过。
+        """
+        scopes = [s for s in dict.fromkeys(scope_ids) if s]
+        if not scopes:
+            return {"warmth": 50.0, "note": "", "interactions": 0, "updated_at": ""}
+        marks = ",".join("?" for _ in scopes)
+        rows = await self._fetchall(
+            "SELECT scope_id,warmth,note,interactions,updated_at FROM user_affinity "
+            f"WHERE scope_id IN ({marks}) AND user_id=? ORDER BY updated_at DESC",
+            (*scopes, str(user_id)),
+        )
+        if not rows:
+            return {"warmth": 50.0, "note": "", "interactions": 0, "updated_at": ""}
+        merged = {
+            "user_id": str(user_id),
+            "warmth": round(float(rows[0]["warmth"]), 1),
+            "note": next((str(r["note"]) for r in rows if str(r["note"] or "").strip()), ""),
+            "interactions": sum(int(r["interactions"] or 0) for r in rows),
+            "updated_at": str(rows[0]["updated_at"] or ""),
+        }
+        label_by_scope = {}
+        try:
+            for item in await self.all_scopes("aiocqhttp"):
+                label_by_scope[str(item.get("scope_id"))] = str(item.get("display_name") or "")
+        except Exception:
+            label_by_scope = {}
+        groups = [label_by_scope.get(str(r["scope_id"])) or str(r["scope_id"])[:8]
+                  for r in rows]
+        merged["groups"] = list(dict.fromkeys(groups))[:8]
+        return merged
+
+    async def get_impression_any(self, scope_ids: Sequence[str], user_id: str) -> dict[str, Any]:
+        """跨会话合并读人物印象（"一个人只有一份印象"，附 groups 出处）。"""
+        labels: dict[str, str] = {}
+        try:
+            for item in await self.all_scopes("aiocqhttp"):
+                name = str(item.get("display_name") or "").strip()
+                if name:
+                    labels[str(item.get("scope_id"))] = name
+        except Exception:
+            labels = {}
+        merged = await self.list_impressions(
+            [s for s in dict.fromkeys(scope_ids) if s], limit=200, merge=True,
+            labels=labels or None)
+        for item in merged:
+            if str(item.get("user_id")) == str(user_id):
+                return item
+        return {}
+
     async def upsert_impression(
         self, scope_id: str, user_id: str, *, display_name: str | None = None,
         impression: str | None = None, tags: Sequence[str] | None = None,
@@ -930,7 +983,7 @@ class Storage:
 
     async def list_impressions(
         self, scope_ids: Sequence[str], limit: int = 30, query: str | None = None,
-        *, merge: bool = True,
+        *, merge: bool = True, labels: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """读人物印象；`merge=True` 会把**同一个人的多条印象合并成一条**。
 
@@ -1011,6 +1064,10 @@ class Storage:
             scope_key = str(row["scope_id"] or "")
             if scope_key and scope_key not in item["groups"]:
                 item["groups"].append(scope_key)
+        if labels:
+            for item in merged.values():
+                item["groups"] = [str(labels.get(scope_id, scope_id)) or scope_id
+                                  for scope_id in item.get("groups", [])]
         ordered = sorted(merged.values(), key=lambda x: x.get("updated_at") or "", reverse=True)
         return ordered[:limit]
 
