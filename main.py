@@ -55,6 +55,8 @@ from .src.humanization import (
     is_tool_markup_leak,
     is_tool_status_narration,
     is_failure_report,
+    is_stage_direction,
+    is_tool_name_leak,
     is_plan_json_leak,
     parse_message_plan,
     salvage_message_plan,
@@ -4017,7 +4019,9 @@ class LongMemoryAgentPlugin(Star):
                     chain.chain.append(Comp.At(qq=str(target)))
                 except Exception:
                     pass
-            bubble = _bubble_text(descriptor.get("text", ""))
+            bubble = _bubble_text(self._sanitize_outgoing(descriptor.get("text", "")))
+            if not bubble.strip():
+                return
             if not bubble:
                 logger.info("长程记忆：跳过空文本段")
                 return
@@ -4059,6 +4063,49 @@ class LongMemoryAgentPlugin(Star):
         elif action == "reaction":
             emoji = descriptor.get("emoji_id") or next(iter(self.settings.allowed_emoji_ids), "76")
             await set_msg_emoji_like(event.bot, event.message_obj.message_id, str(emoji))
+
+    def _sanitize_outgoing(self, text: Any) -> str:
+        """**所有**要发进聊天的文本都过这里（统一出口）。
+
+        实录（用户截图）两次外泄：①"（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"
+        ②"（把刚才那张呆滞无语的表情包丢出来）"——分别是工具名外泄与舞台提示。
+        这里把六类检测收敛到一处，任何新增发送路径只要走它就自动受保护：
+        计划 JSON / 本地路径 / 伪 XML 工具语法 / 状态播报 / 失败汇报 / 工具名 / 舞台提示。
+        """
+        raw = str(text or "")
+        if not raw.strip():
+            return ""
+        if (is_plan_json_leak(raw) or is_local_path_leak(raw) or is_tool_markup_leak(raw)
+                or is_tool_status_narration(raw) or is_failure_report(raw)
+                or is_stage_direction(raw)):
+            logger.info("长程记忆：拦截疑似内部信息外泄：%s", " ".join(raw.split())[:80])
+            return ""
+        try:
+            names = self._known_tool_names()
+        except Exception:
+            names = ()
+        if is_tool_name_leak(raw, names):
+            logger.info("长程记忆：消息里出现工具名，已拦截：%s", " ".join(raw.split())[:80])
+            return ""
+        return raw
+
+    def _known_tool_names(self) -> tuple[str, ...]:
+        """当前插件可调用的工具名（+ 几个关键内部词），用于泄漏检测。"""
+        cached = getattr(self, "_tool_names_cache", None)
+        if cached is not None:
+            return cached
+        names: set[str] = {"send_sticker", "pick_sticker", "sticker_id", "media_id",
+                           "reply_to_message_id", "batch_transcript", "conversation_overview"}
+        try:
+            for tool in self._all_active_tools():
+                name = str(getattr(tool, "name", "") or "").strip()
+                if name:
+                    names.add(name.lower())
+        except Exception:
+            pass
+        result = tuple(sorted(names))
+        self._tool_names_cache = result
+        return result
 
     def _origin_prefixes(self) -> list[str]:
         """前缀直通名单；origin 拓展停用时仅保留 "/"（别封死管理命令）。"""
@@ -6283,7 +6330,8 @@ class LongMemoryAgentPlugin(Star):
         self._bind_gateway_client()
         await self.gateway.execute(
             "send_group_msg", group_id=int(group_id),
-            message=[{"type": "text", "data": {"text": _bubble_text(text)}}])
+            message=[{"type": "text", "data": {"text": _bubble_text(
+                self._sanitize_outgoing(text))}}])
 
     async def _script_run_program(self, program_id: str, code: str,
                                   title: str, description: str) -> dict[str, Any]:
@@ -6326,7 +6374,8 @@ class LongMemoryAgentPlugin(Star):
         self._bind_gateway_client()
         await self.gateway.execute(
             "send_private_msg", user_id=int(user_id),
-            message=[{"type": "text", "data": {"text": _bubble_text(text)}}])
+            message=[{"type": "text", "data": {"text": _bubble_text(
+                self._sanitize_outgoing(text))}}])
 
     def _standing_orders_block(self) -> str:
         """常备指令（OpenClaw standing orders）：每轮注入的持久行动授权。"""
@@ -7282,11 +7331,13 @@ class LongMemoryAgentPlugin(Star):
                     return f"拒绝发送：群 {target_group} 不在白名单，不能跨群发言"
                 return await self.gateway.execute(
                     "send_group_msg", group_id=int(target_group or 0),
-                    message=[{"type": "text", "data": {"text": _bubble_text(args.get("text", ""))}}])
+                    message=[{"type": "text", "data": {"text": _bubble_text(
+                        self._sanitize_outgoing(args.get("text", "")))}}])
             if tool == "qq_send_private" and self.gateway:
                 return await self.gateway.execute(
                     "send_private_msg", user_id=int(args.get("user_id", 0)),
-                    message=[{"type": "text", "data": {"text": _bubble_text(args.get("text", ""))}}])
+                    message=[{"type": "text", "data": {"text": _bubble_text(
+                        self._sanitize_outgoing(args.get("text", "")))}}])
             if tool == "qq_handle_friend_request" and self.qq:
                 return await self.qq.handle_friend_request(
                     str(args.get("flag", "")), bool(args.get("approve", True)),
@@ -8417,7 +8468,8 @@ class LongMemoryAgentPlugin(Star):
                 raise RuntimeError("QQ 网关未就绪")
             await self.gateway.execute(
                 "send_group_msg", group_id=int(group),
-                message=[{"type": "text", "data": {"text": _bubble_text(text)}}])
+                message=[{"type": "text", "data": {"text": _bubble_text(
+                self._sanitize_outgoing(text))}}])
             return "sent"
 
         async def _do_send_private(user_id: str, text: str) -> str:
@@ -8427,13 +8479,14 @@ class LongMemoryAgentPlugin(Star):
                 raise RuntimeError("目标或网关不可用")
             await self.gateway.execute(
                 "send_private_msg", user_id=int(user),
-                message=[{"type": "text", "data": {"text": _bubble_text(text)}}])
+                message=[{"type": "text", "data": {"text": _bubble_text(
+                self._sanitize_outgoing(text))}}])
             return "sent"
 
         async def _do_say(text: str) -> str:
             if event is None:
                 raise RuntimeError("当前任务没有会话上下文，改用 send_group（需群号）")
-            await self._send_segment(event, {"action": "text", "text": _bubble_text(text)})
+            await self._send_segment(event, {"action": "text", "text": text})
             return "sent"
 
         class _BotSandbox:

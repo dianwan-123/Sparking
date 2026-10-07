@@ -395,6 +395,47 @@ _FAIL_REPORT_RE = re.compile(
     r"(?:发出去|发出|发送|送达|发出去|贴出去|发出来)?")
 
 
+_STAGE_DIRECTION_VERBS = ("丢", "发", "甩", "扔", "丢出来", "发出来", "递", "贴", "补", "来一句")
+_STAGE_DIRECTION_NOUNS = ("表情包", "表情", "图片", "图", "卡片", "记录", "转发", "照片", "截图")
+
+
+def is_stage_direction(text: Any) -> bool:
+    """整条消息是**舞台提示**：写着"（把刚才那张表情包丢出来）"这类旁白，而不是真的说话。
+
+    实录（用户截图）：bot 发了一句"（把刚才那张呆滞无语的表情包丢出来）"——它把自己的
+    动作当成台词写出来了。真发表情就直接发，不需要旁白；配音式的动作说明一律丢掉。
+    """
+    stripped = " ".join(str(text or "").split())
+    if not stripped or len(stripped) > 40:
+        return False
+    core = _strip_brackets(stripped)
+    if not core or core == stripped:
+        return False            # 必须整条被括号包着才算旁白
+    if not any(noun in core for noun in _STAGE_DIRECTION_NOUNS):
+        return False
+    return any(verb in core for verb in _STAGE_DIRECTION_VERBS)
+
+
+def is_tool_name_leak(text: Any, tool_names: "Iterable[str] | None" = None) -> bool:
+    """消息里出现了**工具名**——聊天里不该有工具名，那是内部机制外泄。
+
+    实录（用户截图）："（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"——
+    它把工具调用过程当台词写出来了（旧守卫只认 `xx_tool(` 这种带括号的形式，漏了裸名）。
+    工具名取自插件实际可调用的工具表（权威名单），命中即视为泄漏。
+    """
+    stripped = " ".join(str(text or "").split())
+    if not stripped:
+        return False
+    names = [str(name) for name in (tool_names or ()) if str(name).strip()]
+    for name in names:
+        if len(name) < 4:
+            continue
+        if re.search(r"(?<![0-9a-zA-Z_])" + re.escape(name) + r"(?![0-9a-zA-Z_])", stripped,
+                     re.IGNORECASE):
+            return True
+    return False
+
+
 def is_failure_report(text: Any) -> bool:
     """整条消息就是"我没发出XX/XX发送失败"这种失败汇报（含否定的短句）。
 
