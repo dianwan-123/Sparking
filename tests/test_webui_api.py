@@ -749,7 +749,7 @@ class PublishMetadataTests(unittest.TestCase):
         metadata = (self.root / "metadata.yaml").read_text(encoding="utf-8")
         self.assertIn("author: Rikka0612", metadata)
         self.assertIn("version: v1.0.0", metadata)
-        self.assertIn("Rikka0612/Sparking", metadata)
+        self.assertIn("dianwan-123/Sparking", metadata)
 
     def test_no_bundled_example_extensions(self):
         scripts = self.root / "scripts"

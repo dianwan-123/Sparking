@@ -7,7 +7,7 @@ desc: |
   以及表情包、消息表情回应和戳一戳。
 version: v1.0.0
 author: Rikka0612
-repo: https://github.com/Rikka0612/Sparking
+repo: https://github.com/dianwan-123/Sparking
 astrbot_version: ">=4.27,<5"
 support_platforms:
   - aiocqhttp

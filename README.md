@@ -251,7 +251,7 @@ astrbot_plugin_long_memory_agent/   # 插件包名（保持不变，避免破坏
 
 ## 📄 作者
 
-**Rikka0612** · 仓库：[github.com/Rikka0612/Sparking](https://github.com/Rikka0612/Sparking)
+**Rikka0612** · 仓库：[github.com/dianwan-123/Sparking](https://github.com/dianwan-123/Sparking)
 
 本项目为个人自用向插件，代码与文档持续迭代；使用前请自行评估风险并做好数据备份。
 
