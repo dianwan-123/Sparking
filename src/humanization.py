@@ -370,6 +370,23 @@ _STATUS_NARRATION_RE = re.compile(
     + r")[\s！!。.~～）)】\]－—-]*$")
 
 
+# 指示语：上面那段 / 这张图 / 那条消息……（实录："（已发上面那段）"）
+# 名词可以省：只说"上面那段""这张"也算（动词在场时不会误伤正常话）
+_DEIXIS = (r"(?:上[面头]|下[面头]|前[面头])?(?:那|这)(?:段|张|条|个|些|份)?"
+           r"(?:话|段话|图|图片|照片|卡片|文件|表情包|表情|消息|记录|转发|东西|内容|文字)?")
+_STATUS_WORD = (r"(?:已发(?:了|出|送|好)?|发(?:了|出|送|完|好)|已发送|已送达|发送成功|"
+                r"发送完成|已完成|完成|已贴|贴好)")
+
+
+_BRACKET_CHARS = (" \t\u3000（）()【】[]{}<>「」『』"
+                  "－—-~～！!？?。.、,，；;：:")
+
+
+def _strip_brackets(value: str) -> str:
+    """去掉首尾的括号与标点（**全角半角都要去**：漏了「）」会让规则整条失效）。"""
+    return value.strip(_BRACKET_CHARS)
+
+
 def is_tool_status_narration(text: Any) -> bool:
     """整条消息就是"工具干完活了"的状态播报（表情包已发 / 图片已发送 / 转发完成）。
 
@@ -380,7 +397,20 @@ def is_tool_status_narration(text: Any) -> bool:
     stripped = str(text or "").strip()
     if not stripped or len(stripped) > 24:
         return False
-    return bool(_STATUS_NARRATION_RE.match(stripped))
+    if _STATUS_NARRATION_RE.match(stripped):
+        return True
+    # 第二种：状态动词配指示代词（"已发上面那段"、"上面那段已发"、"已发好了"）
+    # ——整条必须只剩这些词，带别的内容就不算（"上面那段我重发了"是正常话）
+    core = _strip_brackets(stripped)
+    if not core:
+        return False
+    # 无括号的极短句（"发了""好了"）可能是正经回答，别误杀；带括号就一定是状态注记
+    if len(core) < 3 and core == stripped:
+        return False
+    pattern = re.compile(
+        r"^(?:(?:" + _STATUS_WORD + r")(?:\s*" + _DEIXIS + r")?"
+        r"|[0-9]*\.?\s*" + _DEIXIS + r"\s*(?:" + _STATUS_WORD + r"))(?:\s*了)?$")
+    return bool(pattern.match(core))
 
 
 def is_tool_markup_leak(text: Any) -> bool:

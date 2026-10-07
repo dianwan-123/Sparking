@@ -3819,14 +3819,14 @@ class LongMemoryAgentPlugin(Star):
         稳定分区，不改任何一段的内容与延迟。
         """
         segments = list(getattr(plan, "segments", ()) or [])
-        if len(segments) < 3:
+        if len(segments) < 2:
             return plan
         texts: list[Any] = []
         media: list[Any] = []
         for item in segments:
             kind = str(getattr(item, "action", ""))
             (media if kind in self._MEDIA_ACTIONS else texts).append(item)
-        if not media or len(texts) < 2:
+        if not media or not texts:
             return plan
         ordered = texts + media
         if ordered == segments:
