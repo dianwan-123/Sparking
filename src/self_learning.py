@@ -50,7 +50,7 @@ SKILL_REVIEW_SYSTEM_PROMPT = """
 硬性规则：
 - 一个技能只做一件事；id 不许与已有技能重复（要改进已有技能就返回同 id，会覆盖更新）。
 - prompts 每条 ≤800 字、最多 8 条；code ≤12000 字符且必须是完整可运行的 Python。
-- api 能力（与 docs/SCRIPT_EXT_API.md 契约一致，只能用这些）：
+- api 能力（与 scripts/ 拓展接口契约一致，只能用这些）：
   api.log(msg)、api.data_dir()、api.kv_get(k)/api.kv_set(k,v)、api.now()、
   api.llm(prompt, system_prompt="", provider_id="")、api.memory_note(text)、
   api.http_get(url)/api.http_post_json(url, payload)/api.http_get_bytes(url)（原始字节下载）、
