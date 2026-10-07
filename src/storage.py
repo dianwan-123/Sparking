@@ -479,7 +479,7 @@ class Storage:
             return []
         marks = ",".join("?" for _ in scopes)
         rows = await self._fetchall(
-            "SELECT mi.message_id,mr.revision_id,mi.scope_id,mc.scope_seq,mi.upstream_message_id,mr.sender_id,mr.sender_name,mr.text,mr.occurred_at,mr.parts_json,mr.reply_to FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id JOIN message_revisions mr ON mr.revision_id=mc.revision_id JOIN event_headers eh ON eh.event_id=mr.event_id WHERE mi.scope_id IN (" + marks + ") AND mc.is_deleted=0 AND (eh.event_type LIKE 'notice.%' OR eh.event_type LIKE 'request.%') ORDER BY mc.scope_seq DESC LIMIT ?",
+            "SELECT mi.message_id,mr.revision_id,mi.scope_id,mc.scope_seq,mi.upstream_message_id,mr.sender_id,mr.sender_name,mr.text,mr.occurred_at,mr.parts_json,mr.reply_to FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id JOIN message_revisions mr ON mr.revision_id=mc.revision_id JOIN event_headers eh ON eh.event_id=mr.event_id WHERE mi.scope_id IN (" + marks + ") AND mc.is_deleted=0 AND (eh.event_type LIKE 'notice.%' OR eh.event_type LIKE 'request.%') ORDER BY mr.occurred_at DESC LIMIT ?",
             (*scopes, _limit(limit, 100)),
         )
         return [_stored(row) for row in reversed(rows)]
@@ -624,6 +624,33 @@ class Storage:
                 await db.rollback()
                 raise
         return SummaryRecord(summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, list(topics), message_ids, now)
+
+    async def upsert_topics(self, scope_id: str, topics: Sequence[str], last_seq: int) -> int:
+        """把一批话题写进 group_topics（同 scope 同标题 hits+1 并推进 last_seq）。
+
+        compression 侧一直在调它（实录日志：'Storage' object has no attribute 'upsert_topics'），
+        但方法从来没被实现过——话题表因此永远是空的。与 store_summary 里那段内联 SQL 同语义。
+        """
+        cleaned = [str(item).strip()[:80] for item in (topics or [])]
+        cleaned = [item for item in dict.fromkeys(cleaned) if item][:12]
+        if not cleaned:
+            return 0
+        db = self._conn()
+        now = utc_now()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            for topic in cleaned:
+                await db.execute(
+                    "INSERT INTO group_topics(topic_id,scope_id,title,hits,last_seq,"
+                    "created_at) VALUES(?,?,?,1,?,?) "
+                    "ON CONFLICT(scope_id,title) DO UPDATE SET hits=group_topics.hits+1, "
+                    "last_seq=excluded.last_seq",
+                    (uuid.uuid4().hex, scope_id, topic, int(last_seq), now))
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return len(cleaned)
 
     async def list_summaries(self, scope_id: str | Sequence[str], limit: int = 8, levels: Sequence[int] | None = None, query: str | None = None) -> list[SummaryRecord]:
         scopes = [scope_id] if isinstance(scope_id, str) else [s for s in scope_id if s]

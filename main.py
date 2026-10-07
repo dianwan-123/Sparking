@@ -6675,32 +6675,7 @@ class LongMemoryAgentPlugin(Star):
                 impression = await self.storage.get_impression(scope, user)
                 return compact_json({"affinity": affinity, "impression": impression}, 2000)
             if tool == "send_sticker" and self.stickers:
-                sticker = self.stickers.resolve(str(args.get("sticker_id", "")))
-                if sticker is None:
-                    picked = self.stickers.pick(str(args.get("query", "")), 1)
-                    sticker = self.stickers.resolve(
-                        str(picked[0]["sticker_id"])
-                    ) if picked else None
-                if sticker is None:
-                    return "没有可发送的表情包"
-                target_group = str(args.get("group_id", "")).strip()
-                if target_group and not self.settings.allows_group(target_group):
-                    return f"拒绝发送：群 {target_group} 不在白名单"
-                if not target_group:
-                    active = self._most_active_group()
-                    target_group = active[1] if active else ""
-                if not target_group:
-                    return "没有可发送的活跃群"
-                await self.gateway.execute(
-                    "send_group_msg", group_id=int(target_group),
-                    message=[{"type": "image",
-                              "data": {"file": "file://" + self.stickers.send_path(sticker)}}],
-                )
-                try:
-                    await self.stickers.note(sticker.sha256, bump_use=True)
-                except Exception:
-                    pass
-                return f"已发表情包到群{target_group}"
+                return await self._send_sticker_action(args)
             if tool == "done":
                 return "done"
             return f"unknown tool: {tool}"
@@ -8060,6 +8035,68 @@ class LongMemoryAgentPlugin(Star):
         if not entries:
             return "没有匹配的表情"
         return compact_json(entries, 3000)
+
+    async def _send_sticker_action(self, args: dict[str, Any]) -> str:
+        """往群里发一张库存表情包（主动发/被要求发都走这里）。
+
+        实录：提示词一直承诺有 send_sticker，但它只挂在内部动作分发上、**没有注册成工具**，
+        模型在主循环里按名字调用不到 → 跑去别家插件的 run_wyc_tool 包装器里试，白烧一轮
+        （日志：无效的工具名称或工具未启用: send_sticker）。现在补成真工具，两处共用这一段。
+        """
+        if self.stickers is None:
+            return "表情包库未启用"
+        payload = args if isinstance(args, dict) else {}
+        sticker = self.stickers.resolve(str(payload.get("sticker_id", "")))
+        if sticker is None:
+            picked = self.stickers.pick(str(payload.get("query", "")), 1)
+            sticker = self.stickers.resolve(
+                str(picked[0]["sticker_id"])) if picked else None
+        if sticker is None:
+            return "没有可发送的表情包（可用 list_stickers 翻库存）"
+        target_group = str(payload.get("group_id", "")).strip()
+        if target_group and not self.settings.allows_group(target_group):
+            return f"拒绝发送：群 {target_group} 不在白名单"
+        if not target_group:
+            active = self._most_active_group()
+            target_group = active[1] if active else ""
+        if not target_group:
+            return "没有可发送的活跃群"
+        if self.gateway is None:
+            return "QQ 网关未就绪"
+        self._bind_gateway_client()
+        await self.gateway.execute(
+            "send_group_msg", group_id=int(target_group),
+            message=[{"type": "image",
+                      "data": {"file": "file://" + self.stickers.send_path(sticker)}}],
+        )
+        try:
+            await self.stickers.note(sticker.sha256, bump_use=True)
+        except Exception:
+            pass
+        return f"已发表情包到群{target_group}"
+
+    @filter.llm_tool(name="send_sticker")
+    async def send_sticker_tool(
+        self, event: AstrMessageEvent, sticker_id: str = "", query: str = "",
+        group_id: str = "",
+    ):
+        """主动往群里发一张表情包（库存里的）。想接梗/吐槽/卖萌又不想只发文字时用它；
+        在群里回话时也可以在计划里直接加 sticker 段，不必调这个工具。
+
+        Args:
+            sticker_id(string): 库存里的表情 id（pick_sticker/list_stickers 拿）；与 query 二选一。
+            query(string): 没有 id 时按含义挑一张，如"无语""狗头""赞"。
+            group_id(string): 发到哪个群（群号或群名）；留空=最近最活跃的白名单群。
+        """
+        resolved = str(group_id or "").strip()
+        if resolved and not resolved.isdigit():
+            scope_ref, key, hint = await self._resolve_scope_ref(resolved)
+            if not key:
+                return f"没能定位这个群：{hint}"
+            resolved = key
+        return await self._send_sticker_action({
+            "sticker_id": sticker_id, "query": query, "group_id": resolved,
+        })
 
     @filter.llm_tool(name="get_affinity")
     async def get_affinity_tool(self, event: AstrMessageEvent, user_id: str = ""):
