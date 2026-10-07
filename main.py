@@ -3832,14 +3832,17 @@ class LongMemoryAgentPlugin(Star):
             or "风控" in error_text
         )
 
+    # 方括号是**可选**的：实录模型有时候写 `[sticker: <sha>]`，有时候只写 `sticker: <sha>`，
+    # 后者以前没被认出来 → 原样当成正文发出去（用户截图：群里出现 "sticker: 6af5f198…"）。
     _STICKER_PLACEHOLDER_RE = re.compile(
-        r"\[\s*(?:sticker|表情|表情包)\s*[:：]?\s*([0-9a-fA-F]{16,64})\s*\]?",
+        r"[\[（(]?\s*(?:sticker|贴纸|表情包|表情)\s*[:：]?\s*([0-9a-fA-F]{16,64})\s*[\]）)]?",
         re.IGNORECASE)
     # "悬挂的占位开头"：实录模型把 [sticker: 和 <sha>] 拆成两条消息发出去，
     # 任何一半单独看都不是完整占位 → 发送前要把相邻两段拼起来再判断
     _STICKER_DANGLING_RE = re.compile(
-        r"\[\s*(?:sticker|表情|表情包)\s*[:：]?\s*$", re.IGNORECASE)
-    _STICKER_TAIL_RE = re.compile(r"^\s*([0-9a-fA-F]{16,64})\s*\]?\s*$")
+        r"[\[（(]?\s*(?:sticker|贴纸|表情包|表情)\s*[:：]?\s*$",
+        re.IGNORECASE)
+    _STICKER_TAIL_RE = re.compile(r"^\s*([0-9a-fA-F]{16,64})\s*[\]）)]?\s*$")
 
     async def _send_sticker_placeholder(self, event: AstrMessageEvent,
                                         sticker_id: str) -> bool:
