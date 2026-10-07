@@ -733,7 +733,7 @@ class PluginLogoTests(unittest.TestCase):
 
 
 class PublishMetadataTests(unittest.TestCase):
-    """第一版发布（v1.0.0 / 作者 Rikka0612）：占位符不许再溜进包里。"""
+    """发布元数据（当前 v1.0.1 / 作者 Rikka0612）：占位符不许再溜进包里。"""
 
     @classmethod
     def setUpClass(cls):
@@ -742,13 +742,13 @@ class PublishMetadataTests(unittest.TestCase):
     def test_register_author_and_version(self):
         main = (self.root / "main.py").read_text(encoding="utf-8")
         self.assertIn('"Rikka0612",', main)
-        self.assertIn('"1.0.0",', main)
+        self.assertIn('"1.0.1",', main)
         self.assertNotIn("REPLACE_BEFORE_PUBLISHING", main)
 
     def test_metadata_identity(self):
         metadata = (self.root / "metadata.yaml").read_text(encoding="utf-8")
         self.assertIn("author: Rikka0612", metadata)
-        self.assertIn("version: v1.0.0", metadata)
+        self.assertIn("version: v1.0.1", metadata)
         self.assertIn("dianwan-123/Sparking", metadata)
 
     def test_no_bundled_example_extensions(self):

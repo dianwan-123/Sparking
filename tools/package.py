@@ -10,7 +10,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "dist"
-ZIP_NAME = "astrbot_plugin_long_memory_agent-v1.0.0.zip"
+
+
+def _version() -> str:
+    """版本号只认 metadata.yaml 这一处，打包脚本不再手抄（免得改版本漏一处）。"""
+    for line in (ROOT / "metadata.yaml").read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("version:"):
+            value = line.split(":", 1)[1].strip()
+            assert value.startswith("v") and value.count(".") == 2, f"版本号格式怪：{value}"
+            return value
+    raise AssertionError("metadata.yaml 里没有 version 字段")
+
+
+VERSION = _version()
+ZIP_NAME = f"astrbot_plugin_long_memory_agent-{VERSION}.zip"
 EXCLUDE_DIRS = {".references", ".refs", ".validation", ".zcode", ".napcat_docs", "plugin_data", "tests", "tools", "dist", "__pycache__", "build"}
 EXCLUDE_FILES = {"tests_last_run.txt"}
 
@@ -31,7 +44,7 @@ def build(out_dir: Path | None = None, root: Path | None = None) -> Path:
     with open(root / "_conf_schema.json", encoding="utf-8") as handle:
         json.load(handle)
     with open(root / "metadata.yaml", encoding="utf-8") as handle:
-        assert "v1.0.0" in handle.read()
+        assert VERSION in handle.read(), "metadata.yaml 的版本号与打包目标不一致"
 
     if target.exists():
         target.unlink()
