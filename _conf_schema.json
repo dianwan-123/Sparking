@@ -1,0 +1,438 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用插件",
+    "default": true
+  },
+  "group_whitelist": {
+    "type": "list",
+    "description": "允许完整存储和自主聊天的QQ群号",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "judge_provider_id": {
+    "type": "string",
+    "description": "自主回复判定模型；留空使用当前模型",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "reply_provider_id": {
+    "type": "string",
+    "description": "回复与Agent模型；留空使用当前模型",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "summary_provider_id": {
+    "type": "string",
+    "description": "分层压缩模型；留空回退回复模型",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "embedding_provider_id": {
+    "type": "string",
+    "description": "可选Embedding Provider ID；AstrBot 4.28没有embedding选择器",
+    "default": ""
+  },
+  "persona_id": {
+    "type": "string",
+    "description": "自主回复/定时任务使用的AstrBot人格ID（人格管理页可见）；留空则用插件内置拟人风格",
+    "default": ""
+  },
+  "vision_provider_id": {
+    "type": "string",
+    "description": "看图用的视觉模型Provider ID；留空则让回复模型直接看图（需模型有视觉能力）",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "recent_message_limit": {
+    "type": "int",
+    "description": "注入最近消息数",
+    "default": 30
+  },
+  "catalog_limit": {
+    "type": "int",
+    "description": "总体记忆目录条数",
+    "default": 24
+  },
+  "summary_limit": {
+    "type": "int",
+    "description": "注入分层摘要数（L1/L2/L3 全含，跨会话带出处）",
+    "default": 14
+  },
+  "evidence_limit": {
+    "type": "int",
+    "description": "注入精确证据数",
+    "default": 12
+  },
+  "context_char_budget": {
+    "type": "int",
+    "description": "动态记忆最大字符预算",
+    "default": 24000
+  },
+  "compression_batch_size": {
+    "type": "int",
+    "description": "L1压缩消息批次",
+    "default": 40
+  },
+  "autonomous_sample_rate": {
+    "type": "float",
+    "description": "普通消息进入判定模型的概率",
+    "default": 0.35
+  },
+  "batch_window_min_seconds": {
+    "type": "int",
+    "description": "自主判定攒批窗口下限秒数：非@群消息先缓冲，隔一段随机时间（15~60秒）才统一判定一次",
+    "default": 15
+  },
+  "batch_window_max_seconds": {
+    "type": "int",
+    "description": "自主判定攒批窗口上限秒数，每批在窗口区间内随机取值",
+    "default": 60
+  },
+  "batch_max_messages": {
+    "type": "int",
+    "description": "攒批缓冲条数上限，攒满立即统一判定（防刷屏时等太久）",
+    "default": 10
+  },
+  "wake_merge_seconds": {
+    "type": "float",
+    "description": "唤醒合并窗口（秒）：@/私聊连发的消息在窗口内会并入同一次回复，像真人一样一起读完再回（防抖：每条新消息都会把窗口往后推；0=关闭，逐条即回）",
+    "default": 4.0
+  },
+  "wake_merge_max_seconds": {
+    "type": "float",
+    "description": "唤醒合并上限（秒）：从第一条唤醒消息起最多等这么久一定开口，防止对方一直连发导致永远不回",
+    "default": 15.0
+  },
+  "group_cooldown_seconds": {
+    "type": "int",
+    "description": "群自主互动冷却秒数",
+    "default": 180
+  },
+  "user_cooldown_seconds": {
+    "type": "int",
+    "description": "用户自主互动冷却秒数",
+    "default": 300
+  },
+  "max_actions_per_hour": {
+    "type": "int",
+    "description": "每群每小时自主动作上限",
+    "default": 8
+  },
+  "max_random_wait_seconds": {
+    "type": "int",
+    "description": "自主回复最大随机等待秒数",
+    "default": 15
+  },
+  "quiet_start_hour": {
+    "type": "int",
+    "description": "静默开始小时（本地时区）",
+    "default": 1
+  },
+  "quiet_end_hour": {
+    "type": "int",
+    "description": "静默结束小时（本地时区）",
+    "default": 7
+  },
+  "sticker_learning": {
+    "type": "bool",
+    "description": "学习NapCat图片表情；默认关闭",
+    "default": false
+  },
+  "sticker_max_bytes": {
+    "type": "int",
+    "description": "单个表情最大字节",
+    "default": 8000000
+  },
+  "sticker_max_count": {
+    "type": "int",
+    "description": "表情库最大数量",
+    "default": 2000
+  },
+  "reactions_enabled": {
+    "type": "bool",
+    "description": "允许NapCat消息表情回应",
+    "default": true
+  },
+  "pokes_enabled": {
+    "type": "bool",
+    "description": "允许NapCat戳一戳回应",
+    "default": true
+  },
+  "allowed_emoji_ids": {
+    "type": "list",
+    "description": "可由模型选择的消息表情ID",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "76",
+      "124",
+      "144"
+    ]
+  },
+  "dashboard_base_url": {
+    "type": "string",
+    "description": "AstrBot Dashboard API地址，默认仅允许回环地址",
+    "default": "http://127.0.0.1:6185"
+  },
+  "dashboard_api_key": {
+    "type": "string",
+    "description": "仅授予plugin和skill scope的API Key",
+    "secret": true,
+    "default": ""
+  },
+  "allow_arbitrary_plugin_urls": {
+    "type": "bool",
+    "description": "允许官方市场外URL安装（高风险）",
+    "default": false
+  },
+  "agent_max_steps": {
+    "type": "int",
+    "description": "Agent最大工具步数（网页操作/过验证等多步任务需要较大值，默认40）",
+    "default": 40
+  },
+  "tool_timeout_seconds": {
+    "type": "int",
+    "description": "单个工具超时",
+    "default": 60
+  },
+  "llm_timeout_seconds": {
+    "type": "int",
+    "description": "LLM调用超时",
+    "default": 180
+  },
+  "enable_qq_tools": {
+    "type": "bool",
+    "description": "允许LLM自主使用QQ工具（好友、群、资料、撤回等）",
+    "default": true
+  },
+  "enable_qzone": {
+    "type": "bool",
+    "description": "允许LLM自主管理QQ空间（发布、点赞、评论、删除）",
+    "default": true
+  },
+  "enable_media_archive": {
+    "type": "bool",
+    "description": "自动保存白名单群的图片/文件/链接到本地",
+    "default": true
+  },
+  "enable_scheduler": {
+    "type": "bool",
+    "description": "允许LLM自行创建和执行定时任务（新闻、说说等）",
+    "default": true
+  },
+  "max_sequence_segments": {
+    "type": "int",
+    "description": "一次自主回复最多连续消息数",
+    "default": 6
+  },
+  "sequence_char_limit": {
+    "type": "int",
+    "description": "一次自主回复总字符上限",
+    "default": 2000
+  },
+  "typing_chars_per_second": {
+    "type": "float",
+    "description": "拟人打字速度（字符/秒）",
+    "default": 8.0
+  },
+  "media_max_file_mb": {
+    "type": "int",
+    "description": "单个媒体/下载文件上限(MB)",
+    "default": 15
+  },
+  "media_total_mb": {
+    "type": "int",
+    "description": "媒体归档总容量上限(MB)",
+    "default": 1024
+  },
+  "web_fetch_max_mb": {
+    "type": "int",
+    "description": "网页抓取内容上限(MB)",
+    "default": 5
+  },
+  "gateway_max_per_hour": {
+    "type": "int",
+    "description": "QQ发送类动作每小时上限",
+    "default": 40
+  },
+  "self_reflect_interval_hours": {
+    "type": "int",
+    "description": "长周期自我打理间隔（小时）：总结记忆/发说说/改资料/换状态（0=关闭）",
+    "default": 6
+  },
+  "mood_update_minutes": {
+    "type": "int",
+    "description": "情绪自更新间隔（分钟）：定期根据最近生活刷新自己的心情，心情与签名明显不搭时顺手换个性签名（0=关闭）",
+    "default": 60
+  },
+  "enable_private_memory": {
+    "type": "bool",
+    "description": "允许私聊进入统一记忆与回复链路",
+    "default": true
+  },
+  "auto_handle_requests": {
+    "type": "bool",
+    "description": "记录好友申请/群邀请等事件供LLM主动查询处理",
+    "default": true
+  },
+  "proactive_interval_minutes": {
+    "type": "int",
+    "description": "短巡查间隔（分钟）：查通知/梳理话题/参与聊天/私聊（0=关闭）",
+    "default": 15
+  },
+  "heartbeat_interval_seconds": {
+    "type": "int",
+    "description": "心跳间隔秒数：拟人事件循环每隔一会醒来一次，执行到点日程/闲时消遣/潜水看群（0=关闭）",
+    "default": 120
+  },
+  "idle_actions_per_hour": {
+    "type": "int",
+    "description": "闲时消遣每小时上限（逛空间/戳人/私聊/搜新闻等）",
+    "default": 4
+  },
+  "plan_interval_hours": {
+    "type": "int",
+    "description": "自主规划周期（小时）：每隔几小时把未来一段时间排成具体日程",
+    "default": 6
+  },
+  "origin_wake_prefixes": {
+    "type": "string",
+    "description": "原版兼容：以这些前缀开头的消息直通 AstrBot 原生命令与插件命令（逗号分隔，如 /,小夜；默认 /）",
+    "default": "/"
+  },
+  "text_to_image_threshold": {
+    "type": "int",
+    "description": "长文本转图阈值：文本字符数超过此值自动调用 text_to_image 渲染成图片发送（0=禁用）",
+    "default": 500
+  },
+  "style_learn_hours": {
+    "type": "int",
+    "description": "说话风格学习周期（小时）：每隔几小时用 LLM 总结群友的口头禅与语气存入风格档案，回复时自动模仿（0=关闭）",
+    "default": 3
+  },
+  "browser_auto_install": {
+    "type": "bool",
+    "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；关闭后仅检测上报",
+    "default": true
+  },
+  "subagent_enabled": {
+    "type": "bool",
+    "description": "启用子agent：主agent可并行派发子任务（批量看图分析、整理资料、执行多步子任务等），执行型子agent拥有除浏览器外的全部工具，结果由主agent汇总",
+    "default": true
+  },
+  "subagent_provider_id": {
+    "type": "string",
+    "description": "子agent使用的模型 ID（留空则与主模型一致）",
+    "default": ""
+  },
+  "subagent_tools_enabled": {
+    "type": "bool",
+    "description": "执行型子agent：子agent自带除浏览器外的全部工具（ssh/python_exec/文件/发媒体等），真正动手干活而不是只出分析（无事件上下文的定时派发仍走单次分析）",
+    "default": true
+  },
+  "decision_subagent_enabled": {
+    "type": "bool",
+    "description": "决策子agent：判定器认为需要时（needs_plan），回复前先派一个只读子agent做需求梳理（自由形式的理解与执行建议，无固定任务分类），注入主agent上下文由其自主执行",
+    "default": true
+  },
+  "decision_subagent_max_steps": {
+    "type": "int",
+    "description": "决策子agent最多工具步数（只读核查用，不需要太大）",
+    "default": 6
+  },
+  "browser_persist": {
+    "type": "bool",
+    "description": "浏览器持久化：用磁盘用户数据目录（browser_profile）保存 cookies/登录态/页面状态，像真浏览器一样跨重启保留（仍是无头轻量的 chromium）；关闭则每次用临时会话",
+    "default": true
+  },
+  "browser_executable_path": {
+    "type": "string",
+    "description": "可选：手动指定浏览器可执行文件（完整 chrome.exe，而非 headless_shell）。留空自动探测 ms-playwright 下的完整 chromium。当安全软件拦截 headless_shell.exe 导致截图超时时，指到 ...\\ms-playwright\\chromium-<版本>\\chrome-win64\\chrome.exe 即可",
+    "default": ""
+  },
+  "ssh_host": {
+    "type": "string",
+    "description": "SSH 远程主机 IP 或域名（留空则 SSH 功能整体不启用）。目前仅面向 Ubuntu 机器",
+    "default": ""
+  },
+  "ssh_port": {
+    "type": "int",
+    "description": "SSH 端口",
+    "default": 22
+  },
+  "ssh_user": {
+    "type": "string",
+    "description": "SSH 登录用户名（如 ubuntu / root）",
+    "default": ""
+  },
+  "ssh_password": {
+    "type": "string",
+    "description": "SSH 登录密码（必填，否则 SSH 功能不启用）",
+    "secret": true,
+    "default": ""
+  },
+  "ssh_notes": {
+    "type": "text",
+    "description": "SSH 机器注释：说明该机器的配置、网络限制、开放端口等，会作为上下文交给 LLM/子agent 参考（例：4C8G Ubuntu22.04，仅开放 22/80/443，国内访问需用清华镜像）",
+    "default": ""
+  },
+  "ssh_command_timeout": {
+    "type": "int",
+    "description": "单条 SSH 命令超时秒数",
+    "default": 60
+  },
+  "ssh_agent_max_steps": {
+    "type": "int",
+    "description": "单个 SSH 子agent最多自主执行的步数上限",
+    "default": 30
+  },
+  "evolution_iterations": {
+    "type": "int",
+    "description": "GEPA 提示词进化代数（每代变异4个候选，消耗较多token；evolve_prompt 工具用）",
+    "default": 4
+  },
+  "standing_orders": {
+    "type": "text",
+    "description": "常备指令（standing orders）：每轮对话自动注入给 bot 的长期行动授权，如'每周五整理一份群聊总结发出来'。留空关闭",
+    "default": ""
+  },
+  "program_port": {
+    "type": "int",
+    "description": "studio 本机端口：designer 渲染窗口与 programmer 小程序共用（127.0.0.1，被占用会自动+1）",
+    "default": 8765
+  },
+  "program_ttl_minutes": {
+    "type": "int",
+    "description": "单个 program 进程存活时间（分钟）：到期自动停止，代码与数据保留，可随时重启",
+    "default": 10
+  },
+  "self_learning_enabled": {
+    "type": "bool",
+    "description": "技能自学习：一段够重的工作结束后安静复盘，把可复用流程固化成技能（写进数据目录并热加载）",
+    "default": true
+  },
+  "self_learning_min_seconds": {
+    "type": "int",
+    "description": "自学习触发阈值：本轮工作耗时超过该秒数才会复盘（默认 60）",
+    "default": 60
+  },
+  "task_concurrency": {
+    "type": "int",
+    "description": "任务队列并发数：同一时刻最多跑几个任务（同会话始终串行，队列式）",
+    "default": 2
+  },
+  "task_tick_seconds": {
+    "type": "int",
+    "description": "任务队列取件节拍（秒）：每隔多久检查一次到点的任务",
+    "default": 15
+  },
+  "task_queue_enabled": {
+    "type": "bool",
+    "description": "任务队列常驻执行器：开启后每隔几秒检查到点的任务并执行（一切皆任务：回复/agent/工具/通知/总结）",
+    "default": true
+  }
+}

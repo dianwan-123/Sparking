@@ -1,0 +1,32 @@
+# 打包产物
+dist/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地开发资料（体积大、与运行无关）
+.references/
+.refs/
+.validation/
+.napcat_docs/
+.snowluma_docs/
+.zcode/
+.zcodeignore
+plugin_data/
+
+# 开发期一次性脚本：只保留生成器、打包器与前端冒烟工具
+tools/*
+!tools/gen_qq_actions.py
+!tools/package.py
+!tools/forest_smoke.js
+!tools/forest_preview.html
+
+# 临时探测文件
+*.tmp
+.chat_body.json
+.chat_out.txt
+.cfg_body.json
+tests_last_run.txt

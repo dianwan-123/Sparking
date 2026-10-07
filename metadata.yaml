@@ -1,0 +1,18 @@
+name: astrbot_plugin_long_memory_agent
+display_name: Sparking
+short_desc: Sparking —— 让 Bot 拥有记忆、情绪与自主行动的拟人化 Agent
+desc: |
+  保存白名单群完整消息，以分层摘要和记忆账本维护长期上下文；
+  支持全文回查、AstrBot 工具自觉、受权限约束的 Agent、插件市场与 Skill 管理，
+  以及表情包、消息表情回应和戳一戳。
+version: v1.0.0
+author: Rikka0612
+repo: https://github.com/Rikka0612/Sparking
+astrbot_version: ">=4.27,<5"
+support_platforms:
+  - aiocqhttp
+tags:
+  - memory
+  - agent
+  - onebot
+  - napcat

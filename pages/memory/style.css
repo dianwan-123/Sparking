@@ -1,0 +1,222 @@
+[hidden] { display: none !important; }
+
+/* Sparking 控制台 —— 深色、紧凑、零依赖 */
+:root {
+  --bg: #0f1115;
+  --bg-soft: #161a21;
+  --card: #1b2028;
+  --card-2: #222834;
+  --line: #2b323e;
+  --text: #e6e9ef;
+  --muted: #98a2b3;
+  --accent: #6ea8fe;
+  --accent-2: #8b7bf7;
+  --ok: #3ecf8e;
+  --warn: #f0b429;
+  --danger: #ef5f6b;
+  --radius: 12px;
+  --shadow: 0 6px 20px rgba(0, 0, 0, .28);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+}
+
+#app { display: flex; height: 100%; }
+
+/* ---------------------------------------------------------------- 侧栏 */
+.sidebar {
+  width: 232px;
+  flex: none;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  padding: 18px 14px;
+  gap: 14px;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand .logo {
+  width: 34px; height: 34px; border-radius: 10px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #0b0e13; font-size: 18px; font-weight: 700;
+}
+.brand-name { font-size: 16px; font-weight: 700; letter-spacing: .3px; }
+.brand-sub { font-size: 12px; color: var(--muted); }
+
+#nav { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+#nav button {
+  all: unset;
+  cursor: pointer;
+  padding: 9px 11px;
+  border-radius: 9px;
+  color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
+  transition: background .12s, color .12s;
+}
+#nav button:hover { background: #1e242e; color: var(--text); }
+#nav button.active { background: #232a36; color: var(--text); font-weight: 600; }
+#nav button .ico { width: 18px; text-align: center; }
+
+.sidebar-foot { margin-top: auto; }
+.scope-picker { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.scope-picker select { width: 100%; }
+
+/* ---------------------------------------------------------------- 主区 */
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 22px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #141821, var(--bg));
+  position: sticky; top: 0; z-index: 5;
+}
+.topbar h1 { font-size: 18px; margin: 0; }
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
+
+.pill {
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  background: #232a36; color: var(--muted); border: 1px solid var(--line);
+}
+.pill.on { color: #06231a; background: var(--ok); border-color: transparent; font-weight: 700; }
+.pill.off { color: #2a1206; background: var(--warn); border-color: transparent; font-weight: 700; }
+
+.panel { padding: 20px 22px 44px; overflow: auto; }
+
+/* ---------------------------------------------------------------- 卡片 */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow);
+}
+.card h2 { font-size: 14px; margin: 0 0 10px; letter-spacing: .2px; }
+.card.danger { border-color: #3a2229; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+.metric { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+.metric .k { font-size: 12px; color: var(--muted); }
+.metric .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13px; }
+.kv b { color: var(--muted); font-weight: 500; }
+.usage { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.usage .bar { height: 6px; border-radius: 4px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+
+/* ---------------------------------------------------------------- 控件 */
+button.btn {
+  all: unset; cursor: pointer; padding: 7px 14px; border-radius: 9px;
+  background: var(--card-2); border: 1px solid var(--line); color: var(--text);
+  font-size: 13px; transition: transform .06s, background .12s;
+}
+button.btn:hover { background: #2a3140; }
+button.btn:active { transform: translateY(1px); }
+button.btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #0b0e13; border-color: transparent; font-weight: 700; }
+button.btn.ghost { background: transparent; }
+button.btn.warn { background: #3a2c17; border-color: #5a4420; color: #f6d38a; }
+button.btn.danger { background: #3a1d22; border-color: #5c2a31; color: #ffb3ba; }
+button.btn[disabled] { opacity: .5; pointer-events: none; }
+
+input, select, textarea {
+  background: #12161d; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 10px; font: inherit; font-size: 13px; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+textarea { width: 100%; resize: vertical; }
+
+.row { display: flex; gap: 8px; align-items: center; margin: 6px 0 10px; }
+.row.wrap { flex-wrap: wrap; }
+.row input { flex: 1; min-width: 120px; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.toolbar input[type="search"] { flex: 1; }
+.check { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+
+/* ---------------------------------------------------------------- 列表 */
+.list { display: flex; flex-direction: column; gap: 8px; max-height: 460px; overflow: auto; }
+.item {
+  background: var(--card-2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start;
+}
+.item .main { flex: 1; min-width: 0; }
+.item .title { font-size: 13px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.item .title .tag {
+  font-size: 11px; color: var(--muted); background: #2a3140; border-radius: 6px; padding: 1px 6px; font-weight: 500;
+}
+.item .body { color: #cfd6e4; font-size: 13px; word-break: break-word; white-space: pre-wrap; margin-top: 3px; }
+.item .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.item .actions { display: flex; gap: 6px; flex: none; }
+.item .actions button { font-size: 12px; padding: 4px 9px; }
+.empty { color: var(--muted); font-size: 13px; padding: 12px; text-align: center; }
+.muted { color: var(--muted); font-size: 12px; }
+.output {
+  background: #0c0f14; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px; font-size: 12px; color: #b9c6d8; max-height: 220px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+/* ---------------------------------------------------------------- 配置 */
+.config { display: flex; flex-direction: column; gap: 18px; }
+.cfg-group h3 { font-size: 13px; color: var(--accent); margin: 0 0 8px; letter-spacing: .4px; }
+.cfg-item {
+  display: grid; grid-template-columns: minmax(200px, 1fr) minmax(160px, 300px) auto;
+  gap: 10px; align-items: center;
+  padding: 8px 10px; border-bottom: 1px solid #232936;
+}
+.cfg-item .desc { font-size: 11px; color: var(--muted); grid-column: 1 / -1; margin-top: -4px; }
+.cfg-item .key { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.cfg-item input[type="checkbox"] { width: 18px; height: 18px; }
+.cfg-item.wide { grid-template-columns: 1fr; }
+
+/* ---------------------------------------------------------------- 提示 */
+.toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  background: #232a36; border: 1px solid var(--line); color: var(--text);
+  padding: 9px 16px; border-radius: 999px; box-shadow: var(--shadow);
+  font-size: 13px; z-index: 40; max-width: 70vw;
+}
+.toast.error { background: #3a1d22; border-color: #5c2a31; color: #ffb3ba; }
+.toast.ok { background: #143026; border-color: #215040; color: #a6f0cd; }
+
+/* ---------------------------------------------------------------- 模态框 */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(6, 9, 13, .62);
+  display: grid; place-items: center; z-index: 50; backdrop-filter: blur(2px);
+}
+.modal {
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 18px 20px; width: min(420px, 90vw); box-shadow: 0 18px 50px rgba(0, 0, 0, .45);
+}
+.modal.danger { border-color: #5c2a31; }
+.modal h3 { margin: 0 0 8px; font-size: 15px; }
+.modal-msg { color: #cfd6e4; font-size: 13px; margin: 0 0 10px; white-space: pre-wrap; }
+.modal input { width: 100%; margin-bottom: 10px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+
+/* ---------------------------------------------------------------- 记忆森林（节点图） */
+.graph { position: relative; height: 60vh; border: 1px solid var(--line);
+  border-radius: 12px; background: #12161d; overflow: hidden; }
+.forest-host { position: relative; }
+.forest-svg { width: 100%; height: 100%; display: block; cursor: grab; }
+.forest-node { cursor: pointer; }
+.forest-node:hover circle { filter: brightness(1.15); stroke: #fff; }
+.forest-node text { pointer-events: none; user-select: none; }
+.forest-tip { position: absolute; max-width: 300px; background: #1b2028; border: 1px solid var(--line);
+  border-radius: 10px; padding: 9px 11px; font-size: 12px; line-height: 1.55; color: #cfd6e4;
+  pointer-events: none; z-index: 8; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+.forest-tip .tip-body { color: #9fb0c6; }
+.forest-tip .tip-hint { color: #6f7a8a; font-size: 11px; }
+.forest-menu { position: absolute; z-index: 9; display: flex; flex-direction: column; gap: 2px;
+  background: #1b2028; border: 1px solid var(--line); border-radius: 10px; padding: 5px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45); min-width: 150px; }
+.forest-menu-item { all: unset; cursor: pointer; padding: 6px 10px; border-radius: 7px;
+  font-size: 13px; color: var(--text); }
+.forest-menu-item:hover { background: #2a3140; }
+.forest-empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }

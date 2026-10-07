@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sparking · 控制台</title>
+  <link rel="icon" href="../../logo.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo">✦</span>
+        <div>
+          <div class="brand-name">Sparking</div>
+          <div class="brand-sub" id="brand-version">加载中…</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="sidebar-foot">
+        <label class="scope-picker">
+          <span>当前会话</span>
+          <select id="scope-select"></select>
+        </label>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <h1 id="page-title">概览</h1>
+        <div class="topbar-actions">
+          <span class="pill" id="pill-status">—</span>
+          <button class="btn ghost" id="btn-refresh" title="重新加载当前面板">刷新</button>
+        </div>
+      </header>
+
+      <section class="panel" id="panel-overview">
+        <div class="cards" id="overview-cards"></div>
+        <div class="split">
+          <div class="card">
+            <h2>给 bot 下令</h2>
+            <p class="muted">写一句话，它会立刻带着工具去做（可自己查记忆、搜网页、连服务器、发消息汇报）。</p>
+            <textarea id="order-text" rows="3" placeholder="例：把今天群里比较离谱的发言做成合并聊天记录发到本群"></textarea>
+            <div class="row">
+              <button class="btn primary" id="btn-order">下达指令</button>
+              <button class="btn" id="btn-ask">只问一句（不带工具）</button>
+            </div>
+            <pre class="output" id="order-output" hidden></pre>
+          </div>
+          <div class="card">
+            <h2>运行概况</h2>
+            <div id="overview-detail" class="kv"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>用量（近 7 天）</h2>
+          <div id="overview-usage" class="usage"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-memory" hidden>
+        <div class="toolbar">
+          <input type="search" id="msg-search" placeholder="在消息里搜关键词…">
+          <label class="check"><input type="checkbox" id="msg-events"> 含系统通知</label>
+          <button class="btn" id="btn-msg-load">加载</button>
+        </div>
+        <div class="card">
+          <h2>消息浏览 <span class="muted" id="msg-count"></span></h2>
+          <div id="messages" class="list"></div>
+          <div class="row"><button class="btn" id="btn-msg-more">加载更早</button></div>
+        </div>
+        <div class="card">
+          <h2>分层摘要</h2>
+          <div id="summaries" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>记忆账本</h2>
+          <div id="catalog" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-forest" hidden>
+        <div class="toolbar">
+          <input type="search" id="forest-filter" placeholder="过滤节点标题…">
+          <button class="btn primary" id="btn-forest-new">新增记忆</button>
+          <button class="btn ghost" id="btn-forest-refresh">刷新</button>
+          <a class="btn ghost" href="../tree/index.html" target="_blank" rel="noopener">独立页打开</a>
+        </div>
+        <p class="muted">每棵树是一个会话：群 → 类目 → 条目 → 证据。点三角展开；
+          账本与印象节点可编辑/删除；时间粒度随层级变化（L1 分钟 / L2 天 / L3 月 / 印象相对时间）。</p>
+        <div id="forest-graph" class="graph"></div>
+        <div id="forest" class="list" hidden></div>
+      </section>
+
+      <section class="panel" id="panel-people" hidden>
+        <div class="card">
+          <h2>人物印象</h2>
+          <div class="row wrap">
+            <input id="imp-user" placeholder="QQ 号">
+            <input id="imp-name" placeholder="昵称（可选）">
+            <input id="imp-text" placeholder="印象：一两句话">
+            <input id="imp-tags" placeholder="标签（逗号分隔）">
+            <button class="btn primary" id="btn-imp-save">保存</button>
+          </div>
+          <div id="impressions" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>好感度</h2>
+          <div id="affinity" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>说话风格档案</h2>
+          <div id="styles" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-groups" hidden>
+        <div class="card">
+          <h2>群与会话</h2>
+          <p class="muted">白名单里的群会被完整记忆；点「切到」把它设为当前会话。</p>
+          <div id="scopes" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>白名单</h2>
+          <div class="row">
+            <input id="wl-input" placeholder="群号（逗号或空格分隔）">
+            <button class="btn primary" id="btn-wl-save">保存白名单</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>群话题</h2>
+          <div id="topics" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-schedule" hidden>
+        <div class="card">
+          <h2>任务队列 <span class="muted" id="queue-stats"></span></h2>
+          <p class="muted">一切皆任务：一次回复、一轮 agent、工具调用、主动通知、总结…
+            队列式执行；短期跑 1~N 次，长期定时反复；都能设时间区间，超出区间不执行。</p>
+          <div class="row wrap">
+            <select id="task-kind" title="任务类型">
+              <option value="agent">agent（带工具自主干一轮）</option>
+              <option value="reply">reply（说一句话）</option>
+              <option value="notify">notify（只发一条消息）</option>
+              <option value="tool">tool（调某个工具）</option>
+              <option value="reflect">reflect（自我总结）</option>
+              <option value="compress">compress（压缩记忆）</option>
+            </select>
+            <input id="plan-detail" placeholder="要做什么（例：总结本周群聊并写进记忆）">
+          </div>
+          <div class="row wrap">
+            <label class="check">延迟<input id="plan-hours" type="number" value="0" min="0" step="0.5" title="多少小时后开始（0=马上）"></label>
+            <label class="check">间隔<input id="task-interval" type="number" value="0" min="0" step="5" title="长期任务的间隔（分钟，0=不重复）"></label>
+            <label class="check">次数<input id="task-runs" type="number" value="1" min="-1" step="1" title="最多跑几次（-1=不限）"></label>
+            <label class="check">时段<input id="task-window" placeholder="09:00-22:00" title="每日执行时段（超出不执行）"></label>
+            <button class="btn primary" id="btn-plan-add">排进队列</button>
+          </div>
+          <div id="plans" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>任务表</h2>
+          <div class="row">
+            <input id="todo-text" placeholder="任务内容">
+            <button class="btn primary" id="btn-todo-add">加任务</button>
+            <button class="btn ghost" id="btn-todo-clear">清空</button>
+          </div>
+          <div id="todos" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>事件条件指令</h2>
+          <p class="muted">「当有人提到 X 时就做 Y」——命中时 bot 会自动执行。</p>
+          <div class="row wrap">
+            <input id="intent-text" placeholder="命中后做什么">
+            <input id="intent-keys" placeholder="触发词（逗号分隔）">
+            <button class="btn primary" id="btn-intent-add">立指令</button>
+          </div>
+          <div id="intents" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-caps" hidden>
+        <div class="card">
+          <h2>能力总表 <span class="muted" id="caps-count"></span></h2>
+          <p class="muted">bot 实际能调用的全部工具：AstrBot 内置、其它插件、本插件与自学习技能。
+            被拓展开关关掉的会明确标出来。</p>
+          <div class="toolbar">
+            <input type="search" id="caps-search" placeholder="搜工具名或说明…">
+          </div>
+          <div id="capabilities" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>拓展与技能</h2>
+          <div id="extensions" class="list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-config" hidden>
+        <div class="toolbar">
+          <input type="search" id="cfg-search" placeholder="搜配置项…">
+        </div>
+        <div id="config" class="config"></div>
+      </section>
+
+      <section class="panel" id="panel-ops" hidden>
+        <div class="split">
+          <div class="card">
+            <h2>维护</h2>
+            <div class="row wrap">
+              <button class="btn" id="btn-compress">压缩记忆</button>
+              <button class="btn" id="btn-reflect">让 bot 自我总结</button>
+              <button class="btn" id="btn-backup">立即备份</button>
+            </div>
+            <p class="muted">备份保存在插件数据目录的 backups/。</p>
+            <div id="backups" class="list"></div>
+          </div>
+          <div class="card danger">
+            <h2>危险操作</h2>
+            <div class="row wrap">
+              <button class="btn warn" id="btn-wipe-group">清空当前群记忆</button>
+              <button class="btn warn" id="btn-clear-media">清空媒体归档</button>
+              <button class="btn warn" id="btn-clear-stickers">清空表情包</button>
+              <button class="btn danger" id="btn-wipe-all">清空全部记忆</button>
+            </div>
+            <p class="muted">「清空全部」需要输入确认词：确认清空</p>
+          </div>
+        </div>
+        <div class="card">
+          <h2>情绪</h2>
+          <div class="row wrap">
+            <input id="mood-name" placeholder="情绪词（如：雀跃）">
+            <input id="mood-intensity" type="number" value="0.5" min="0" max="1" step="0.1">
+            <input id="mood-note" placeholder="原因（可选）">
+            <button class="btn primary" id="btn-mood">设置</button>
+          </div>
+          <div id="mood-view" class="kv"></div>
+        </div>
+        <div class="card">
+          <h2>通知与请求</h2>
+          <p class="muted">好友申请 / 群邀请等事件（bot 会自动处理，也可在此核对）。</p>
+          <div id="events" class="list"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

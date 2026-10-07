@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sparking · 记忆森林</title>
+  <link rel="icon" href="../../logo.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand"><span class="logo">🌳</span> 记忆森林</div>
+    <div class="bar-actions">
+      <input type="search" id="filter" placeholder="过滤节点标题…">
+      <button class="btn primary" id="btn-new">新增记忆</button>
+      <button class="btn ghost" id="btn-refresh">刷新</button>
+    </div>
+  </header>
+
+  <p class="hint">
+    <b>圆形节点＝一个记忆</b>，连线＝父子关系（会话 → 类目 → 条目 → 证据）。
+    <b>鼠标悬停</b>看详情（类型、时间、粒度、内容）；<b>左键</b>点节点开菜单（编辑／删除／加子节点／展开）；
+    <b>双击</b>展开收拢；<b>滚轮</b>缩放、<b>拖拽空白</b>平移。
+  </p>
+
+  <main id="graph" class="graph"></main>
+
+  <div id="editor" class="overlay" hidden>
+    <div class="dialog">
+      <h3 id="editor-title">新增记忆</h3>
+      <label>标题 / 对象<input id="f-subject" placeholder="例：小明喜欢猫"></label>
+      <label>内容<textarea id="f-value" rows="4" placeholder="例：他家里养了两只布偶，一只叫团子"></textarea></label>
+      <div class="grid">
+        <label>类型
+          <select id="f-kind">
+            <option value="fact">事实</option>
+            <option value="preference">偏好</option>
+            <option value="agreement">约定</option>
+            <option value="identity">身份</option>
+            <option value="task">任务</option>
+          </select>
+        </label>
+        <label>归属群（可选）<input id="f-group" placeholder="群号"></label>
+      </div>
+      <div class="row">
+        <button class="btn ghost" id="btn-cancel">取消</button>
+        <button class="btn primary" id="btn-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="forest.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

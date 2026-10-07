@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>记忆森林预览</title>
+<style>
+  body { margin: 0; background: #0f1115; color: #e6e9ef;
+         font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif; }
+  .graph { position: relative; height: 96vh; margin: 12px; border: 1px solid #2b323e;
+           border-radius: 12px; background: #12161d; overflow: hidden; }
+  .forest-svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  .forest-node { cursor: pointer; }
+  .forest-node text { pointer-events: none; user-select: none; }
+  .forest-tip { position: absolute; max-width: 300px; background: #1b2028; border: 1px solid #2b323e;
+    border-radius: 10px; padding: 9px 11px; font-size: 12px; line-height: 1.55; color: #cfd6e4;
+    pointer-events: none; z-index: 8; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .forest-tip .tip-body { color: #9fb0c6; }
+  .forest-tip .tip-hint { color: #6f7a8a; font-size: 11px; }
+  .forest-menu { position: absolute; z-index: 9; display: flex; flex-direction: column; gap: 2px;
+    background: #1b2028; border: 1px solid #2b323e; border-radius: 10px; padding: 5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.45); min-width: 150px; }
+  .forest-menu-item { all: unset; cursor: pointer; padding: 6px 10px; border-radius: 7px;
+    font-size: 13px; color: #e6e9ef; }
+  .forest-menu-item:hover { background: #2a3140; }
+  .forest-empty { color: #98a2b3; padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="graph" class="graph"></div>
+<script src="../pages/tree/forest.js"></script>
+<script>
+const TREE = {
+  root: { roots: [
+    { id: "scope:s1", type: "scope", label: "神秘音游基地(763226341)", count: 3, hint: "音游群" },
+    { id: "scope:s2", type: "scope", label: "private:2450655009", count: 2, hint: "私聊" },
+  ]},
+  "scope:s1": { children: [
+    { id: "cat:s1:summaries", type: "category", label: "分层摘要", count: 2, hint: "按批次/情节/主题压缩" },
+    { id: "cat:s1:catalog", type: "category", label: "记忆账本", count: 1, hint: "带证据的事实·偏好·约定" },
+    { id: "cat:s1:impressions", type: "category", label: "人物印象", count: 1, hint: "对某个人的长期判断" },
+  ]},
+  "cat:s1:summaries": { children: [
+    { id: "item:summary:a1", type: "summary", label: "L1 · 音游定数讨论", hint: "群友在聊 phi 的定数",
+      time: "2026-10-06 22:14", time_granularity: "精确到分钟", count: 3 },
+    { id: "item:summary:a2", type: "summary", label: "L2 · 开学话题", hint: "聊到大学进度",
+      time: "2026-10-05", time_granularity: "精确到天", count: 0 },
+  ]},
+  "item:summary:a1": { children: [
+    { id: "item:message:m1", type: "message", label: "雾宙·独行", hint: "我说变速慢速脑裂是最沙币配置",
+      time: "2026-10-06 22:14", time_granularity: "精确到分钟", count: 0 },
+    { id: "item:message:m2", type: "message", label: "⁧。", hint: "不会瑞平 我是phi萌新",
+      time: "2026-10-06 22:15", time_granularity: "精确到分钟", count: 0 },
+  ]},
+  "cat:s1:catalog": { children: [
+    { id: "item:catalog:e1", type: "catalog", label: "由页 在准备大学", hint: "他说这三年过太快",
+      time: "3 天前", time_granularity: "相对时间", kind: "fact", status: "active",
+      editable: true, count: 1 },
+  ]},
+  "item:catalog:e1": { children: [
+    { id: "item:message:m3", type: "message", label: "由页", hint: "这日子啥时候是个头啊",
+      time: "2026-10-03 19:59", time_granularity: "精确到分钟", count: 0 },
+  ]},
+  "cat:s1:impressions": { children: [
+    { id: "item:impression:2536257270", type: "impression", label: "由页", hint: "爱念大学进度（出现在 2 个会话）",
+      time: "2 天前", time_granularity: "相对时间", editable: true, count: 0 },
+  ]},
+  "scope:s2": { children: [
+    { id: "cat:s2:catalog", type: "category", label: "记忆账本", count: 1, hint: "带证据的事实" },
+  ]},
+  "cat:s2:catalog": { children: [
+    { id: "item:catalog:e2", type: "catalog", label: "主人 在调插件", hint: "要求一切皆任务",
+      time: "1 小时前", time_granularity: "相对时间", kind: "preference",
+      status: "active", editable: true, count: 0 },
+  ]},
+};
+const graph = window.SparkingForest.mount(document.getElementById("graph"), {
+  getTree: async (nodeId) => TREE[nodeId || "root"],
+  onEdit: () => {}, onDelete: () => {}, onAddChild: () => {},
+});
+// 预览时自动展开两层，方便截图看连线与配色
+setTimeout(async () => {
+  await graph.expand("scope:s1");
+  await graph.expand("cat:s1:summaries");
+  await graph.expand("item:summary:a1");
+  await graph.expand("cat:s1:impressions");
+}, 60);
+</script>
+</body>
+</html>
