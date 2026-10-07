@@ -3,6 +3,7 @@ dist/
 *.zip
 
 # Python
+tests/
 __pycache__/
 *.py[cod]
 .pytest_cache/
