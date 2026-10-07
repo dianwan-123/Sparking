@@ -387,6 +387,33 @@ def _strip_brackets(value: str) -> str:
     return value.strip(_BRACKET_CHARS)
 
 
+# 成对括号：只有"以左括号开头、以对应右括号结尾"才算旁白
+_BRACKET_PAIRS = (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"),
+                  ("「", "」"), ("『", "』"), ("《", "》"))
+
+
+def is_wrapped(text: Any) -> bool:
+    """整条是不是**被一对括号包着**的旁白（QQ 上的舞台提示都长这样）。
+
+    实录（用户实测踩坑）："说得像你刚没狂发图一样（" 被判成舞台提示拦掉了——旧实现只查
+    "首尾去掉括号后与原串不同"，一串正常话的**末尾挂个"（"**（很常见的打字习惯）就命中了。
+    这里必须首尾成对，才算"整条是旁白"。
+    """
+    stripped = " ".join(str(text or "").split())
+    if len(stripped) < 3:
+        return False
+    for opener, closer in _BRACKET_PAIRS:
+        if stripped.startswith(opener) and stripped.endswith(closer)                 and stripped.count(opener) >= 1 and stripped.count(closer) >= 1:
+            inner = stripped[len(opener):-len(closer)]
+            return bool(inner.strip())
+    return False
+
+
+_MEDIA_NOUNS = ("表情包", "表情", "图片", "图", "卡片", "聊天记录", "记录",
+                "转发", "照片", "截图", "文件", "语音", "视频")
+_DEIXIS_RE = re.compile(_DEIXIS)
+
+
 # 失败类播报：实录（用户截图）bot 说"表情包没发出去 反正这比赛我是真看不出啥含金量"——
 # 那是工具报错被它转述成了聊天内容。工具失败自己消化，绝不向群友汇报。
 _FAIL_REPORT_RE = re.compile(
@@ -395,8 +422,19 @@ _FAIL_REPORT_RE = re.compile(
     r"(?:发出去|发出|发送|送达|发出去|贴出去|发出来)?")
 
 
-_STAGE_DIRECTION_VERBS = ("丢", "发", "甩", "扔", "丢出来", "发出来", "递", "贴", "补", "来一句")
-_STAGE_DIRECTION_NOUNS = ("表情包", "表情", "图片", "图", "卡片", "记录", "转发", "照片", "截图")
+# 舞台提示的结构：「（把…表情包丢出来）」——媒体名词后面紧跟"丢/发/甩…+出来/出去/给你"。
+# 光有"图"和"发"两个字不算（实录："说得像你刚没狂发图一样（" 被误拦）。
+_STAGE_DIRECTION_NOUN = r"(?:表情包|表情|图片|图|卡片|聊天记录|记录|转发|照片|截图)"
+_STAGE_DIRECTION_VERB = r"(?:丢|甩|扔|发|递|贴|补|放|摆)"
+_STAGE_DIRECTION_SUFFIX = r"(?:出来|出去|上来|下去|过去|来|一下|给(?:他|你|群|大家|我))"
+# 两种语序都认：「（把那张表情包丢出来）」「(丢一张表情包出来)」
+_STAGE_DIRECTION_RE = re.compile(
+    r"(?:[^，。！？；]{0,10}" + _STAGE_DIRECTION_NOUN + r"[^，。！？；]{0,8}"
+    + _STAGE_DIRECTION_VERB + _STAGE_DIRECTION_SUFFIX + r")"
+    r"|(?:" + _STAGE_DIRECTION_VERB + r"[^，。！？；]{0,6}" + _STAGE_DIRECTION_NOUN
+    + r"[^，。！？；]{0,6}(?:出来|出去|上来|过去|给你|给他))")
+# 请求别人发东西的说法（"发个图出来看看"）不是旁白，放行
+_STAGE_REQUEST_RE = re.compile(r"看看|看下|看一眼|让我|给我看|吧|呗|吗|？")
 
 
 def is_stage_direction(text: Any) -> bool:
@@ -404,16 +442,22 @@ def is_stage_direction(text: Any) -> bool:
 
     实录（用户截图）：bot 发了一句"（把刚才那张呆滞无语的表情包丢出来）"——它把自己的
     动作当成台词写出来了。真发表情就直接发，不需要旁白；配音式的动作说明一律丢掉。
+
+    判定要件（缺一不可，宁可漏杀不可误杀——误杀正常聊天是用户最烦的事）：
+    ①整条被一对括号包着（`is_wrapped`，末尾挂个"（"不算）；②结构是"把/将…媒体名词…丢/发出来"；
+    ③没有第一人称主语（"（我把图发出去了）"是人话，不是旁白）。
     """
     stripped = " ".join(str(text or "").split())
     if not stripped or len(stripped) > 40:
         return False
-    core = _strip_brackets(stripped)
-    if not core or core == stripped:
-        return False            # 必须整条被括号包着才算旁白
-    if not any(noun in core for noun in _STAGE_DIRECTION_NOUNS):
+    if not is_wrapped(stripped):
         return False
-    return any(verb in core for verb in _STAGE_DIRECTION_VERBS)
+    core = _strip_brackets(stripped)
+    if "我" in core:                     # 带"我"的是叙述自己做了什么，放行
+        return False
+    if _STAGE_REQUEST_RE.search(core):   # "（发个图出来看看）"是在求人发，放行
+        return False
+    return bool(_STAGE_DIRECTION_RE.search(core))
 
 
 def is_tool_name_leak(text: Any, tool_names: "Iterable[str] | None" = None) -> bool:
@@ -455,11 +499,12 @@ def is_failure_report(text: Any) -> bool:
     action = ("(?:发出去|发出|发送|送达|发出来|贴出去|贴出来|"
               "发不出去|发不出来|贴不出去|没发出去)")
     tail = "(?:了|失败|不了|没成功)?"
-    # 只认"媒体 + （否定）+ 发送动作"的整条短句；正常吐槽（"这比赛没含金量"）不受影响
+    # 三个模式都必须点到"媒体"或"发送动作"——裸的否定词不算：
+    # 实录误杀："我没有"、"（没图）"（这俩都是人话）。
     patterns = (
-        "^" + media + "?" + neg + "?" + action + tail + "$",
-        "^" + media + action + tail + "$",
-        "^(?:我)?" + neg + action + "?" + media + "?$",
+        "^" + media + neg + action + "?" + tail + "$",      # 表情包没发出去 / 图片发送失败
+        "^" + media + action + tail + "$",                   # 图发不出去
+        "^(?:我)?" + neg + action + media + "?$",            # 我没发出去 / 没有发出图
     )
     return any(re.match(pattern, core) for pattern in patterns)
 
@@ -474,16 +519,18 @@ def is_tool_status_narration(text: Any) -> bool:
     stripped = str(text or "").strip()
     if not stripped or len(stripped) > 24:
         return False
+    # 必须看得出"在说发送这件事本身"：整条是旁白（带成对括号），或点到媒体/指示语。
+    # 实录误杀：光秃秃的"已发送""完成"——那可能是正经回答（"做完了吗"→"完成"），放行。
+    core = _strip_brackets(stripped)
+    if not core:
+        return False
+    anchored = is_wrapped(stripped) or any(noun in core for noun in _MEDIA_NOUNS)         or bool(_DEIXIS_RE.search(core))
+    if not anchored:
+        return False
     if _STATUS_NARRATION_RE.match(stripped):
         return True
     # 第二种：状态动词配指示代词（"已发上面那段"、"上面那段已发"、"已发好了"）
     # ——整条必须只剩这些词，带别的内容就不算（"上面那段我重发了"是正常话）
-    core = _strip_brackets(stripped)
-    if not core:
-        return False
-    # 无括号的极短句（"发了""好了"）可能是正经回答，别误杀；带括号就一定是状态注记
-    if len(core) < 3 and core == stripped:
-        return False
     pattern = re.compile(
         r"^(?:(?:" + _STATUS_WORD + r")(?:\s*" + _DEIXIS + r")?"
         r"|[0-9]*\.?\s*" + _DEIXIS + r"\s*(?:" + _STATUS_WORD + r"))(?:\s*了)?$")
