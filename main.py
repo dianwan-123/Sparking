@@ -54,6 +54,7 @@ from .src.humanization import (
     is_local_path_leak,
     is_tool_markup_leak,
     is_tool_status_narration,
+    is_failure_report,
     is_plan_json_leak,
     parse_message_plan,
     salvage_message_plan,
@@ -3455,7 +3456,8 @@ class LongMemoryAgentPlugin(Star):
                  if line and not is_plan_json_leak(line)
                  and not is_local_path_leak(line)
                  and not is_tool_markup_leak(line)
-                 and not is_tool_status_narration(line)]
+                 and not is_tool_status_narration(line)
+                 and not is_failure_report(line)]
         if not lines:
             return None
         actions = tuple(
@@ -3595,13 +3597,22 @@ class LongMemoryAgentPlugin(Star):
             if sticker is None:
                 recent = self.stickers.select(limit=1)
                 sticker = recent[0] if recent else None
-            if sticker is not None:
-                await event.send(MessageChain().file_image(
-                    self.stickers.send_path(sticker)))
+            # 清空过记忆/文件被清掉后旧引用会失效：这时**静默跳过**，
+            # 既不报错、也不给模型转述失败的机会（实录：bot 说"表情包没发出去"）。
+            if sticker is not None and Path(sticker.path).is_file() \
+                    and self._sticker_claim(str(event.get_group_id() or ""), sticker.sha256):
                 try:
-                    await self.stickers.note(sticker.sha256, bump_use=True)
-                except Exception:
-                    pass
+                    await event.send(MessageChain().file_image(
+                        self.stickers.send_path(sticker)))
+                    try:
+                        await self.stickers.note(sticker.sha256, bump_use=True)
+                    except Exception:
+                        pass
+                except Exception as error:
+                    logger.info("长程记忆：表情发送失败（静默跳过）：%s", str(error)[:120])
+            elif sticker is not None:
+                logger.info("长程记忆：表情文件已不存在，跳过发送（%s）",
+                            str(getattr(sticker, "sha256", ""))[:12])
             return
 
         plan: MessagePlan | None = None
@@ -3723,7 +3734,24 @@ class LongMemoryAgentPlugin(Star):
         logger.info(
             "长程记忆：%s拟人回复计划=%d段", self._conversation_key(event), len(plan.segments)
         )
-        plan = self._text_first_plan(self._merge_split_sticker_plan(plan))
+        plan = self._text_first_plan(
+            self._dedupe_media_plan(self._merge_split_sticker_plan(plan)))
+        self._new_reply_turn()          # 新回复：表情去重按回复重新计
+        # 取证日志：计划里到底有几个表情段/几处占位（下次看日志就能定位表情重复的来源）
+        try:
+            kinds = [str(getattr(seg, "action", "")) for seg in plan.segments]
+            sticker_ids = [str(getattr(seg, "sticker_id", "") or "")[:10]
+                           for seg in plan.segments
+                           if str(getattr(seg, "action", "")) == "sticker"]
+            placeholders = sum(
+                1 for seg in plan.segments
+                if str(getattr(seg, "action", "")) == "text"
+                and self._STICKER_PLACEHOLDER_RE.search(str(getattr(seg, "text", "") or "")))
+            if sticker_ids or placeholders:
+                logger.info("长程记忆：本条回复的表情来源 = 段%s 占位%d处（去重后段=%s）",
+                            sticker_ids or "无", placeholders, kinds)
+        except Exception:
+            pass
         sender = HumanizedSender(
             lambda descriptor: self._send_segment(event, descriptor),
             config=self._humanization,
@@ -3829,6 +3857,8 @@ class LongMemoryAgentPlugin(Star):
                     break
         if record is None:
             return False
+        if not self._sticker_claim(str(event.get_group_id() or ""), record.sha256):
+            return True          # 重复的：当成已处理（正文里的占位照样要擦掉）
         try:
             await event.send(MessageChain().file_image(stickers.send_path(record)))
         except Exception as error:
@@ -3841,6 +3871,38 @@ class LongMemoryAgentPlugin(Star):
         return True
 
     _MEDIA_ACTIONS = {"sticker", "image", "file", "record", "video"}
+
+    def _dedupe_media_plan(self, plan: Any) -> Any:
+        """去掉计划里**相邻或重复**的同一媒体段。
+
+        实录：一次回复里弹了三条一模一样的表情——模型把同一个 sticker 段写了好几遍。
+        这里按 (action, sticker_id/media_id/path) 去重，只留第一次。
+        """
+        segments = list(getattr(plan, "segments", ()) or [])
+        if not segments:
+            return plan
+        seen: set[tuple[str, str]] = set()
+        kept: list[Any] = []
+        changed = False
+        for item in segments:
+            action = str(getattr(item, "action", ""))
+            if action in self._MEDIA_ACTIONS:
+                key = (action, str(getattr(item, "sticker_id", "")
+                                   or getattr(item, "media_id", "")
+                                   or getattr(item, "path", "")))
+                if key in seen:
+                    changed = True
+                    continue
+                seen.add(key)
+            kept.append(item)
+        if not changed:
+            return plan
+        try:
+            import dataclasses
+
+            return dataclasses.replace(plan, segments=tuple(kept))
+        except Exception:
+            return plan
 
     def _text_first_plan(self, plan: Any) -> Any:
         """把所有媒体段挪到文字之后，媒体之间、文字之间各自保持原顺序。
@@ -8636,6 +8698,44 @@ class LongMemoryAgentPlugin(Star):
             return "没有匹配的表情"
         return compact_json(entries, 3000)
 
+    def _reply_token(self, scope_id: str) -> str:
+        """当前这条回复的令牌：换令牌=换回复，用来做"同一回复内去重"。"""
+        token = getattr(self, "_sticker_reply_token", "")
+        if not token:
+            token = self._sticker_reply_token = uuid.uuid4().hex
+        return f"{scope_id}|{token}"
+
+    def _sticker_claim(self, scope_id: str, sha: str) -> bool:
+        """这条回复里这张表情**发过没有**？没发过→登记并返回 True。
+
+        实录（用户截图）：一次回复弹出三条一模一样的表情。查证后的成因是——
+        一次回复里有**三条互不知情的发送路径**：①决策级 sticker 动作
+        ②计划里的 sticker 段 ③正文里的 [sticker: id] 占位。模型把"发这张"
+        表达了两三遍（写了段、又把占位写进正文），三条路于是各发一遍。
+        这里只做**路径协调**（同一条回复里同一张只认第一次），不限制张数、
+        也不影响不同表情连发。
+        """
+        sha = str(sha or "").strip()
+        if not sha:
+            return False
+        token = self._reply_token(str(scope_id or ""))
+        claims = getattr(self, "_sticker_claims", None)
+        if claims is None:
+            claims = self._sticker_claims = {}
+        # 换回复就清空登记（只留本次）
+        if claims.get("__token__") != token:
+            claims.clear()
+            claims["__token__"] = token
+        if claims.get(str(sha)):
+            logger.info("长程记忆：这张表情在本次回复里已发过，跳过重复（%s）", str(sha)[:12])
+            return False
+        claims[str(sha)] = 1
+        return True
+
+    def _new_reply_turn(self) -> None:
+        """开一条新回复：换令牌，让表情去重按回复重新计。"""
+        self._sticker_reply_token = uuid.uuid4().hex
+
     async def _send_sticker_action(self, args: dict[str, Any]) -> str:
         """往群里发一张库存表情包（主动发/被要求发都走这里）。
 
@@ -8663,6 +8763,8 @@ class LongMemoryAgentPlugin(Star):
             return "没有可发送的活跃群"
         if self.gateway is None:
             return "QQ 网关未就绪"
+        if not self._sticker_claim(target_group, sticker.sha256):
+            return "这张表情刚发过，这次就不重复了"
         self._bind_gateway_client()
         await self.gateway.execute(
             "send_group_msg", group_id=int(target_group),

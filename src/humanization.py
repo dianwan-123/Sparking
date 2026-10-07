@@ -387,6 +387,42 @@ def _strip_brackets(value: str) -> str:
     return value.strip(_BRACKET_CHARS)
 
 
+# 失败类播报：实录（用户截图）bot 说"表情包没发出去 反正这比赛我是真看不出啥含金量"——
+# 那是工具报错被它转述成了聊天内容。工具失败自己消化，绝不向群友汇报。
+_FAIL_REPORT_RE = re.compile(
+    r"(?:表情包|表情|图片|图|文件|语音|视频|转发|卡片|消息)?"
+    r"(?:没|没有|未能|没能|无法|不能|发送失败|发不出去|失败了|发送不出去)"
+    r"(?:发出去|发出|发送|送达|发出去|贴出去|发出来)?")
+
+
+def is_failure_report(text: Any) -> bool:
+    """整条消息就是"我没发出XX/XX发送失败"这种失败汇报（含否定的短句）。
+
+    只拦"媒体 + 否定/失败"的组合，正常吐槽（"这比赛没含金量"）不受影响。
+    """
+    stripped = " ".join(str(text or "").split())
+    if not stripped or len(stripped) > 32:
+        return False
+    core = _strip_brackets(stripped)
+    if not core:
+        return False
+    # 无括号的两字短句（"发送""发出"）可能是正经回复，别误杀
+    if len(core) < 3 and core == stripped:
+        return False
+    media = "(?:表情包|表情|图片|图|文件|语音|视频|转发|卡片)"
+    neg = "(?:没|没有|未能|没能|无法|不能|失败|没成功)"
+    action = ("(?:发出去|发出|发送|送达|发出来|贴出去|贴出来|"
+              "发不出去|发不出来|贴不出去|没发出去)")
+    tail = "(?:了|失败|不了|没成功)?"
+    # 只认"媒体 + （否定）+ 发送动作"的整条短句；正常吐槽（"这比赛没含金量"）不受影响
+    patterns = (
+        "^" + media + "?" + neg + "?" + action + tail + "$",
+        "^" + media + action + tail + "$",
+        "^(?:我)?" + neg + action + "?" + media + "?$",
+    )
+    return any(re.match(pattern, core) for pattern in patterns)
+
+
 def is_tool_status_narration(text: Any) -> bool:
     """整条消息就是"工具干完活了"的状态播报（表情包已发 / 图片已发送 / 转发完成）。
 
