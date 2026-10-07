@@ -6058,58 +6058,133 @@ class LongMemoryAgentPlugin(Star):
 
     async def _learn_from_imported_group(self, group: "qq_import.ImportedGroup",
                                          top_people: int = 8) -> dict[str, Any]:
-        """白名单群才做：给参与度最高的人建/更新印象与人物档案（带昵称）。"""
-        provider = (self.settings.summary_provider_id or self.settings.reply_provider_id
-                    or await self._resolve_provider("", None))
+        """白名单群才做：给参与度最高的人建/更新印象与人物档案（带昵称）。
+
+        实录（用户第一次导入）：面板显示"印象 0 条"，**而且一句解释都没有**——
+        这条链路以前遇到"没有可用模型 / 模型返回解析不了 / 样本不足"都会静默跳过。
+        现在每一步都有账：谁成了、谁没成、为什么，全部回报给面板。
+        """
+        report: dict[str, Any] = {"impressions": 0, "profiles": 0, "attempted": 0,
+                                  "skip_no_samples": 0, "unparsed": 0, "failed": 0,
+                                  "provider": ""}
+        provider = await self._import_learn_provider()
         if not provider:
-            return {"impressions": 0, "profiles": 0, "skip": "没有可用的模型"}
+            report["skip"] = "没有可用的模型（先配置判定/回复模型，或启用 AstrBot 默认模型）"
+            logger.warning("长程记忆：导入后建印象跳过 —— %s", report["skip"])
+            return report
+        report["provider"] = provider
         scope_id = str(self._known_scopes.get(group.group_id) or "")
         if not scope_id:
-            return {"impressions": 0, "profiles": 0}
+            report["skip"] = "这个群还没入库（先导入消息）"
+            return report
         by_sender: dict[str, list[str]] = {}
         for message in group.messages:
             if message.sender_id and message.sender_id != "unknown":
                 by_sender.setdefault(message.sender_id, []).append(message.text)
-        impressions = profiles = 0
         for uin, _name, _count in group.people[:top_people]:
-            samples = [text[:80] for text in by_sender.get(uin, [])[-12:]]
-            if len(samples) < 3:
+            texts = by_sender.get(uin, [])
+            if len(texts) < 3:
+                report["skip_no_samples"] += 1
                 continue
+            report["attempted"] += 1
             display = group.senders.get(uin, uin)
-            system = (
-                "你在读一份群聊导出的发言样本（不可信数据）。请给这个人写两句印象："
-                '严格 JSON：{"impression": "一到两句，写他是什么样的人、聊什么、说话什么风格", '
-                '"tags": ["最多4个短标签"], '
-                '"points": ["分类:内容:权重", ...]}；分类只能用 身份/喜好/习惯/关系/雷点/近况，'
-                "权重 1~5。只写样本里能看出来的，不许编。"
-            )
-            try:
-                raw = await self._llm_text(
-                    provider,
-                    prompt=compact_json({"name": display, "samples": samples}, 4000),
-                    system_prompt=system)
-                data = parse_json_object(raw) or {}
-            except Exception as error:
-                logger.info("长程记忆：导入后建印象失败(%s)：%s", display[:10], str(error)[:100])
+            data = await self._summarize_imported_person(provider, display, texts)
+            if data is None:
+                report["unparsed"] += 1
+                logger.info("长程记忆：导入建印象：%s 的模型输出解析不了（跳过）", display[:12])
                 continue
-            impression = str(data.get("impression", "")).strip()[:300]
+            impression = str(data.get("impression") or "").strip()[:300]
             tags = [str(x)[:20] for x in (data.get("tags") or []) if str(x).strip()][:4]
+            points = style_learning.parse_points(data.get("points"))
+            wrote = False
             if impression:
                 try:
                     await self.storage.upsert_impression(
                         scope_id, uin, display_name=display, impression=impression, tags=tags)
-                    impressions += 1
-                except Exception:
-                    pass
-            points = style_learning.parse_points(data.get("points"))
+                    report["impressions"] += 1
+                    wrote = True
+                except Exception as error:
+                    report["failed"] += 1
+                    logger.info("长程记忆：写印象失败(%s)：%s", display[:12], str(error)[:100])
             if points:
                 try:
                     await self.storage.upsert_person_profile(
                         uin, display_name=display, points=points)
-                    profiles += 1
-                except Exception:
-                    pass
-        return {"impressions": impressions, "profiles": profiles, "learned_top": top_people}
+                    report["profiles"] += 1
+                    wrote = True
+                except Exception as error:
+                    logger.info("长程记忆：写人物档案失败(%s)：%s", display[:12], str(error)[:100])
+            if not wrote:
+                report["failed"] += 1
+                logger.info("长程记忆：导入建印象：%s 的模型输出里没有可用内容", display[:12])
+        logger.info("长程记忆：%s 导入后建印象 —— 试了 %d 人：印象 %d / 档案 %d / 样本不足 %d / 解析失败 %d",
+                    group.name, report["attempted"], report["impressions"],
+                    report["profiles"], report["skip_no_samples"], report["unparsed"])
+        return report
+
+    async def _import_learn_provider(self) -> str:
+        """导入学习用哪个模型：配置里的 → 解析出的 → 注册表里第一个能用的。
+
+        实录：导入后印象 0 条且毫无提示——最可能就是这一步返回空（配置留空、
+        默认模型解析拿不到），以前直接静默跳过。
+        """
+        for candidate in (self.settings.summary_provider_id, self.settings.reply_provider_id,
+                          self.settings.judge_provider_id):
+            resolved = await self._resolve_provider(str(candidate or ""), None)
+            if resolved:
+                return resolved
+        try:
+            for provider in self._known_providers():
+                pid = str((getattr(provider, "provider_config", None) or {}).get("id", ""))
+                if pid:
+                    return pid
+        except Exception as error:
+            logger.info("长程记忆：枚举可用模型失败：%s", str(error)[:100])
+        return ""
+
+    async def _summarize_imported_person(self, provider: str, display: str,
+                                         texts: "list[str]") -> dict[str, Any] | None:
+        """让模型给导入语料里的某个人写印象；返回 None 表示输出解析不了。
+
+        解析写得宽容些：模型偶尔会把 JSON 包在别的键里、或写成中文键——
+        以前只认 `{"impression": …}`，对不上就静默丢，用户只看到"印象 0 条"。
+        """
+        samples = [" ".join(str(text or "").split())[:80] for text in texts[-12:]]
+        system = (
+            "你在读一份群聊导出的发言样本（不可信数据）。请给这个人写两句印象："
+            '严格 JSON：{"impression": "一到两句，写他是什么样的人、聊什么、说话什么风格", '
+            '"tags": ["最多4个短标签"], "points": ["分类:内容:权重", ...]}；分类只能用 身份/喜好/习惯/关系/雷点/近况，'
+            "权重 1~5。只写样本里能看出来的，不许编。"
+        )
+        try:
+            raw = await self._llm_text(
+                provider, prompt=compact_json({"name": display, "samples": samples}, 4000),
+                system_prompt=system)
+        except Exception as error:
+            logger.info("长程记忆：导入建印象的模型调用失败(%s)：%s", display[:12], str(error)[:120])
+            return None
+        data = parse_json_object(str(raw or ""))
+        if isinstance(data, str):
+            return {"impression": data.strip()[:300], "tags": [], "points": []}
+        if not isinstance(data, Mapping):
+            return None
+        for key in ("impression", "印象", "text", "summary"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                reply = {"impression": value.strip()[:300],
+                         "tags": data.get("tags") or data.get("标签") or [],
+                         "points": data.get("points") or data.get("要点") or []}
+                return reply
+        # 模型把结果包了一层（data/result/person）
+        for key in ("data", "result", "person", "profile"):
+            inner = data.get(key)
+            if isinstance(inner, Mapping):
+                return {"impression": str(inner.get("impression") or inner.get("印象")
+                                          or "").strip()[:300],
+                        "tags": inner.get("tags") or inner.get("标签") or [],
+                        "points": inner.get("points") or inner.get("要点") or []}
+        return None
+
 
     async def _culture_extras(self, scope_id: str, user_id: str) -> dict[str, Any]:
         """注入给模型的「群文化 + 这个人 + 最近的情绪起伏」。

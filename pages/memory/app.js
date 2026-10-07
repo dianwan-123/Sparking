@@ -1213,9 +1213,19 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
           `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条`);
       (report.groups || []).forEach((group) => {
         const tag = group.whitelisted ? "白名单（含印象学习）" : "仅入库";
-        say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}` +
+        const learn = group.whitelisted
+          ? `；印象 ${group.impressions || 0} 条 / 档案 ${group.profiles || 0} 条`
+            + `（试了 ${group.attempted || 0} 人`
+            + (group.skip_no_samples ? `，样本不足 ${group.skip_no_samples} 人` : "")
+            + (group.unparsed ? `，模型输出没解析出来 ${group.unparsed} 人` : "")
+            + (group.failed ? `，写库失败 ${group.failed} 次` : "")
+            + (group.provider ? `，用模型 ${group.provider}` : "")
+            + "）"
+          : "";
+        say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}${learn}` +
             (group.error ? ` ⚠ ${group.error}` : "") +
-            (group.learn_error ? ` ⚠ ${group.learn_error}` : ""));
+            (group.learn_error ? ` ⚠ ${group.learn_error}` : "") +
+            (group.skip ? ` ⚠ ${group.skip}` : ""));
       });
       toast("导入完成", "ok");
       loadLearn();
