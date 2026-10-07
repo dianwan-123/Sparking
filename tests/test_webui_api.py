@@ -658,6 +658,22 @@ class ForestGraphTests(unittest.TestCase):
         self.assertNotIn("../tree/forest.js", self.console_html,
                          "不能依赖跨页相对路径")
 
+    @staticmethod
+    def _renderer_body(text: str) -> str:
+        start = text.index("(function () {")
+        end = text.index("})();", start) + len("})();")
+        chunk = text[start:end]
+        kept = [item.rstrip() for item in chunk.splitlines()]
+        return "\n".join(line for line in kept
+                         if line.strip() and not line.strip().startswith("//"))
+
+    def test_console_copy_matches_standalone_renderer(self):
+        """控制台内联了一份渲染器（插件页加载不到 ../tree/forest.js）——两份必须逐行一致，防漂移。"""
+        tree = (Path(__file__).resolve().parents[1] / "pages" / "tree" / "forest.js").read_text(encoding="utf-8")
+        console = (Path(__file__).resolve().parents[1] / "pages" / "memory" / "app.js").read_text(encoding="utf-8")
+        self.assertEqual(self._renderer_body(tree), self._renderer_body(console),
+                         "内联副本与 pages/tree/forest.js 不一致，改一处要同步另一处")
+
     def test_hidden_wins_over_display(self):
         """[hidden] 必须压过 .list{display:flex}，否则隐藏不生效（列表会一直露着）。"""
         for page in ("memory", "tree"):
