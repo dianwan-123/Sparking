@@ -71,9 +71,18 @@ class QQService:
         return await self.gateway.execute(
             "set_friend_add_request", flag=str(flag)[:128], approve=bool(approve), remark=str(remark)[:64])
 
-    async def handle_group_invite(self, flag: str, approve: bool = True, reason: str = "") -> Any:
+    async def handle_group_invite(self, flag: str, approve: bool = True, reason: str = "",
+                                  sub_type: str = "invite") -> Any:
+        """处理群相关申请。**sub_type 必须对**：invite=邀请你进群，add=别人申请进你的群。
+
+        实录：这里曾把 sub_type 写死成 "invite"，于是"别人申请入群"用同一个 flag 去批，
+        OneBot 侧对不上、申请就一直挂着——两类申请的处理方式必须由调用方区分。
+        """
+        kind = str(sub_type or "invite").strip().lower()
+        if kind not in {"add", "invite"}:
+            kind = "invite"
         return await self.gateway.execute(
-            "set_group_add_request", flag=str(flag)[:128], sub_type="invite",
+            "set_group_add_request", flag=str(flag)[:128], sub_type=kind,
             approve=bool(approve), reason=str(reason)[:64])
 
     async def delete_friend(self, user_id: str | int) -> Any:

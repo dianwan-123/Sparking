@@ -277,9 +277,11 @@ def normalize_request_record(event: Any) -> NormalizedMessage | None:
     else:
         conversation = info["group_id"]
         if info["sub_type"] == "invite":
-            text = f"[收到群邀请 group_id={info['group_id']} 来自 {info['user_id']} flag={info['flag']} 说明：{comment}]"
+            text = (f"[收到群邀请 group_id={info['group_id']} 来自 {info['user_id']} "
+                    f"sub_type=invite flag={info['flag']} 说明：{comment}]")
         else:
-            text = f"[群 {info['group_id']} 收到入群申请 user_id={info['user_id']} flag={info['flag']} 说明：{comment}]"
+            text = (f"[群 {info['group_id']} 收到入群申请 user_id={info['user_id']} "
+                    f"sub_type=add flag={info['flag']} 说明：{comment}]")
         event_type = "request.group"
     upstream = f"request:{timestamp}:{info['request_type']}:{info['user_id']}:{info['flag'][:24]}"
     return NormalizedMessage(

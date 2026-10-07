@@ -5252,6 +5252,7 @@ class LongMemoryAgentPlugin(Star):
         seen_calls: dict[str, int] = {}
         loop_warning = ""
         forced_done = False
+        last_thought = ""
         watermark = 0
         if scope and self.storage is not None:
             try:
@@ -5331,9 +5332,12 @@ class LongMemoryAgentPlugin(Star):
                 outcome = await self._dispatch_task_action(tool_name, call_args, scope)
                 results.append({"tool": tool_name, "result": outcome})
                 transcript.append({"tool": tool_name})
+            if isinstance(plan.get("thought"), str) and plan["thought"].strip():
+                last_thought = plan["thought"].strip()
             if forced_done or plan.get("done") or not actions:
                 break
-        return {"ok": True, "actions": len(results), "results": results}
+        return {"ok": True, "actions": len(results), "results": results,
+                "last_thought": last_thought}
 
     async def _heartbeat_loop(self) -> None:
         """Human-like tick: scheduled plans first, idle pastimes, silent lurking."""
@@ -6627,7 +6631,8 @@ class LongMemoryAgentPlugin(Star):
             if tool == "qq_handle_group_invite" and self.qq:
                 return await self.qq.handle_group_invite(
                     str(args.get("flag", "")), bool(args.get("approve", True)),
-                    str(args.get("reason", "")))
+                    str(args.get("reason", "")),
+                    sub_type=str(args.get("sub_type", "") or "invite"))
             if tool == "recent_events" and self.storage:
                 return await self.storage.recent_events(
                     list(self._known_scopes.values()) or None, int(args.get("limit", 10)))
@@ -6999,10 +7004,16 @@ class LongMemoryAgentPlugin(Star):
             6000,
         )
         instruction = (
-            f"有 {len(pending)} 条待处理通知，逐条自主决定处理方式："
-            "好友申请用 qq_handle_friend_request(flag,approve,remark)（flag 在事件文本里）；"
-            "群邀请或入群申请用 qq_handle_group_invite(flag,approve,reason)；"
-            "其他通知如需回应自行决定，不需要处理就忽略。"
+            f"有 {len(pending)} 条待处理通知，逐条处理。**默认态度**：好友申请同意（remark 写对方"
+            "来自的群或能认人的备注），群邀请接受，别人申请进你的群也同意；只有明显是广告/骚扰/"
+            "可疑小号才拒绝，并在 reason 里写明。\n"
+            "动作写成 JSON：{\"actions\":[{\"tool\":\"qq_handle_friend_request\","
+            "\"args\":{\"flag\":\"<从事件文本里抄>\",\"approve\":true,\"remark\":\"群友\"}}],"
+            "\"thought\":\"为什么这么处理\",\"done\":true}；群相关申请改用 "
+            "qq_handle_group_invite(flag,approve,reason,sub_type)，"
+            "**sub_type 照抄事件文本里的值**（invite=邀请你进群，add=别人申请进你的群），"
+            "抄错会导致申请一直挂着；其他通知如需回应自行决定。"
+            "若决定不处理，thought 里必须写明理由（会记进日志）。\n"
             f"待处理列表：{listing}"
         )
         result = await self._autonomous_action_loop(pending[0].scope_id, "通知处理", instruction)
@@ -7013,9 +7024,10 @@ class LongMemoryAgentPlugin(Star):
                 "qq_send_group", "set_mood",
             }
         ]
+        thought = str(result.get("last_thought", "") or "").strip()[:120]
         brief = "；".join(
             f"{item['tool']}→{str(item.get('result', ''))[:40]}" for item in details[:6]
-        ) or "查看后无需操作"
+        ) or (f"未执行处理动作；理由是：{thought}" if thought else "未执行处理动作")
         compact = f"[通知处理] 处理了{len(pending)}条事件：{brief}"
         now_stamp = timeutil.text("%Y-%m-%d %H:%M")
         for scope_id in {e.scope_id for e in pending}:
@@ -7398,17 +7410,22 @@ class LongMemoryAgentPlugin(Star):
             await self.qq.handle_friend_request(flag, bool(approve), remark), 4000))
 
     @filter.llm_tool(name="qq_handle_group_invite")
-    async def qq_group_invite_tool(self, event: AstrMessageEvent, flag: str, approve: bool = True, reason: str = ""):
-        """处理收到的入群邀请（LLM自主决定是否接受）。
+    async def qq_group_invite_tool(self, event: AstrMessageEvent, flag: str,
+                                   approve: bool = True, reason: str = "",
+                                   sub_type: str = ""):
+        """处理群相关申请（LLM自主决定是否接受）：邀请你进群、或别人申请进你的群。
 
         Args:
-            flag(string): 邀请flag。
+            flag(string): 申请/邀请的 flag（事件文本里有）。
             approve(bool): 是否接受。
             reason(string): 拒绝理由，可留空。
+            sub_type(string): **必须与事件文本里的一致**：invite=邀请你进群，
+                add=别人申请进你的群（文本里写着 sub_type=...，照抄；抄错申请会一直挂着）。
         """
         self._require_qq(event)
         return (compact_json(
-            await self.qq.handle_group_invite(flag, bool(approve), reason), 4000))
+            await self.qq.handle_group_invite(
+                flag, bool(approve), reason, sub_type=sub_type or "invite"), 4000))
 
     @filter.llm_tool(name="qq_delete_friend")
     async def qq_delete_friend_tool(self, event: AstrMessageEvent, user_id: str):
