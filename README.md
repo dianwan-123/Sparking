@@ -4,11 +4,11 @@
 
 <img src="logo.png" alt="Sparking" width="140">
 
-# ✨ Sparking
+# ✨ Sparking · 星火
 
-**让你的 Bot 拥有记忆、情绪与自主行动的拟人化 Agent**
+**让你的 Bot 像真人一样：会聊天、记得住、有情绪，还会自己找事做**
 
-*不只是"回答问题"——它会记得你、会主动找你、会在群里像真人一样接话、攒梗、挂人。*
+*一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
   <img src="https://img.shields.io/badge/version-v1.0.0-orange.svg" alt="v1.0.0">

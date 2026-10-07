@@ -1,10 +1,11 @@
 name: astrbot_plugin_long_memory_agent
-display_name: Sparking
-short_desc: Sparking —— 让 Bot 拥有记忆、情绪与自主行动的拟人化 Agent
+display_name: Sparking · 星火
+short_desc: 星火 —— 让你的 Bot 像真人一样：会聊天、记得住、有情绪，还会自己找事做
 desc: |
-  保存白名单群完整消息，以分层摘要和记忆账本维护长期上下文；
-  支持全文回查、AstrBot 工具自觉、受权限约束的 Agent、插件市场与 Skill 管理，
-  以及表情包、消息表情回应和戳一戳。
+  一点星火，把"问答机器"烧成群里那个真人。
+  它会像人一样短句连发地聊天、记得你说过的每句话、情绪随聊天起落，
+  自己发表情包、看得懂合并聊天记录，也会不等你 @ 就主动接话、挂人、打理心情；
+  记忆跨群共享——同一个人在各个群只有一份印象，A 群的老梗在私聊里也接得上。
 version: v1.0.0
 author: Rikka0612
 repo: https://github.com/dianwan-123/Sparking

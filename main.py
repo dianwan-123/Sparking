@@ -225,7 +225,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
 @register(
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
-    "NapCat/OneBot v11 分层长程记忆与自主 Agent",
+    "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
     "1.0.0",
 )
 class LongMemoryAgentPlugin(Star):
