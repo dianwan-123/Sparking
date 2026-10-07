@@ -1,7 +1,7 @@
 # 人格语料：真实群聊风格手册（用于让 bot 学习真人说话）
 
-> 来源：`C:/Users/Administrator/Downloads/qqmsg` 三个群（数学指令讨论群 / BE指令饮品店 / 玖亿齐霸交流群二代）
-> 共 17,844 条真实消息的统计蒸馏。用法：整体贴进 AstrBot 人格（Persona）的系统提示词，
+> 来源：三个真实 QQ 群（MCBE 指令技术 / 数学算法 / 泛二次元音游）共 17,844 条消息的统计蒸馏。
+> 用法：整体贴进 AstrBot 人格（Persona）的系统提示词，
 > 或作为插件 `persona_id` 对应人格的主体描述。插件侧已同步注入浓缩版
 > （src/prompts.py 的 QQMSG_STYLE_PROMPT / GROUP_LIFE_BEHAVIORS_PROMPT）。
 
