@@ -375,6 +375,7 @@
     { id: "schedule", icon: "schedule", title: "日程与任务", desc: "任务队列、待办与事件条件指令" },
     { id: "caps", icon: "caps", title: "能力与拓展", desc: "bot 实际可调用的工具与已装载技能" },
     { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
+    { id: "culture", icon: "culture", title: "群风格与心理", desc: "它学到的说话习惯、群内黑话、对你的了解与情绪记忆" },
     { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
     { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
   ];
@@ -394,6 +395,7 @@
     ops: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.4"/><path d="M7.8 10 10.6 12.4 7.8 14.8M12.8 15h3.6"/>',
     inject: '<path d="M12 3.5v9"/><path d="M12 15.5v5"/><circle cx="12" cy="13" r="2.6"/>'
       + '<path d="M5.5 6.5h4M5.5 10h3M14.5 6.5h4M14.5 10h3"/>',
+    culture: '<path d="M4 5.5h16v11H8.5L4.5 20z"/><path d="M8 10h8M8 13h5"/>',
   };
 
   function iconSvg(name) {
@@ -689,6 +691,7 @@
       case "schedule": return loadSchedule();
       case "caps": return loadCaps();
       case "inject": return loadInjections();
+      case "culture": return loadCulture();
       case "config": return loadConfig();
       case "ops": return loadOps();
       default: return undefined;
@@ -1160,6 +1163,85 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
 
   // ---------------------------------------------------------------- 能力
   // ---------------------------------------------------------------- 提示词注入
+  // ---------------------------------------------------------------- 群风格与心理
+  async function loadCulture() {
+    const groups = [["styleRules", "style_rules"], ["lexicon", "lexicon"],
+                    ["profiles", "profiles"], ["moodEvents", "mood_events"]];
+    groups.forEach(([boxId]) => {
+      const box = $(boxId);
+      if (box) { box.textContent = ""; box.appendChild(el("div", "muted", "加载中…")); }
+    });
+    let data;
+    try {
+      data = await get("culture", { group_id: state.scope });
+    } catch (error) {
+      groups.forEach(([boxId]) => {
+        const box = $(boxId);
+        if (box) { box.textContent = ""; box.appendChild(el("div", "empty", String(error.message || error))); }
+      });
+      return;
+    }
+    renderList($("styleRules"), data.style_rules || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", `当${row.situation}时`));
+      title.appendChild(el("span", "tag", `用过 ${row.hits} 次`));
+      const del = actionBtn("删除", async () => {
+        if (!(await askConfirm({ title: "删掉这条规律", danger: true, okText: "删除",
+                                 message: `当${row.situation}时，可以${row.style}` }))) return;
+        try { await post("style_rule_delete", { rule_id: row.rule_id }); toast("已删除", "ok"); loadCulture(); }
+        catch (error) { toast(String(error.message || error), "error"); }
+      }, "warn");
+      return itemShell(title, `可以${row.style}`, "", [del]);
+    }, "还没学到这个群的说话习惯（再聊一阵就有了）");
+
+    renderList($("lexicon"), data.lexicon || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.term));
+      title.appendChild(el("span", "tag", row.meaning ? `用过 ${row.uses} 次` : "还没搞懂"));
+      const edit = actionBtn("改解释", async () => {
+        const answer = await askPrompt({
+          title: `「${row.term}」是什么意思`,
+          fields: [{ key: "meaning", label: "解释", value: row.meaning || "", multiline: true }],
+          okText: "保存",
+        });
+        if (!answer) return;
+        try {
+          await post("lexicon_save", { group_id: state.scope, term: row.term, meaning: answer.meaning });
+          toast("已保存", "ok"); loadCulture();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      });
+      const del = actionBtn("删除", async () => {
+        try { await post("lexicon_delete", { term_id: row.term_id }); toast("已删除", "ok"); loadCulture(); }
+        catch (error) { toast(String(error.message || error), "error"); }
+      }, "warn");
+      return itemShell(title, row.meaning || "（等它再出现几次我再学着理解）", "", [edit, del]);
+    }, "这个词库还是空的");
+
+    renderList($("profiles"), data.profiles || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.display_name || row.user_id));
+      title.appendChild(el("span", "tag", `聊过 ${row.know_counts} 次`));
+      const del = actionBtn("删除", async () => {
+        if (!(await askConfirm({ title: "删掉这份档案", danger: true, okText: "删除",
+                                 message: row.display_name || row.user_id }))) return;
+        try { await post("profile_delete", { person_id: row.person_id }); toast("已删除", "ok"); loadCulture(); }
+        catch (error) { toast(String(error.message || error), "error"); }
+      }, "warn");
+      return itemShell(title, (row.points || []).join("；"), "分类:内容:权重", [del]);
+    }, "还没有攒下对谁的了解");
+
+    renderList($("moodEvents"), data.mood_events || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.valence >= 0 ? "😊" : "😞"));
+      title.appendChild(el("span", "tag", String(row.created_at || "").slice(5, 16)));
+      const del = actionBtn("删除", async () => {
+        try { await post("mood_event_delete", { event_id: row.event_id }); toast("已删除", "ok"); loadCulture(); }
+        catch (error) { toast(String(error.message || error), "error"); }
+      }, "warn");
+      return itemShell(title, row.reason || "", "", [del]);
+    }, "还没有情绪起伏的记录");
+  }
+
   async function loadInjections() {
     const box = $("injections");
     if (!box) return;
@@ -1456,6 +1538,7 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     });
     $("btn-forest-refresh").addEventListener("click", loadForest);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
+    $("btn-refresh-culture").addEventListener("click", loadCulture);
     $("forest-filter").addEventListener("input", loadForest);
     $("btn-forest-new").addEventListener("click", () => forestEdit(null, null));
     $("btn-imp-save").addEventListener("click", async () => {

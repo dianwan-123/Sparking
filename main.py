@@ -135,6 +135,7 @@ from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
 from .src import timeutil
+from .src import style_learning
 from .src import injections as prompt_injections
 from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
@@ -232,7 +233,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
     "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
-    "1.0.2",
+    "1.0.3",
 )
 class LongMemoryAgentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -1372,6 +1373,16 @@ class LongMemoryAgentPlugin(Star):
                 delta = classify_interaction(stored.text)
                 if delta is not None:
                     self.mood.observe(delta)
+                    # 情绪记忆（不是"一句话加一个数值"）：明显起伏的那句留档——
+                    # 之后能注入"最近什么让我开心/难受"，心情回归时也有了依据。
+                    if abs(float(delta.valence or 0.0)) >= 0.35:
+                        valence = float(delta.valence)
+                        snippet = " ".join(str(stored.text or "").split())[:20]
+                        reason = (f"「{snippet}」让我挺开心" if valence > 0
+                                  else f"「{snippet}」让我不太舒服")
+                        await self.storage.add_mood_event(
+                            stored.scope_id, str(stored.sender_id), valence,
+                            float(delta.arousal or 0.0), reason, stored.message_id)
             except Exception:
                 pass
         if self.retrieval.embedding and stored.text:
@@ -1465,7 +1476,8 @@ class LongMemoryAgentPlugin(Star):
                     summary_limit=self.settings.summary_limit,
                     evidence_limit=self.settings.evidence_limit,
                     cross_scope_ids=self._shared_scope_ids(scope),
-                    cross_labels={v: k for k, v in self._known_scopes.items()},
+                    cross_labels=await self._scope_labels(),
+                    extras=await self._culture_extras(scope, str(event.get_sender_id() or "")),
                 )
             event.set_extra(_PREFETCH_KEY, memory)
         except Exception as error:
@@ -1485,7 +1497,9 @@ class LongMemoryAgentPlugin(Star):
                         memory = await self.context_builder.build(
                             scope, event.get_message_str(), runtime_manifest=manifest,
                             cross_scope_ids=self._shared_scope_ids(scope),
-                            cross_labels={v: k for k, v in self._known_scopes.items()},
+                            cross_labels=await self._scope_labels(),
+                            extras=await self._culture_extras(
+                                scope, str(event.get_sender_id() or "")),
                         )
                 except Exception:
                     memory = None
@@ -1629,8 +1643,9 @@ class LongMemoryAgentPlugin(Star):
                 "mood": mood_data,
             },
             cross_scope_ids=self._shared_scope_ids(scope_id),
-            cross_labels={v: k for k, v in self._known_scopes.items()},
+            cross_labels=await self._scope_labels(),
             affinity=affinity,
+            extras=await self._culture_extras(scope_id, str(event.get_sender_id() or "")),
         )
         context_data = parse_json_object(context) or {}
         merged_affinity = affinity
@@ -5796,6 +5811,64 @@ class LongMemoryAgentPlugin(Star):
             if self.storage and done:
                 await self.storage.complete_plan(str(plan.get("plan_id", "")), done)
 
+    async def _culture_extras(self, scope_id: str, user_id: str) -> dict[str, Any]:
+        """注入给模型的「群文化 + 这个人 + 最近的情绪起伏」。
+
+        移植自 MaiBot 的两块：① group_style / group_lexicon（学着像群里人一样说话、
+        看得懂圈内黑话）；② known_person / mood_events（攒对一个人的了解、记住什么
+        让我们情绪起伏——不是"一句话加一个数值"）。
+        """
+        extras: dict[str, Any] = {}
+        if self.storage is None or not scope_id:
+            return extras
+        try:
+            rules = await self.storage.list_style_rules(scope_id, 6)
+            lines = style_learning.render_style_rules(rules, 6)
+            if lines:
+                extras["group_style"] = {
+                    "note": "这个群说话的习惯（你学来的，照着说更自然）：",
+                    "rules": lines,
+                }
+        except Exception as error:
+            logger.info("长程记忆：群风格读取失败：%s", str(error)[:100])
+        try:
+            entries = await self.storage.list_lexicon(scope_id, 12, known_only=False)
+            lines = style_learning.render_lexicon(entries, 10)
+            unknown = [row["term"] for row in entries if not row.get("meaning")][:6]
+            if lines or unknown:
+                extras["group_lexicon"] = {
+                    "note": "这个群的词；unknown 里的你还没搞懂，用之前先问清或别用：",
+                    "terms": lines,
+                    "unknown": unknown,
+                }
+        except Exception as error:
+            logger.info("长程记忆：黑话读取失败：%s", str(error)[:100])
+        try:
+            if user_id:
+                profile = await self.storage.get_person_profile(user_id)
+                if profile:
+                    extras["known_person"] = {
+                        "user_id": profile.get("user_id", user_id),
+                        "name": profile.get("display_name", ""),
+                        "points": profile.get("points", [])[:12],
+                        "know_since": timeutil.to_text(profile.get("first_known", ""), "%m-%d"),
+                        "know_counts": profile.get("know_counts", 0),
+                        "note": "你对 TA 已知的了解（越聊越多；写新印象时接着它来）。",
+                    }
+        except Exception as error:
+            logger.info("长程记忆：人物档案读取失败：%s", str(error)[:100])
+        try:
+            events = await self.storage.recent_mood_events(self._shared_scope_ids(scope_id), 4)
+            lines = style_learning.mood_events_lines(events, 3)
+            if lines:
+                extras["mood_events"] = {
+                    "note": "最近让你情绪起伏的几句话（影响你现在的心情）：",
+                    "events": lines,
+                }
+        except Exception as error:
+            logger.info("长程记忆：情绪记忆读取失败：%s", str(error)[:100])
+        return extras
+
     async def _scope_labels(self) -> dict[str, str]:
         """scope_id → "群名（群号）"：跨会话记忆与各会话近况都靠它标注出处。"""
         labels: dict[str, str] = {}
@@ -6269,6 +6342,174 @@ class LongMemoryAgentPlugin(Star):
             except Exception as error:
                 logger.warning("长程记忆：风格学习异常：%s", str(error)[:150])
             await asyncio.sleep(interval + random.uniform(0, interval * 0.2))
+
+    async def _learn_group_culture(self, scope_id: str, provider: str) -> int:
+        """群文化学习（移植 MaiBot 的两块）：说话风格规律 + 群内黑话。
+
+        - 风格：学「情境 → 说法」，不学某个人，排除自己的发言；
+        - 黑话：先挖候选（拼音缩写/英文缩写/中文缩写/群内难懂短词），
+          再用它出现的上下文推断含义；**信息不足就记「还没搞懂」，绝不瞎猜**；
+          已经有解释的词，拿新上下文再核一遍（对不上就更新）。
+        """
+        if self.storage is None or not provider:
+            return 0
+        try:
+            messages = await self.storage.recent_messages(scope_id, 120)
+        except Exception:
+            return 0
+        lines: list[str] = []
+        for index, item in enumerate(messages):
+            text = " ".join(str(item.text or "").split())
+            if not text:
+                continue
+            who = "SELF" if str(item.sender_id) == str(getattr(self, "_self_id_hint", "")) else str(item.sender_name or "群友")
+            lines.append(f"[来源:{index}] {who}：{text[:120]}")
+        if len(lines) < 8:
+            return 0
+        window = "\n".join(lines[-120:])
+        learned = 0
+        # --- 风格规律
+        try:
+            raw = await self._llm_text(
+                provider, prompt=window, system_prompt=style_learning.GROUP_STYLE_PROMPT)
+            for rule in (parse_json_object(raw) or {}).get("rules", [])[:6]:
+                if not isinstance(rule, dict):
+                    continue
+                situation = str(rule.get("situation", "")).strip()
+                style = str(rule.get("style", "")).strip()
+                if not situation or not style:
+                    continue
+                await self.storage.upsert_style_rule(
+                    scope_id, situation, style,
+                    evidence_message_id=self._evidence_id(messages, rule.get("evidence_id")))
+                learned += 1
+        except Exception as error:
+            logger.info("长程记忆：群风格学习失败：%s", str(error)[:120])
+        # --- 黑话
+        try:
+            raw = await self._llm_text(
+                provider, prompt=window, system_prompt=style_learning.JARGON_MINE_PROMPT)
+            candidates = (parse_json_object(raw) or {}).get("candidates", [])[:4]
+        except Exception as error:
+            logger.info("长程记忆：黑话挖掘失败：%s", str(error)[:120])
+            candidates = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            term = str(item.get("term", "")).strip()[:24]
+            if not term:
+                continue
+            evidence = self._evidence_id(messages, item.get("evidence_id"))
+            known = await self.storage.get_lexicon_term(scope_id, term)
+            context = self._jargon_context(messages, term)
+            system = style_learning.JARGON_INFER_PROMPT.replace("{term}", term).replace(
+                "{context}", context or "（没找到别的上下文）").replace(
+                "{previous}",
+                style_learning.JARGON_COMPARE_HINT.format(meaning=known.get("meaning", ""))
+                if known and known.get("meaning") else "")
+            try:
+                raw = await self._llm_text(provider, prompt=term, system_prompt=system)
+            except Exception as error:
+                logger.info("长程记忆：黑话推断失败(%s)：%s", term[:8], str(error)[:100])
+                continue
+            data = parse_json_object(raw) or {}
+            if data.get("no_info"):
+                await self.storage.upsert_lexicon(scope_id, term, "", evidence_message_id=evidence)
+                continue
+            meaning = str(data.get("meaning", "")).strip()[:200]
+            if not meaning:
+                continue
+            await self.storage.upsert_lexicon(
+                scope_id, term, meaning, confidence=0.6, evidence_message_id=evidence,
+                bump_use=True)
+            learned += 1
+        if learned:
+            logger.info("长程记忆：%s群文化学习到 %d 条（风格/黑话）",
+                        self._conversation_key_of(scope_id), learned)
+        return learned
+
+    @staticmethod
+    def _evidence_id(messages: "list[Any]", raw_id: Any) -> str:
+        """把 LLM 给的编号换回内部 message_id（越界/非法一律空串）。"""
+        try:
+            index = int(str(raw_id).strip())
+        except (TypeError, ValueError):
+            return ""
+        if 0 <= index < len(messages):
+            return str(getattr(messages[index], "message_id", "") or "")
+        return ""
+
+    @staticmethod
+    def _jargon_context(messages: "list[Any]", term: str, span: int = 2) -> str:
+        """把这个词出现处的前后几条拼成上下文（给推断用，含说话人）。"""
+        rows: list[str] = []
+        for index, item in enumerate(messages):
+            text = " ".join(str(getattr(item, "text", "") or "").split())
+            if not text or term not in text:
+                continue
+            for offset in range(max(0, index - span), min(len(messages), index + span + 1)):
+                target = messages[offset]
+                body = " ".join(str(getattr(target, "text", "") or "").split())
+                if not body:
+                    continue
+                name = ("SELF" if offset == index else str(getattr(target, "sender_name", "") or "群友"))
+                rows.append(f"{name}：{body[:100]}")
+            rows.append("---")
+            if len(rows) > 18:
+                break
+        return "\n".join(rows[:18])
+
+    async def _learn_person_profiles_round(self, provider: str) -> int:
+        """人物心理档案：从最近发言里攒「分类:内容:权重」要点（跨群一份）。"""
+        if self.storage is None or not provider:
+            return 0
+        learned = 0
+        scopes = [
+            sid for key, sid in self._known_scopes.items()
+            if not key.startswith("private:") and self.settings.allows_group(key)
+        ][:3]
+        for scope_id in scopes:
+            try:
+                messages = await self.storage.recent_messages(scope_id, 120)
+            except Exception:
+                continue
+            by_user: dict[str, list[str]] = {}
+            names: dict[str, str] = {}
+            for item in messages:
+                text = " ".join(str(item.text or "").split())
+                if not text or str(item.sender_id) in {"", "system"}:
+                    continue
+                by_user.setdefault(str(item.sender_id), []).append(text)
+                names.setdefault(str(item.sender_id), str(item.sender_name or ""))
+            for user_id, texts in list(by_user.items())[:4]:
+                if len(texts) < 6:
+                    continue
+                profile = await self.storage.get_person_profile(user_id)
+                existing = "\n".join(profile.get("points") or []) or "（还没有）"
+                try:
+                    raw = await self._llm_text(
+                        provider,
+                        prompt=compact_json({"user": names.get(user_id, ""),
+                                             "samples": [x[:80] for x in texts[-10:]]}, 4000),
+                        system_prompt=style_learning.PERSON_PROFILE_PROMPT.replace(
+                            "{existing}", existing).replace(
+                            "{samples}", "\n".join(x[:80] for x in texts[-10:])))
+                except Exception as error:
+                    logger.info("长程记忆：人物档案学习失败：%s", str(error)[:120])
+                    continue
+                points = style_learning.parse_points((parse_json_object(raw) or {}).get("points"))
+                if not points:
+                    continue
+                await self.storage.upsert_person_profile(
+                    user_id, display_name=names.get(user_id, ""), points=points)
+                learned += 1
+        return learned
+
+    def _conversation_key_of(self, scope_id: str) -> str:
+        for key, sid in (self._known_scopes or {}).items():
+            if sid == scope_id:
+                return str(key)
+        return str(scope_id)[:8]
 
     async def _learn_styles_round(self) -> int:
         """定期总结人们的聊天方式：口头禅、句长、语气 → user_styles 档案。"""
@@ -8504,6 +8745,84 @@ class LongMemoryAgentPlugin(Star):
             return (f"{payload['origin']} 还没有可用的分层记忆（可能刚进群/刚被清空，"
                     "继续聊几句就会攒出来）")
         return compact_json(payload, 12000)
+
+    @filter.llm_tool(name="explain_jargon")
+    async def explain_jargon_tool(self, event: AstrMessageEvent, term: str = "",
+                                  group_id: str = ""):
+        """查群里某个词/黑话是什么意思（你在群文化学习里攒的词库）。
+
+        Args:
+            term(string): 要查的词；留空则列出这个群最常用的词。
+            group_id(string): 群号或群名，留空=当前会话。
+        """
+        if self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        scope = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个会话：{hint}"
+            scope = resolved
+        if not scope:
+            return "还没记录这个会话"
+        word = str(term or "").strip()
+        if word:
+            found = await self.storage.get_lexicon_term(scope, word)
+            if found is None:
+                return f"词库里还没有「{word}」——等它再出现几次，我再学着理解"
+            meaning = found.get("meaning") or "（还没搞懂，别乱用）"
+            return compact_json({"term": found["term"], "meaning": meaning,
+                                 "uses": found.get("uses", 1)}, 800)
+        rows = await self.storage.list_lexicon(scope, 20, known_only=False)
+        return compact_json({"terms": [{"term": r["term"],
+                                        "meaning": r["meaning"] or "（还没搞懂）"}
+                                       for r in rows]}, 4000)
+
+    @filter.llm_tool(name="list_group_style")
+    async def list_group_style_tool(self, event: AstrMessageEvent, group_id: str = ""):
+        """看看这个群说话的习惯（你学到的「什么情境用什么说法」）。
+
+        Args:
+            group_id(string): 群号或群名，留空=当前会话。
+        """
+        if self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        scope = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个会话：{hint}"
+            scope = resolved
+        if not scope:
+            return "还没记录这个会话"
+        rules = await self.storage.list_style_rules(scope, 12)
+        lines = style_learning.render_style_rules(rules, 12)
+        if not lines:
+            return "还没学到这个群的说话习惯（再聊一阵就有了）"
+        return compact_json({"style": lines}, 3000)
+
+    @filter.llm_tool(name="person_profile")
+    async def person_profile_tool(self, event: AstrMessageEvent, user_id: str = ""):
+        """看你对某个人已知的了解（他是什么人、喜欢什么、有什么习惯/雷点）。
+
+        Args:
+            user_id(string): QQ 号；留空=当前说话的人。
+        """
+        if self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        target = str(user_id or (event.get_sender_id() if event is not None else "")).strip()
+        if not target:
+            return "需要 user_id"
+        profile = await self.storage.get_person_profile(target)
+        if not profile:
+            return f"还没攒下关于 {target} 的了解"
+        return compact_json({
+            "user_id": profile["user_id"],
+            "name": profile.get("display_name", ""),
+            "first_known": timeutil.to_text(profile.get("first_known", ""), "%Y-%m-%d"),
+            "know_counts": profile.get("know_counts", 0),
+            "points": profile.get("points", []),
+        }, 2500)
 
     @filter.llm_tool(name="get_affinity")
     async def get_affinity_tool(self, event: AstrMessageEvent, user_id: str = ""):

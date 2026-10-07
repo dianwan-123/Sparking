@@ -49,6 +49,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("memory_tree", "记忆森林"),
     ("tasks", "任务队列"),
     ("injections", "提示词注入"),
+    ("culture", "群风格与心理"),
 )
 
 WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
@@ -63,6 +64,11 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("impression_save", "写人物印象"),
     ("impression_delete", "删人物印象"),
     ("affinity_adjust", "调好感度"),
+    ("style_rule_delete", "删一条群说话风格"),
+    ("lexicon_save", "改/加一条群内词条"),
+    ("lexicon_delete", "删一条群内词条"),
+    ("profile_delete", "删一份人物档案"),
+    ("mood_event_delete", "删一条情绪记忆"),
     ("injection_save", "存提示词注入（新增/改内容）"),
     ("injection_toggle", "开关提示词注入"),
     ("injection_delete", "删除自定义注入"),
@@ -385,6 +391,21 @@ class PageAPI:
     async def _read_plans(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         limit = min(max(int(query.get("limit", 30) or 30), 1), 200)
         return list(await self.storage.pending_plans(limit))
+
+    async def _read_culture(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """群说话风格 / 群内黑话 / 人物心理档案 / 情绪记忆（MaiBot 式的那两块）。"""
+        group = str(query.get("group_id") or "").strip()
+        scope = self._scope_or_raise(group) if group else (
+            next(iter(self._known_scopes().values()), None))
+        scope_ids = [scope] if scope else []
+        return {
+            "scope": group or "",
+            "style_rules": await self.storage.list_style_rules(scope_ids, 30),
+            "lexicon": await self.storage.list_lexicon(scope_ids, 40, known_only=False),
+            "profiles": await self.storage.list_person_profiles(30),
+            "mood_events": await self.storage.recent_mood_events(scope_ids, 20),
+            "note": "说话风格与黑话是按群学的；人物档案与情绪记忆跨群共用一份。",
+        }
 
     async def _read_injections(self, query: Mapping[str, Any]) -> dict[str, Any]:
         """提示词注入列表（自带 vs 自定义、开关状态）。"""
@@ -932,6 +953,18 @@ class PageAPI:
                 stickers.clear()
             except Exception:
                 pass
+        mood = getattr(self.host, "mood", None)
+        if mood is not None:
+            try:
+                mood.load_dict({})          # 情绪复位（mood.json 里那份也一起清）
+            except Exception:
+                pass
+        queue = getattr(self.host, "task_queue", None)
+        if queue is not None:
+            try:
+                await queue.ensure_table()   # 刚才删过 tasks 表，把表补回来
+            except Exception:
+                pass
         media = getattr(self.host, "media", None)
         if media is not None:
             try:
@@ -1028,6 +1061,39 @@ class PageAPI:
             raise WebUIError("缺少 plan_id")
         ok = await self.storage.drop_plan(plan_id)
         return {"ok": bool(ok), "plan_id": plan_id}
+
+    async def _do_style_rule_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        rule_id = str(body.get("rule_id") or "").strip()
+        if not rule_id:
+            raise WebUIError("缺少 rule_id")
+        return {"ok": True, "removed": await self.storage.delete_style_rule(rule_id)}
+
+    async def _do_lexicon_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        scope = self._scope_or_raise(str(body.get("group_id") or ""))
+        term = str(body.get("term") or "").strip()
+        if not term:
+            raise WebUIError("缺少 term")
+        meaning = str(body.get("meaning") or "").strip()
+        await self.storage.upsert_lexicon(scope, term, meaning, confidence=0.9)
+        return {"ok": True, "term": term}
+
+    async def _do_lexicon_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        term_id = str(body.get("term_id") or "").strip()
+        if not term_id:
+            raise WebUIError("缺少 term_id")
+        return {"ok": True, "removed": await self.storage.delete_lexicon(term_id)}
+
+    async def _do_profile_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        person_id = str(body.get("person_id") or "").strip()
+        if not person_id:
+            raise WebUIError("缺少 person_id")
+        return {"ok": True, "removed": await self.storage.delete_person_profile(person_id)}
+
+    async def _do_mood_event_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        event_id = str(body.get("event_id") or "").strip()
+        if not event_id:
+            raise WebUIError("缺少 event_id")
+        return {"ok": True, "removed": await self.storage.delete_mood_event(event_id)}
 
     async def _do_injection_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
         injection_id = str(body.get("injection_id") or "").strip()

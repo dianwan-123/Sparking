@@ -215,6 +215,29 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-culture" hidden>
+        <div class="card">
+          <h2>群说话风格 <span class="muted">学到的「什么情境用什么说法」</span></h2>
+          <p class="muted">它从群聊里学的（不含它自己的发言）；聊天时会自然地照着说。删掉错的即可。</p>
+          <div class="row"><button class="btn ghost" id="btn-refresh-culture">刷新</button></div>
+          <div id="styleRules" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>群内黑话 <span class="muted">词条与它理解的含义</span></h2>
+          <p class="muted">先挖出听不懂的词、再用上下文推断含义；信息不足时它不会硬猜（显示「还没搞懂」），
+            你可以直接改解释。</p>
+          <div id="lexicon" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>人物档案 <span class="muted">它对你的了解（跨群共用一份）</span></h2>
+          <div id="profiles" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>情绪记忆 <span class="muted">最近什么让它情绪起伏</span></h2>
+          <div id="moodEvents" class="list"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-config" hidden>
         <div class="toolbar">
           <input type="search" id="cfg-search" placeholder="搜配置项…">

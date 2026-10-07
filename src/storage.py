@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS stickers(sticker_id TEXT PRIMARY KEY,sha256 TEXT NOT 
 CREATE TABLE IF NOT EXISTS sticker_sources(sticker_id TEXT NOT NULL REFERENCES stickers(sticker_id) ON DELETE CASCADE,message_id TEXT NOT NULL REFERENCES message_identities(message_id) ON DELETE CASCADE,PRIMARY KEY(sticker_id,message_id));
 CREATE TABLE IF NOT EXISTS interactions(interaction_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,user_id TEXT,action TEXT NOT NULL,message_id TEXT,occurred_at TEXT NOT NULL,metadata_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_logs(audit_id TEXT PRIMARY KEY,scope_id TEXT REFERENCES scopes(scope_id) ON DELETE SET NULL,actor_id TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL,result TEXT NOT NULL,metadata_json TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS group_style_rules(rule_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,situation TEXT NOT NULL,style TEXT NOT NULL,evidence_message_id TEXT NOT NULL DEFAULT '',hits INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(scope_id,situation,style));
+CREATE TABLE IF NOT EXISTS group_lexicon(term_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,term TEXT NOT NULL,meaning TEXT NOT NULL DEFAULT '',confidence REAL NOT NULL DEFAULT 0.5,evidence_message_id TEXT NOT NULL DEFAULT '',first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,uses INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,UNIQUE(scope_id,term));
+CREATE TABLE IF NOT EXISTS person_profiles(person_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,display_name TEXT NOT NULL DEFAULT '',points_json TEXT NOT NULL DEFAULT '[]',know_counts INTEGER NOT NULL DEFAULT 0,first_known TEXT NOT NULL,last_known TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mood_events(event_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL,user_id TEXT NOT NULL DEFAULT '',valence REAL NOT NULL DEFAULT 0,arousal REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',message_id TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS prompt_injections(injection_id TEXT PRIMARY KEY,name TEXT NOT NULL,content TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,builtin INTEGER NOT NULL DEFAULT 0,sort_order INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS user_affinity(scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,user_id TEXT NOT NULL,warmth REAL NOT NULL DEFAULT 50,note TEXT NOT NULL DEFAULT '',interactions INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(scope_id,user_id));
 CREATE TABLE IF NOT EXISTS group_topics(topic_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,title TEXT NOT NULL,hits INTEGER NOT NULL DEFAULT 1,last_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(scope_id,title));
@@ -802,6 +806,21 @@ class Storage:
             await db.commit()
         return bool(cursor.rowcount)
 
+    async def drop_plan(self, plan_id: str) -> bool:
+        """撤销一条日程（WebUI 的「撤销任务」用）。
+
+        实录：这个方法在重构里被删了，但 WebUI 两处还在调 → 点撤销直接
+        `AttributeError: 'Storage' object has no attribute 'drop_plan'`。
+        """
+        plan_id = str(plan_id or "").strip()
+        if not plan_id:
+            return False
+        db = self._conn()
+        async with self._write_lock:
+            cursor = await db.execute("DELETE FROM agent_plans WHERE plan_id=?", (plan_id,))
+            await db.commit()
+            return bool(cursor.rowcount)
+
     async def complete_plan(self, plan_id: str, status: str, note: str = "") -> bool:
         if status not in {"done", "skipped", "failed"}:
             status = "done"
@@ -1133,6 +1152,216 @@ class Storage:
         return {str(row["sid"]): {"last_active": str(row["last_at"] or ""),
                                   "messages": int(row["total"] or 0)} for row in rows}
 
+    # -------------------------------------------- 群风格 / 黑话 / 人物档案 / 情绪记忆
+    async def upsert_style_rule(self, scope_id: str, situation: str, style: str, *,
+                                evidence_message_id: str = "") -> dict[str, Any]:
+        """记一条群说话规律（同群同「情境+说法」命中就 hits+1）。"""
+        situation, style = situation.strip()[:40], style.strip()[:40]
+        if not situation or not style:
+            raise ValueError("situation/style 不能为空")
+        now = utc_now()
+        rule_id = uuid.uuid5(uuid.NAMESPACE_URL,
+                             f"style\0{scope_id}\0{situation}\0{style}").hex
+        async with self._write_lock:
+            await self._conn().execute(
+                "INSERT INTO group_style_rules(rule_id,scope_id,situation,style,"
+                "evidence_message_id,hits,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?) "
+                "ON CONFLICT(scope_id,situation,style) DO UPDATE SET hits=group_style_rules.hits+1,"
+                "evidence_message_id=CASE WHEN excluded.evidence_message_id!='' "
+                "THEN excluded.evidence_message_id ELSE group_style_rules.evidence_message_id END,"
+                "updated_at=excluded.updated_at",
+                (rule_id, scope_id, situation, style, evidence_message_id[:64], now, now))
+        return {"rule_id": rule_id, "situation": situation, "style": style}
+
+    async def list_style_rules(self, scope_ids: "str | Sequence[str]",
+                               limit: int = 12) -> list[dict[str, Any]]:
+        scopes = [scope_ids] if isinstance(scope_ids, str) else [s for s in scope_ids if s]
+        if not scopes:
+            return []
+        marks = ",".join("?" for _ in scopes)
+        rows = await self._fetchall(
+            "SELECT rule_id,scope_id,situation,style,evidence_message_id,hits,updated_at "
+            f"FROM group_style_rules WHERE scope_id IN ({marks}) "
+            "ORDER BY hits DESC, updated_at DESC LIMIT ?",
+            (*scopes, _limit(limit, 60)))
+        return [{"rule_id": str(r["rule_id"]), "scope_id": str(r["scope_id"]),
+                 "situation": str(r["situation"]), "style": str(r["style"]),
+                 "evidence_message_id": str(r["evidence_message_id"]),
+                 "hits": int(r["hits"] or 1), "updated_at": str(r["updated_at"])}
+                for r in rows]
+
+    async def delete_style_rule(self, rule_id: str) -> int:
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "DELETE FROM group_style_rules WHERE rule_id=?", (str(rule_id),))
+            return int(cursor.rowcount or 0)
+
+    async def upsert_lexicon(self, scope_id: str, term: str, meaning: str, *,
+                             confidence: float = 0.5, evidence_message_id: str = "",
+                             bump_use: bool = False) -> dict[str, Any]:
+        """记/更新一个群内词条（黑话）。meaning 为空表示"还没搞懂"。"""
+        term = term.strip()[:24]
+        if not term:
+            raise ValueError("term 不能为空")
+        now = utc_now()
+        term_id = uuid.uuid5(uuid.NAMESPACE_URL, f"lex\0{scope_id}\0{term}").hex
+        async with self._write_lock:
+            await self._conn().execute(
+                "INSERT INTO group_lexicon(term_id,scope_id,term,meaning,confidence,"
+                "evidence_message_id,first_seen,last_seen,uses,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,1,?) "
+                "ON CONFLICT(scope_id,term) DO UPDATE SET "
+                "meaning=CASE WHEN excluded.meaning!='' THEN excluded.meaning "
+                "ELSE group_lexicon.meaning END,"
+                "confidence=CASE WHEN excluded.confidence>0 THEN excluded.confidence "
+                "ELSE group_lexicon.confidence END,"
+                "evidence_message_id=CASE WHEN excluded.evidence_message_id!='' "
+                "THEN excluded.evidence_message_id ELSE group_lexicon.evidence_message_id END,"
+                "last_seen=excluded.last_seen,"
+                "uses=group_lexicon.uses+?, updated_at=excluded.updated_at",
+                (term_id, scope_id, term, meaning.strip()[:200], float(confidence),
+                 evidence_message_id[:64], now, now, now, 1 if bump_use else 0))
+        return {"term_id": term_id, "term": term, "meaning": meaning}
+
+    async def list_lexicon(self, scope_ids: "str | Sequence[str]",
+                           limit: int = 20, *, known_only: bool = True) -> list[dict[str, Any]]:
+        scopes = [scope_ids] if isinstance(scope_ids, str) else [s for s in scope_ids if s]
+        if not scopes:
+            return []
+        marks = ",".join("?" for _ in scopes)
+        clause = " AND meaning!=''" if known_only else ""
+        rows = await self._fetchall(
+            "SELECT term_id,scope_id,term,meaning,confidence,uses,first_seen,last_seen "
+            f"FROM group_lexicon WHERE scope_id IN ({marks}){clause} "
+            "ORDER BY uses DESC, last_seen DESC LIMIT ?",
+            (*scopes, _limit(limit, 100)))
+        return [{"term_id": str(r["term_id"]), "scope_id": str(r["scope_id"]),
+                 "term": str(r["term"]), "meaning": str(r["meaning"]),
+                 "confidence": float(r["confidence"] or 0), "uses": int(r["uses"] or 1),
+                 "first_seen": str(r["first_seen"]), "last_seen": str(r["last_seen"])}
+                for r in rows]
+
+    async def get_lexicon_term(self, scope_id: str, term: str) -> dict[str, Any] | None:
+        row = await self._fetchone(
+            "SELECT term_id,scope_id,term,meaning,confidence,uses FROM group_lexicon "
+            "WHERE scope_id=? AND term=?", (scope_id, str(term).strip()[:24]))
+        if row is None:
+            return None
+        return {"term_id": str(row["term_id"]), "scope_id": str(row["scope_id"]),
+                "term": str(row["term"]), "meaning": str(row["meaning"]),
+                "confidence": float(row["confidence"] or 0), "uses": int(row["uses"] or 1)}
+
+    async def delete_lexicon(self, term_id: str) -> int:
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "DELETE FROM group_lexicon WHERE term_id=?", (str(term_id),))
+            return int(cursor.rowcount or 0)
+
+    async def upsert_person_profile(self, user_id: str, *, display_name: str = "",
+                                    points: "Sequence[str] | None" = None) -> dict[str, Any]:
+        """人物心理档案（跨群一份）：要点按「分类:内容:权重」存，认识次数累加。"""
+        user_id = str(user_id).strip()
+        if not user_id:
+            raise ValueError("user_id 不能为空")
+        now = utc_now()
+        person_id = uuid.uuid5(uuid.NAMESPACE_URL, f"person\0{user_id}").hex
+        existing = await self.get_person_profile(user_id)
+        merged = list(existing.get("points") or [])
+        if points:
+            from .style_learning import merge_points
+
+            merged = merge_points(merged, points)
+        async with self._write_lock:
+            await self._conn().execute(
+                "INSERT INTO person_profiles(person_id,user_id,display_name,points_json,"
+                "know_counts,first_known,last_known,updated_at) VALUES(?,?,?,?,1,?,?,?) "
+                "ON CONFLICT(person_id) DO UPDATE SET "
+                "display_name=CASE WHEN excluded.display_name!='' THEN excluded.display_name "
+                "ELSE person_profiles.display_name END,"
+                "points_json=excluded.points_json, know_counts=person_profiles.know_counts+1,"
+                "last_known=excluded.last_known, updated_at=excluded.updated_at",
+                (person_id, user_id, str(display_name or "")[:60],
+                 json.dumps(merged, ensure_ascii=False), now, now, now))
+        return {"person_id": person_id, "user_id": user_id, "points": merged}
+
+    async def get_person_profile(self, user_id: str) -> dict[str, Any]:
+        person_id = uuid.uuid5(uuid.NAMESPACE_URL, f"person\0{str(user_id).strip()}").hex
+        row = await self._fetchone(
+            "SELECT person_id,user_id,display_name,points_json,know_counts,first_known,"
+            "last_known,updated_at FROM person_profiles WHERE person_id=?", (person_id,))
+        if row is None:
+            return {}
+        try:
+            points = json.loads(row["points_json"] or "[]")
+        except Exception:
+            points = []
+        return {"person_id": str(row["person_id"]), "user_id": str(row["user_id"]),
+                "display_name": str(row["display_name"]), "points": list(points),
+                "know_counts": int(row["know_counts"] or 0),
+                "first_known": str(row["first_known"]), "last_known": str(row["last_known"]),
+                "updated_at": str(row["updated_at"])}
+
+    async def list_person_profiles(self, limit: int = 30) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            "SELECT person_id,user_id,display_name,points_json,know_counts,first_known,"
+            "last_known,updated_at FROM person_profiles ORDER BY last_known DESC LIMIT ?",
+            (_limit(limit, 100),))
+        out = []
+        for row in rows:
+            try:
+                points = json.loads(row["points_json"] or "[]")
+            except Exception:
+                points = []
+            out.append({"person_id": str(row["person_id"]), "user_id": str(row["user_id"]),
+                        "display_name": str(row["display_name"]), "points": list(points),
+                        "know_counts": int(row["know_counts"] or 0),
+                        "last_known": str(row["last_known"])})
+        return out
+
+    async def delete_person_profile(self, person_id: str) -> int:
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "DELETE FROM person_profiles WHERE person_id=?", (str(person_id),))
+            return int(cursor.rowcount or 0)
+
+    async def add_mood_event(self, scope_id: str, user_id: str, valence: float,
+                             arousal: float, reason: str, message_id: str = "") -> str:
+        event_id = uuid.uuid4().hex
+        async with self._write_lock:
+            await self._conn().execute(
+                "INSERT INTO mood_events(event_id,scope_id,user_id,valence,arousal,reason,"
+                "message_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (event_id, scope_id, str(user_id), float(valence), float(arousal),
+                 str(reason)[:120], str(message_id)[:64], utc_now()))
+        return event_id
+
+    async def recent_mood_events(self, scope_ids: "str | Sequence[str] | None" = None,
+                                 limit: int = 8) -> list[dict[str, Any]]:
+        scopes = None
+        if isinstance(scope_ids, str):
+            scopes = [scope_ids]
+        elif scope_ids:
+            scopes = [s for s in scope_ids if s]
+        args: list[Any] = []
+        clause = ""
+        if scopes:
+            clause = " WHERE scope_id IN (" + ",".join("?" for _ in scopes) + ")"
+            args.extend(scopes)
+        rows = await self._fetchall(
+            "SELECT event_id,scope_id,user_id,valence,arousal,reason,message_id,created_at "
+            "FROM mood_events" + clause + " ORDER BY created_at DESC LIMIT ?",
+            (*args, _limit(limit, 60)))
+        return [{"event_id": str(r["event_id"]), "scope_id": str(r["scope_id"]),
+                 "user_id": str(r["user_id"]), "valence": float(r["valence"] or 0),
+                 "arousal": float(r["arousal"] or 0), "reason": str(r["reason"]),
+                 "created_at": str(r["created_at"])} for r in rows]
+
+    async def delete_mood_event(self, event_id: str) -> int:
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "DELETE FROM mood_events WHERE event_id=?", (str(event_id),))
+            return int(cursor.rowcount or 0)
+
     # ---------------------------------------------------------- 提示词注入
     async def list_prompt_injections(self) -> list[dict[str, Any]]:
         rows = await self._fetchall(
@@ -1246,6 +1475,15 @@ class Storage:
                 await db.execute("DELETE FROM stickers")
                 await db.execute("DELETE FROM jobs")
                 await db.execute("DELETE FROM audit_logs")
+                # 实录（用户）：点了"清空全部记忆"，情绪/任务/日程还留着。
+                # 记忆相关的一律清干净——scopes 靠外键级联带走消息/摘要/话题/印象/好感/风格，
+                # 下面这些是各自独立的表，要显式删。
+                for table in ("agent_plans", "tasks", "mood_events", "person_profiles",
+                              "group_style_rules", "group_lexicon"):
+                    try:
+                        await db.execute(f"DELETE FROM {table}")
+                    except Exception:
+                        pass          # 表可能还没建（老库/功能关着）
                 if self.fts5_available:
                     await db.execute("DELETE FROM message_fts")
                 else:

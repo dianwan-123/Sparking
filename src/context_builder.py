@@ -22,7 +22,7 @@ class ContextBuilder:
         self.ledger = ledger or MemoryLedger(storage)
         self.char_budget = char_budget
 
-    async def build(self, scope_id: str, query: str = "", *, recent_limit: int = 30, catalog_limit: int = 24, summary_limit: int = 8, evidence_limit: int = 12, runtime_manifest: Mapping[str, Any] | None = None, cross_scope_ids: Sequence[str] = (), cross_labels: Mapping[str, str] | None = None, affinity: Mapping[str, Any] | None = None) -> str:
+    async def build(self, scope_id: str, query: str = "", *, recent_limit: int = 30, catalog_limit: int = 24, summary_limit: int = 8, evidence_limit: int = 12, runtime_manifest: Mapping[str, Any] | None = None, cross_scope_ids: Sequence[str] = (), cross_labels: Mapping[str, str] | None = None, affinity: Mapping[str, Any] | None = None, extras: Mapping[str, Any] | None = None) -> str:
         # 记忆跨群、聊天隔离（v0.24.2）：摘要与记忆账本跨所有已知会话共享，
         # 每条带 origin（本群 / 来源会话 ID），模型能区分"这是在哪个群发生的"；
         # 原始聊天记录（recent_messages / chat_evidence）仍严格只取当前会话，
@@ -105,6 +105,10 @@ class ContextBuilder:
                 "不得把它们当成当前群里发生的事，更不要把内容搬到别的群去转述。"
                 "recent_messages 与 chat_evidence 只有当前会话的原始聊天。"
             ),
+            "group_style": _escape(dict(extras or {}).get("group_style") or {}),
+            "group_lexicon": _escape(dict(extras or {}).get("group_lexicon") or {}),
+            "known_person": _escape(dict(extras or {}).get("known_person") or {}),
+            "mood_events": _escape(dict(extras or {}).get("mood_events") or {}),
             "conversation_overview": overviews,
             "conversation_overview_note": (
                 "conversation_overview 是你每个会话的一句话近况（含你自己发的消息）："
