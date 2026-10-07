@@ -714,3 +714,34 @@ class PluginLogoTests(unittest.TestCase):
         self.assertTrue(any(name.endswith("/metadata.yaml") for name in names), "包里要带 metadata.yaml")
         self.assertFalse(any("/tests/" in name or "/tools/" in name for name in names),
                          "开发件（tests/tools）不进包")
+
+
+class PublishMetadataTests(unittest.TestCase):
+    """第一版发布（v1.0.0 / 作者 Rikka0612）：占位符不许再溜进包里。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parents[1]
+
+    def test_register_author_and_version(self):
+        main = (self.root / "main.py").read_text(encoding="utf-8")
+        self.assertIn('"Rikka0612",', main)
+        self.assertIn('"1.0.0",', main)
+        self.assertNotIn("REPLACE_BEFORE_PUBLISHING", main)
+
+    def test_metadata_identity(self):
+        metadata = (self.root / "metadata.yaml").read_text(encoding="utf-8")
+        self.assertIn("author: Rikka0612", metadata)
+        self.assertIn("version: v1.0.0", metadata)
+        self.assertIn("Rikka0612/Sparking", metadata)
+
+    def test_no_bundled_example_extensions(self):
+        scripts = self.root / "scripts"
+        if scripts.is_dir():
+            names = [item.name for item in scripts.iterdir()
+                     if item.is_dir() and not item.name.startswith(("_", "."))]
+            self.assertEqual([], names, "发布版不带示例拓展")
+
+
+if __name__ == "__main__":
+    unittest.main()
