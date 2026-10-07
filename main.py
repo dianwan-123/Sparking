@@ -134,6 +134,7 @@ from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
 from .src import timeutil
+from .src import injections as prompt_injections
 from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
 from .src.web_tools import WebToolError, fetch_text, search_web
@@ -338,6 +339,7 @@ class LongMemoryAgentPlugin(Star):
             self.settings = PluginConfig.from_mapping(self.raw_config)
             logger.info("长程记忆：检测到配置热更新，已重建运行参数")
             self._apply_auto_install_setting()
+            self._invalidate_injections()
             # 后补的 SSH 配置：把 paramiko 安装/环境探测补跑一次
             try:
                 if self._ssh_config().configured and not self._ssh_env.get("checked"):
@@ -469,6 +471,7 @@ class LongMemoryAgentPlugin(Star):
         logger.info("长程记忆：时间基准 = %s（存储 UTC / 展示本地）",
                     zone or timeutil.zone_name() or "本机时区")
         self._apply_auto_install_setting()
+        self._injections_cache = None
         root = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_long_memory_agent"
         root.mkdir(parents=True, exist_ok=True)
         (root / "backups").mkdir(exist_ok=True)
@@ -476,6 +479,7 @@ class LongMemoryAgentPlugin(Star):
         self._claim_instance_slot()
         self._reap_zombie_instances()
         self.ingest = IngestService(self.storage)
+        await self._seed_prompt_injections()   # 自带注入预设入库（用户改过的不覆盖）
         self.ledger = MemoryLedger(self.storage)
         self.retrieval = RetrievalService(self.storage, embedding=await self._embedding_adapter())
         self.context_builder = ContextBuilder(
@@ -2108,9 +2112,45 @@ class LongMemoryAgentPlugin(Star):
         )
         return ""
 
+    def _invalidate_injections(self) -> None:
+        self._injections_cache = None
+
+    async def _seed_prompt_injections(self) -> None:
+        """把自带预设补进库（用户改过的不覆盖，只补缺的）。"""
+        if self.storage is None:
+            return
+        try:
+            added = await self.storage.seed_prompt_injections(prompt_injections.PRESETS)
+            if added:
+                logger.info("长程记忆：已补入 %d 条自带提示词注入预设", added)
+            self._invalidate_injections()
+        except Exception as error:
+            logger.warning("长程记忆：提示词注入预设播种失败：%s", str(error)[:140])
+
+    async def _injections_block(self) -> str:
+        """启用中的注入 → 一段"强制规则"文本（回复与自主行动都用它）。
+
+        缓存一份：每条消息都查库没必要；控制台/工具改动会调用 _invalidate_injections。
+        """
+        cached = getattr(self, "_injections_cache", None)
+        if cached is not None:
+            return cached
+        text = ""
+        if self.storage is not None:
+            try:
+                rows = await self.storage.list_prompt_injections()
+                text = prompt_injections.render_block(rows)
+            except Exception as error:
+                logger.info("长程记忆：读取提示词注入失败：%s", str(error)[:120])
+        self._injections_cache = text
+        return text
+
     async def _compose_reply_prompt(self) -> str:
         persona = await self._persona_prompt()
         parts = [part for part in (persona, REPLY_SYSTEM_PROMPT.strip()) if part]
+        injected = await self._injections_block()
+        if injected:
+            parts.append(injected)
         inventory = self._tool_inventory_prompt()
         if inventory:
             parts.append(inventory)
@@ -3650,6 +3690,7 @@ class LongMemoryAgentPlugin(Star):
         logger.info(
             "长程记忆：%s拟人回复计划=%d段", self._conversation_key(event), len(plan.segments)
         )
+        plan = self._text_first_plan(self._merge_split_sticker_plan(plan))
         sender = HumanizedSender(
             lambda descriptor: self._send_segment(event, descriptor),
             config=self._humanization,
@@ -3731,8 +3772,13 @@ class LongMemoryAgentPlugin(Star):
         )
 
     _STICKER_PLACEHOLDER_RE = re.compile(
-        r"\[\s*(?:sticker|表情|表情包)\s*[:：]?\s*([0-9a-fA-F]{16,64})\s*\]",
+        r"\[\s*(?:sticker|表情|表情包)\s*[:：]?\s*([0-9a-fA-F]{16,64})\s*\]?",
         re.IGNORECASE)
+    # "悬挂的占位开头"：实录模型把 [sticker: 和 <sha>] 拆成两条消息发出去，
+    # 任何一半单独看都不是完整占位 → 发送前要把相邻两段拼起来再判断
+    _STICKER_DANGLING_RE = re.compile(
+        r"\[\s*(?:sticker|表情|表情包)\s*[:：]?\s*$", re.IGNORECASE)
+    _STICKER_TAIL_RE = re.compile(r"^\s*([0-9a-fA-F]{16,64})\s*\]?\s*$")
 
     async def _send_sticker_placeholder(self, event: AstrMessageEvent,
                                         sticker_id: str) -> bool:
@@ -3760,6 +3806,74 @@ class LongMemoryAgentPlugin(Star):
         except Exception:
             pass
         return True
+
+    _MEDIA_ACTIONS = {"sticker", "image", "file", "record", "video"}
+
+    def _text_first_plan(self, plan: Any) -> Any:
+        """把所有媒体段挪到文字之后，媒体之间、文字之间各自保持原顺序。
+
+        实录（用户截图）：回复是「文字 → 表情 → 文字 → 表情」，表情被夹在两句中间。
+        用户要的是**别在文字之间夹图片/表情**：先说完整段话，再发图/表情。
+        稳定分区，不改任何一段的内容与延迟。
+        """
+        segments = list(getattr(plan, "segments", ()) or [])
+        if len(segments) < 3:
+            return plan
+        texts: list[Any] = []
+        media: list[Any] = []
+        for item in segments:
+            kind = str(getattr(item, "action", ""))
+            (media if kind in self._MEDIA_ACTIONS else texts).append(item)
+        if not media or len(texts) < 2:
+            return plan
+        ordered = texts + media
+        if ordered == segments:
+            return plan
+        try:
+            import dataclasses
+
+            return dataclasses.replace(plan, segments=tuple(ordered))
+        except Exception:
+            return plan
+
+    def _merge_split_sticker_plan(self, plan: Any) -> Any:
+        """把被拆成两段的 [sticker: … ] 占位拼回一段（计划段级）。
+
+        实录（用户截图）：一个气泡是"……你嘴硬 [sticker:"、下一个气泡是
+        "9dc80a0b…218]"。分开发出去就是两行源码，必须拼起来当成一次表情发送。
+        """
+        segments = list(getattr(plan, "segments", ()) or [])
+        if not segments:
+            return plan
+        merged: list[Any] = []
+        index = 0
+        changed = False
+        while index < len(segments):
+            item = segments[index]
+            text = str(getattr(item, "text", "") or "")
+            if (str(getattr(item, "action", "")) == "text"
+                    and self._STICKER_DANGLING_RE.search(text)
+                    and index + 1 < len(segments)
+                    and str(getattr(segments[index + 1], "action", "")) == "text"):
+                tail = str(getattr(segments[index + 1], "text", "") or "")
+                if self._STICKER_TAIL_RE.match(tail):
+                    import dataclasses
+
+                    merged.append(dataclasses.replace(
+                        item, text=(text + tail.strip())[:2000]))
+                    index += 2
+                    changed = True
+                    continue
+            merged.append(item)
+            index += 1
+        if not changed:
+            return plan
+        try:
+            import dataclasses
+
+            return dataclasses.replace(plan, segments=tuple(merged))
+        except Exception:
+            return plan
 
     async def _send_segment(self, event: AstrMessageEvent, descriptor: dict[str, Any]) -> None:
         action = descriptor.get("action")
@@ -5458,7 +5572,8 @@ class LongMemoryAgentPlugin(Star):
                 "\n\n".join(
                     part for part in
                     (persona, SCHEDULED_TASK_PROMPT.strip(), script_block,
-                     self._standing_orders_block()) if part
+                     self._standing_orders_block(),
+                     await self._injections_block()) if part
                 )
             )
             raw = await self._llm_text(provider, prompt=payload, system_prompt=task_prompt)

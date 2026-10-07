@@ -374,6 +374,7 @@
     { id: "groups", icon: "groups", title: "群与会话", desc: "会话列表、白名单与群话题" },
     { id: "schedule", icon: "schedule", title: "日程与任务", desc: "任务队列、待办与事件条件指令" },
     { id: "caps", icon: "caps", title: "能力与拓展", desc: "bot 实际可调用的工具与已装载技能" },
+    { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
     { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
     { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
   ];
@@ -391,6 +392,8 @@
     caps: '<path d="M12 3.6 14.7 9l6 .9-4.3 4.2 1 6-5.4-2.9-5.4 2.9 1-6L3.3 9.9l6-.9Z"/>',
     config: '<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9.5" cy="7" r="2.1"/><circle cx="15" cy="12" r="2.1"/><circle cx="8" cy="17" r="2.1"/>',
     ops: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.4"/><path d="M7.8 10 10.6 12.4 7.8 14.8M12.8 15h3.6"/>',
+    inject: '<path d="M12 3.5v9"/><path d="M12 15.5v5"/><circle cx="12" cy="13" r="2.6"/>'
+      + '<path d="M5.5 6.5h4M5.5 10h3M14.5 6.5h4M14.5 10h3"/>',
   };
 
   function iconSvg(name) {
@@ -685,6 +688,7 @@
       case "groups": return loadGroups();
       case "schedule": return loadSchedule();
       case "caps": return loadCaps();
+      case "inject": return loadInjections();
       case "config": return loadConfig();
       case "ops": return loadOps();
       default: return undefined;
@@ -1147,6 +1151,76 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
   }
 
   // ---------------------------------------------------------------- 能力
+  // ---------------------------------------------------------------- 提示词注入
+  async function loadInjections() {
+    const box = $("injections");
+    if (!box) return;
+    box.textContent = "";
+    box.appendChild(el("div", "muted", "加载中…"));
+    let data;
+    try {
+      data = await get("injections");
+    } catch (error) {
+      box.textContent = "";
+      box.appendChild(el("div", "empty", String(error.message || error)));
+      return;
+    }
+    const items = (data && data.items) || [];
+    box.textContent = "";
+    if (!items.length) {
+      box.appendChild(el("div", "empty", "还没有注入项——点上面的「新增」自己写一条"));
+      return;
+    }
+    items.forEach((row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.name || row.injection_id));
+      title.appendChild(el("span", "tag", row.builtin ? "自带" : "自定义"));
+      title.appendChild(el("span", "tag", row.enabled ? "已启用" : "未启用"));
+      const body = el("div", "body", String(row.content || "").slice(0, 220));
+      const toggle = actionBtn(row.enabled ? "关掉" : "启用", async () => {
+        try {
+          await post("injection_toggle", { injection_id: row.injection_id, enabled: !row.enabled });
+          toast(row.enabled ? "已关掉" : "已启用", "ok");
+          loadInjections();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }, row.enabled ? "" : "primary");
+      const edit = actionBtn("编辑", async () => {
+        const answer = await askPrompt({
+          title: "改这条注入",
+          fields: [
+            { key: "name", label: "名称", value: row.name || "" },
+            { key: "content", label: "规则内容（会以【强制规则】注入）", value: row.content || "", multiline: true },
+          ],
+          okText: "保存",
+        });
+        if (!answer) return;
+        try {
+          await post("injection_save", {
+            injection_id: row.injection_id, name: answer.name, content: answer.content,
+            enabled: row.enabled,
+          });
+          toast("已保存", "ok");
+          loadInjections();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      });
+      const remove = actionBtn("删除", async () => {
+        if (row.builtin) return toast("自带预设不能删，关掉就行", "error");
+        if (!(await askConfirm({
+          title: "删除这条注入", danger: true, okText: "删除",
+          message: row.name || row.injection_id,
+        }))) return;
+        try {
+          await post("injection_delete", { injection_id: row.injection_id });
+          toast("已删除", "ok");
+          loadInjections();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }, "warn");
+      box.appendChild(itemShell(title, "", (data.note || ""), [toggle, edit, remove]));
+      const main = box.lastChild.querySelector(".main");
+      if (main) main.insertBefore(body, main.querySelector(".meta"));
+    });
+  }
+
   async function loadCaps() {
     const [caps, extensions] = await Promise.all([get("capabilities"), get("extensions")]);
     state.capabilities = caps.items || [];
@@ -1355,7 +1429,25 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     $("msg-search").addEventListener("keydown", (event) => { if (event.key === "Enter") loadMemory(); });
     $("caps-search").addEventListener("input", renderCapabilities);
     $("cfg-search").addEventListener("input", renderConfig);
+    $("btn-inject-add").addEventListener("click", async () => {
+      const answer = await askPrompt({
+        title: "新增提示词注入",
+        fields: [
+          { key: "name", label: "名称（如：每条都要短）", value: "" },
+          { key: "content", label: "规则内容（写成硬性要求最有效）", value: "", multiline: true },
+        ],
+        okText: "添加并启用",
+      });
+      if (!answer) return;
+      if (!String(answer.content || "").trim()) return toast("内容不能为空", "error");
+      try {
+        await post("injection_save", { name: answer.name, content: answer.content, enabled: true });
+        toast("已添加", "ok");
+        loadInjections();
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
     $("btn-forest-refresh").addEventListener("click", loadForest);
+    $("btn-refresh-inject").addEventListener("click", loadInjections);
     $("forest-filter").addEventListener("input", loadForest);
     $("btn-forest-new").addEventListener("click", () => forestEdit(null, null));
     $("btn-imp-save").addEventListener("click", async () => {

@@ -201,6 +201,20 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-inject" hidden>
+        <div class="card">
+          <h2>提示词注入 <span class="muted">勾选即生效，以【强制规则】追加到系统提示</span></h2>
+          <p class="muted">自带预设可以直接启用、也可以改内容；自己的规则点「新增」。
+            注入内容写成硬性要求（「每条消息必须 ≤15 字」）效果最好——它们会以
+            「违反即视为本轮失败」的强制框架注入，优先级高于普通风格说明。</p>
+          <div class="row">
+            <button class="btn primary" id="btn-inject-add">新增注入</button>
+            <button class="btn ghost" id="btn-refresh-inject">刷新</button>
+          </div>
+          <div id="injections" class="list"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-config" hidden>
         <div class="toolbar">
           <input type="search" id="cfg-search" placeholder="搜配置项…">

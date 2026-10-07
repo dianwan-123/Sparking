@@ -48,6 +48,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("backups", "备份"),
     ("memory_tree", "记忆森林"),
     ("tasks", "任务队列"),
+    ("injections", "提示词注入"),
 )
 
 WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
@@ -62,6 +63,9 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("impression_save", "写人物印象"),
     ("impression_delete", "删人物印象"),
     ("affinity_adjust", "调好感度"),
+    ("injection_save", "存提示词注入（新增/改内容）"),
+    ("injection_toggle", "开关提示词注入"),
+    ("injection_delete", "删除自定义注入"),
     ("mood_set", "设置情绪"),
     ("plan_add", "加日程"),
     ("plan_drop", "撤日程"),
@@ -381,6 +385,15 @@ class PageAPI:
     async def _read_plans(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         limit = min(max(int(query.get("limit", 30) or 30), 1), 200)
         return list(await self.storage.pending_plans(limit))
+
+    async def _read_injections(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """提示词注入列表（自带 vs 自定义、开关状态）。"""
+        rows = await self.storage.list_prompt_injections()
+        return {
+            "items": rows,
+            "enabled": [row["injection_id"] for row in rows if row.get("enabled")],
+            "note": "注入会以【强制规则】的形式追加到系统提示；自带预设立即可用，可改内容。",
+        }
 
     async def _read_todos(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         group = str(query.get("group_id") or "").strip()
@@ -1015,6 +1028,65 @@ class PageAPI:
             raise WebUIError("缺少 plan_id")
         ok = await self.storage.drop_plan(plan_id)
         return {"ok": bool(ok), "plan_id": plan_id}
+
+    async def _do_injection_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        injection_id = str(body.get("injection_id") or "").strip()
+        name = str(body.get("name") or "").strip()
+        content = str(body.get("content") or "").strip()
+        if not content:
+            raise WebUIError("注入内容不能为空")
+        if not injection_id:
+            import re as _re
+
+            slug = _re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", name or content[:12]).strip("-")
+            injection_id = f"custom-{slug[:24] or 'item'}"
+        existing = {row["injection_id"]: row
+                    for row in await self.storage.list_prompt_injections()}
+        enabled = bool(body.get("enabled", existing.get(injection_id, {}).get("enabled", True)))
+        item = await self.storage.upsert_prompt_injection(
+            injection_id, name or injection_id, content, enabled=enabled,
+            builtin=bool(existing.get(injection_id, {}).get("builtin", False)),
+            sort_order=int(existing.get(injection_id, {}).get("sort_order", 50) or 50))
+        self._invalidate_injections()
+        return {"ok": True, "injection": item}
+
+    async def _do_injection_toggle(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        injection_id = str(body.get("injection_id") or "").strip()
+        if not injection_id:
+            raise WebUIError("缺少 injection_id")
+        rows = {row["injection_id"]: row for row in await self.storage.list_prompt_injections()}
+        row = rows.get(injection_id)
+        if row is None:
+            raise WebUIError(f"没有这条注入：{injection_id}")
+        enabled = bool(body.get("enabled", not row.get("enabled")))
+        await self.storage.upsert_prompt_injection(
+            injection_id, str(row.get("name") or injection_id),
+            str(row.get("content") or ""), enabled=enabled,
+            builtin=bool(row.get("builtin")), sort_order=int(row.get("sort_order") or 0))
+        self._invalidate_injections()
+        return {"ok": True, "injection_id": injection_id, "enabled": enabled}
+
+    async def _do_injection_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        injection_id = str(body.get("injection_id") or "").strip()
+        rows = {row["injection_id"]: row for row in await self.storage.list_prompt_injections()}
+        row = rows.get(injection_id)
+        if row is None:
+            raise WebUIError(f"没有这条注入：{injection_id}")
+        if row.get("builtin"):
+            raise WebUIError("自带预设不能删，直接关掉即可（改内容也行）")
+        removed = await self.storage.delete_prompt_injection(injection_id)
+        self._invalidate_injections()
+        return {"ok": True, "removed": removed}
+
+    def _invalidate_injections(self) -> None:
+        """让插件重新读注入（宿主有缓存）。"""
+        try:
+            host = self.host
+            invalidate = getattr(host, "_invalidate_injections", None)
+            if callable(invalidate):
+                invalidate()
+        except Exception:
+            pass
 
     async def _do_todo_add(self, body: Mapping[str, Any]) -> dict[str, Any]:
         _group, scope = self._scope_of(body)

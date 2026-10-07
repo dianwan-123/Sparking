@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS stickers(sticker_id TEXT PRIMARY KEY,sha256 TEXT NOT 
 CREATE TABLE IF NOT EXISTS sticker_sources(sticker_id TEXT NOT NULL REFERENCES stickers(sticker_id) ON DELETE CASCADE,message_id TEXT NOT NULL REFERENCES message_identities(message_id) ON DELETE CASCADE,PRIMARY KEY(sticker_id,message_id));
 CREATE TABLE IF NOT EXISTS interactions(interaction_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,user_id TEXT,action TEXT NOT NULL,message_id TEXT,occurred_at TEXT NOT NULL,metadata_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_logs(audit_id TEXT PRIMARY KEY,scope_id TEXT REFERENCES scopes(scope_id) ON DELETE SET NULL,actor_id TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL,result TEXT NOT NULL,metadata_json TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS prompt_injections(injection_id TEXT PRIMARY KEY,name TEXT NOT NULL,content TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,builtin INTEGER NOT NULL DEFAULT 0,sort_order INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS user_affinity(scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,user_id TEXT NOT NULL,warmth REAL NOT NULL DEFAULT 50,note TEXT NOT NULL DEFAULT '',interactions INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(scope_id,user_id));
 CREATE TABLE IF NOT EXISTS group_topics(topic_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,title TEXT NOT NULL,hits INTEGER NOT NULL DEFAULT 1,last_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(scope_id,title));
 CREATE INDEX IF NOT EXISTS idx_current_scope_seq ON message_current(scope_seq);
@@ -1131,6 +1132,61 @@ class Storage:
         )
         return {str(row["sid"]): {"last_active": str(row["last_at"] or ""),
                                   "messages": int(row["total"] or 0)} for row in rows}
+
+    # ---------------------------------------------------------- 提示词注入
+    async def list_prompt_injections(self) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            "SELECT injection_id,name,content,enabled,builtin,sort_order,created_at,updated_at "
+            "FROM prompt_injections ORDER BY sort_order, created_at")
+        return [
+            {"injection_id": str(row["injection_id"]), "name": str(row["name"]),
+             "content": str(row["content"]), "enabled": bool(row["enabled"]),
+             "builtin": bool(row["builtin"]), "sort_order": int(row["sort_order"]),
+             "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"])}
+            for row in rows
+        ]
+
+    async def upsert_prompt_injection(
+        self, injection_id: str, name: str, content: str, *,
+        enabled: bool = True, builtin: bool = False, sort_order: int = 0,
+    ) -> dict[str, Any]:
+        key = str(injection_id or "").strip()
+        if not key:
+            raise ValueError("injection_id 不能为空")
+        now = utc_now()
+        async with self._write_lock:
+            await self._conn().execute(
+                "INSERT INTO prompt_injections(injection_id,name,content,enabled,builtin,"
+                "sort_order,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(injection_id) DO UPDATE SET name=excluded.name,"
+                "content=excluded.content,enabled=excluded.enabled,"
+                "sort_order=excluded.sort_order,updated_at=excluded.updated_at",
+                (key, str(name)[:60], str(content)[:4000], 1 if enabled else 0,
+                 1 if builtin else 0, int(sort_order), now, now))
+        return {"injection_id": key, "name": str(name)[:60],
+                "content": str(content)[:4000], "enabled": bool(enabled),
+                "builtin": bool(builtin), "sort_order": int(sort_order)}
+
+    async def delete_prompt_injection(self, injection_id: str) -> int:
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "DELETE FROM prompt_injections WHERE injection_id=?", (str(injection_id),))
+            return int(cursor.rowcount or 0)
+
+    async def seed_prompt_injections(self, presets: "Sequence[Mapping[str, Any]]") -> int:
+        """把自带预设补进库（已存在的不动——用户改过的内容不该被覆盖）。"""
+        existing = {row["injection_id"] for row in await self.list_prompt_injections()}
+        added = 0
+        for order, item in enumerate(presets):
+            key = str(item.get("id", "")).strip()
+            if not key or key in existing:
+                continue
+            await self.upsert_prompt_injection(
+                key, str(item.get("name", key)), str(item.get("content", "")),
+                enabled=bool(item.get("enabled", False)),
+                builtin=True, sort_order=order)
+            added += 1
+        return added
 
     async def recent_topics(self, scope_id: str, limit: int = 10) -> list[dict[str, Any]]:
         rows = await self._fetchall(
