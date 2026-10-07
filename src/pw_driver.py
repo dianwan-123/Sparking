@@ -491,12 +491,60 @@ class PlaywrightDriver:
                 await render_page.set_content(
                     markup, wait_until="domcontentloaded", timeout=8000)
             await render_page.wait_for_timeout(500)
+            # 内容自适应：HTML 标了 data-shot-fit 的元素（聊天卡片就是）就按它的
+            # 实际尺寸定视口，再截图——否则固定 1280 宽的视口会把 520px 宽的卡片
+            # 塞在左上角，其余全白（用户：「消息只占左上角一点点」）。
+            box = await self._measure_fit(render_page)
+            if box:
+                # 窄卡片（聊天卡片 520px）放 2 倍：图片尺寸接近手机截图，字也清晰
+                zoom = 2 if box[0] <= 700 else 1
+                if zoom > 1:
+                    try:
+                        await render_page.evaluate(
+                            f"document.body.style.zoom = '{zoom}'")
+                        await render_page.wait_for_timeout(100)
+                        box = (box[0] * zoom, box[1] * zoom)
+                    except Exception:
+                        pass
+                width = max(240, min(2400, box[0]))
+                height = max(160, min(24000, box[1]))
+                try:
+                    await render_page.set_viewport_size(
+                        {"width": int(width), "height": int(height)})
+                    await render_page.wait_for_timeout(120)
+                except Exception:
+                    pass
+                return await render_page.screenshot()
             return await render_page.screenshot(full_page=bool(full_page))
         finally:
             try:
                 await render_page.close()
             except Exception:
                 pass
+
+    @staticmethod
+    async def _measure_fit(page: Any) -> tuple[float, float] | None:
+        """量 data-shot-fit 元素的外框（含外边距），拿不到返回 None。"""
+        script = """() => {
+            const node = document.querySelector('[data-shot-fit]');
+            if (!node) return null;
+            const rect = node.getBoundingClientRect();
+            if (!rect || rect.width < 1 || rect.height < 1) return null;
+            const style = getComputedStyle(node);
+            const extra = ['marginTop', 'marginBottom', 'marginLeft', 'marginRight']
+                .map((key) => parseFloat(style[key]) || 0);
+            return [rect.width + extra[2] + extra[3], rect.height + extra[0] + extra[1]];
+        }"""
+        try:
+            box = await page.evaluate(script)
+        except Exception:
+            return None
+        if not box or len(box) != 2:
+            return None
+        try:
+            return float(box[0]), float(box[1])
+        except (TypeError, ValueError):
+            return None
 
 
     async def _screenshot_with_grid(self, page: Any, full_page: bool) -> bytes:

@@ -2430,10 +2430,22 @@ class LongMemoryAgentPlugin(Star):
             except Exception as error:
                 logger.info("长程记忆：get_msg %s 失败（回落库存）：%s",
                             mid[:16], str(error)[:120])
-            if detail is None and self.storage is not None and scope_id:
-                try:
-                    row = await self.storage.find_message_any(scope_id, mid)
-                except Exception:
+            if detail is None and self.storage is not None:
+                # 先当前会话，再兜底扫其它会话——录实录：跨群引用消息 id 时，
+                # 只认当前会话会「一条都取不到」，模型只好改拿手边的消息凑。
+                tried: list[str] = []
+                for candidate in [str(scope_id or "")] + [
+                        str(x) for x in (self._known_scopes or {}).values()][:20]:
+                    if not candidate or candidate in tried:
+                        continue
+                    tried.append(candidate)
+                    try:
+                        row = await self.storage.find_message_any(candidate, mid)
+                    except Exception:
+                        row = None
+                    if row is not None:
+                        break
+                else:
                     row = None
                 if row is not None:
                     detail = {
@@ -2488,31 +2500,116 @@ class LongMemoryAgentPlugin(Star):
         所以这里先自己把图抓成 base64：SnowLuma 不再需要联网，坏图只丢那一段。
         """
         data = segment.get("data") or {}
-        source = str(data.get("file") or data.get("url") or "").strip()
         kind = str(segment.get("type") or "media")
-        if not source:
-            return {"type": "text", "data": {"text": f"[{kind}]"}}
-        lowered = source.lower()
-        if lowered.startswith(("base64://", "base://", "data:")):
+        label = {"image": "图片", "record": "语音", "video": "视频"}.get(kind, kind)
+        if self._segment_already_inline(data):
             return segment  # 已经是内联内容，原样
-        payload = b""
-        try:
-            if lowered.startswith(("http://", "https://")):
-                payload = await fetch_bounded(
-                    source, self.settings.media_max_file_mb * 1024 * 1024)
-            else:
-                path = Path(source)
-                if path.is_file():
-                    payload = await asyncio.to_thread(path.read_bytes)
-        except Exception as error:
-            logger.info("长程记忆：转发媒体抓取失败（降级占位）：%s", str(error)[:120])
-            payload = b""
+        payload = await self._fetch_media_bytes(data, kind)
         if not payload:
-            label = {"image": "图片", "record": "语音", "video": "视频"}.get(kind, kind)
             return {"type": "text", "data": {"text": f"[{label}已失效]"}}
         encoded = base64.b64encode(payload).decode("ascii")
         return {"type": kind,
                 "data": {**data, "file": "base64://" + encoded, "url": ""}}
+
+    @staticmethod
+    def _segment_already_inline(data: Mapping[str, Any]) -> bool:
+        """段里已经带 base64（或 base64:// file）就不用再抓。"""
+        if str(data.get("base64") or "").strip():
+            return True
+        return str(data.get("file") or "").lower().startswith(
+            ("base64://", "base://", "data:"))
+
+    async def _fetch_media_bytes(self, data: Mapping[str, Any],
+                                 kind: str = "image") -> bytes:
+        """媒体段 → 原始字节。依次试：远端 URL → 本地文件 → 网关 get_image。
+
+        实录（转发里图片全变"[图片已失效]"的真因）：get_msg 回里的 `file` 往往是
+        **裸文件名**（比如 "a1b2c3.jpg"，既不是 URL 也不是本地路径），而旧代码
+        `file or url` 优先拿它 → 读不到就当坏图。现在 URL 优先，裸文件名交给
+        get_image 去换真内容（SnowLuma 会给新 URL，NapCat 会给本地路径）。
+        """
+        cap = int(getattr(self.settings, "media_max_file_mb", 32) or 32) * 1024 * 1024
+        refs: list[str] = []
+        for key in ("url", "file", "path"):
+            value = str(data.get(key) or "").strip()
+            if value and value not in refs:
+                refs.append(value)
+        for source in refs:
+            lowered = source.lower()
+            if lowered.startswith(("base64://", "base://", "data:")):
+                return b""
+            if lowered.startswith("file://"):
+                source = source[7:]
+                lowered = source.lower()
+            if lowered.startswith(("http://", "https://")):
+                try:
+                    payload = await fetch_bounded(source, cap)
+                except Exception as error:
+                    logger.info("长程记忆：转发媒体下载失败（试下一来源）：%s",
+                                str(error)[:120])
+                    payload = b""
+                if payload:
+                    return payload
+                continue
+            try:
+                path = Path(source)
+                if path.is_file():
+                    return await asyncio.to_thread(path.read_bytes)
+            except Exception:
+                continue
+        # 网关兜底：把裸文件名换成真内容（图片走 get_image，语音走 get_record 转码）
+        ref = str(data.get("file") or data.get("file_id") or "").strip()
+        if not ref or self.gateway is None or kind not in {"image", "record"}:
+            return b""
+        try:
+            self._bind_gateway_client()
+            if kind == "image":
+                response = await self.gateway.execute("get_image", file=ref)
+                normalized = await self._normalize_image_payload(
+                    qq_payload(response), limit=cap)
+                encoded = str(((normalized or {}).get("data") or {}).get("base64") or "")
+            else:
+                response = await self.gateway.execute(
+                    "get_record", file=ref, out_format="mp3")
+                inner = qq_payload(response) or {}
+                encoded = str(inner.get("base64") or "")
+            if encoded:
+                return base64.b64decode(encoded.split(",", 1)[-1])
+        except Exception as error:
+            logger.info("长程记忆：转发媒体经网关取回失败：%s", str(error)[:120])
+        return b""
+
+    @staticmethod
+    def _forward_preview(details: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+        """卡片上的逐条预览（QQ 显示"名字：内容"那种）。"""
+        preview: list[dict[str, str]] = []
+        for item in list(details)[:4]:
+            name = str(item.get("name") or item.get("uin") or "群友")
+            text = ""
+            for segment in list(item.get("segments") or []):
+                if str(segment.get("type")) == "text":
+                    text = str((segment.get("data") or {}).get("text") or "").strip()
+                    if text:
+                        break
+            if not text:
+                kinds = {str(segment.get("type")) for segment in list(item.get("segments") or [])}
+                text = "[图片]" if "image" in kinds else "[消息]"
+            preview.append({"text": f"{name}：{text[:28]}"})
+        return preview
+
+    @staticmethod
+    def _clean_forward_name(value: Any) -> str:
+        """节点署名清洗：去控制字符/代理对残渣，压掉多余空白并限长。
+
+        实录：转发窗口标题出现过 "&ÿÿÆê ◆◆◆◆" 这类乱码——署名里混进了坏字符，
+        QQ 自己拼 "<甲>和<乙>的聊天记录" 就花了。
+        """
+        text = str(value or "")
+        cleaned = "".join(ch for ch in text
+                          if ch.isprintable() and not (0xDC80 <= ord(ch) <= 0xDCFF)
+                          and ord(ch) != 0xFFFD)
+        cleaned = " ".join(cleaned.split()).strip()
+        return cleaned[:24]
 
     async def _build_forward_nodes(
         self, details: Sequence[Mapping[str, Any]],
@@ -2532,7 +2629,7 @@ class LongMemoryAgentPlugin(Star):
                 segments = [{"type": "text", "data": {"text": "[空消息]"}}]
             nodes.append({"type": "node", "data": {
                 "user_id": str(item.get("uin") or "10000"),
-                "nickname": str(item.get("name") or "群友"),
+                "nickname": self._clean_forward_name(item.get("name")) or "群友",
                 "content": segments,
             }})
         return nodes
@@ -2569,6 +2666,16 @@ class LongMemoryAgentPlugin(Star):
             node["custom"] = True
         target_group = str(target_group_id or "").strip()
         target_user = str(target_user_id or "").strip()
+        if target_group and not target_group.isdigit():
+            # 群名也能用（实录：模型手里只有"数学指令讨论群"这种名字）
+            resolved, key, hint = await self._resolve_scope_ref(target_group)
+            if not resolved:
+                return f"没能定位目标群：{hint}"
+            target_group = key
+        if target_user and not target_user.isdigit():
+            resolved, key, hint = await self._resolve_scope_ref(target_user)
+            if resolved:
+                target_user = key
         if not target_group and not target_user:
             current_group = str(event.get_group_id() or "")
             if current_group:
@@ -2605,18 +2712,21 @@ class LongMemoryAgentPlugin(Star):
                     user_id=int(target_user) if target_user.isdigit() else target_user)
             else:
                 nodes = await self._build_forward_nodes(details)
+                # 卡片文案各就其位：summary=标题、prompt=预览前缀、news=逐条预览。
+                # 实录：三个字段塞同一句话，QQ 卡片上就出现两行一样的文字。
+                preview = self._forward_preview(details)
                 if target_group:
                     await self.gateway.execute(
                         "send_group_forward_msg",
                         group_id=int(target_group) if target_group.isdigit() else target_group,
-                        message=nodes, summary=outer[:50], prompt=outer[:50],
-                        news=[{"text": outer[:20]}])
+                        message=nodes, summary=outer[:50], prompt="[聊天记录]",
+                        news=preview)
                 else:
                     await self.gateway.execute(
                         "send_private_forward_msg",
                         user_id=int(target_user) if target_user.isdigit() else target_user,
-                        message=nodes, summary=outer[:50], prompt=outer[:50],
-                        news=[{"text": outer[:20]}])
+                        message=nodes, summary=outer[:50], prompt="[聊天记录]",
+                        news=preview)
         except Exception as error:
             return f"转发失败：{type(error).__name__}: {str(error)[:140]}"
         logger.info("长程记忆：%s已转发%d条消息（→%s）",
@@ -2632,6 +2742,7 @@ class LongMemoryAgentPlugin(Star):
     @filter.llm_tool(name="screenshot_messages")
     async def screenshot_messages_tool(
         self, event: AstrMessageEvent, message_ids_json: str = "", title: str = "",
+        group_id: str = "",
     ):
         """把一批消息做成 QQ 风格的聊天卡片图片发到当前会话（伪截图：头像+昵称+
         内容气泡，支持图文混排、合并转发占位）。比真实转发更直观，任何会话都能发；
@@ -2640,11 +2751,18 @@ class LongMemoryAgentPlugin(Star):
         Args:
             message_ids_json(string): 消息 id 数组 JSON，按时间顺序。
             title(string): 卡片标题，留空默认"聊天记录"。
+            group_id(string): 这些消息属于哪个群（群号或群名，如"数学指令讨论群"）；
+                消息来自别的群/会话时必须给，留空按当前会话找。
         """
         ids = self._parse_media_ids(message_ids_json)
         if not ids:
             return "需要 message_ids_json（消息 id 数组 JSON）"
         scope_id = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个群：{hint}"
+            scope_id = resolved
         details = await self._fetch_message_details(ids, scope_id)
         if not details:
             return "一条消息都没取到（可能已删除或 id 无效）"
@@ -5306,6 +5424,71 @@ class LongMemoryAgentPlugin(Star):
                 return self._known_scopes.get(key, ""), key
         return "", ""
 
+    async def _scope_directory(self) -> list[dict[str, str]]:
+        """全部已知会话：群号/QQ号、scope_id、名字（含白名单里还没说过话的群）。"""
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        if self.storage is not None:
+            try:
+                for item in await self.storage.all_scopes("aiocqhttp"):
+                    key = str(item.get("conversation_id") or "")
+                    scope_id = str(item.get("scope_id") or "")
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({"key": key, "scope_id": scope_id,
+                                 "name": str(item.get("display_name") or "")})
+            except Exception as error:
+                logger.info("长程记忆：列举会话失败：%s", str(error)[:120])
+        for key, scope_id in (self._known_scopes or {}).items():
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"key": str(key), "scope_id": str(scope_id), "name": ""})
+        for key in self.settings.group_whitelist or []:
+            if str(key) in seen:
+                continue
+            seen.add(str(key))
+            rows.append({"key": str(key), "scope_id": str(self._known_scopes.get(str(key), "")),
+                         "name": ""})
+        return rows
+
+    async def _resolve_scope_ref(self, ref: str) -> tuple[str, str, str]:
+        """把"群号 / QQ号 / 群名（或名字片段）"解析成 (scope_id, 会话号, 提示)。
+
+        实录：用户要"数学指令讨论群"的记录，模型手里只有名字，而检索工具只认当前
+        会话 → 它只好拿私聊的消息凑数。这里让带名字的目标都能解析出来；解析不了
+        就返回候选清单（宁可让它再问一句，也不要它默默换群）。
+        """
+        text = str(ref or "").strip()
+        if not text:
+            return "", "", ""
+        directory = await self._scope_directory()
+        lowered = text.lower()
+        exact = [row for row in directory if row["key"] == text]
+        if not exact:
+            exact = [row for row in directory
+                     if row["name"] and row["name"].lower() == lowered]
+        if not exact:
+            exact = [row for row in directory
+                     if row["name"] and lowered in row["name"].lower()]
+        if not exact:
+            exact = [row for row in directory if row["key"] == text.replace("群", "")]
+        if len(exact) == 1:
+            row = exact[0]
+            scope_id = row["scope_id"]
+            if not scope_id and self.storage is not None:
+                scope_id = str(self._known_scopes.get(row["key"], ""))
+            label = f"{row['name']}（{row['key']}）" if row["name"] else row["key"]
+            return scope_id, row["key"], f"已定位到 {label}"
+        names = [f"{row['name']}（{row['key']}）" if row["name"] else row["key"]
+                 for row in directory][:12]
+        if len(exact) > 1:
+            matched = [f"{row['name']}（{row['key']}）" if row["name"] else row["key"]
+                       for row in exact][:8]
+            return "", "", f"「{text}」匹配到多个会话：{'、'.join(matched)}——请指明群号"
+        return "", "", (f"没找到「{text}」这个会话；已知会话：{'、'.join(names) or '（暂无）'}")
+
     async def _run_idle_action(self, kind: str) -> None:
         scope, group_key = "", ""
         active = self._most_active_group()
@@ -6875,10 +7058,11 @@ class LongMemoryAgentPlugin(Star):
                 )
             await asyncio.sleep(random.uniform(3, 8))
 
-    async def _memory_facade(self, event: AstrMessageEvent) -> ScopedMemoryFacade:
+    async def _memory_facade(self, event: AstrMessageEvent,
+                             scope_id: str | None = None) -> ScopedMemoryFacade:
         if not self.storage or not self.retrieval or not self.ledger:
             raise RuntimeError("记忆系统尚未就绪")
-        scope = await self._scope_for_event(event, create=True)
+        scope = str(scope_id or "").strip() or await self._scope_for_event(event, create=True)
         if not scope:
             raise PermissionError("当前会话未启用记忆")
         return ScopedMemoryFacade(
@@ -6920,20 +7104,30 @@ class LongMemoryAgentPlugin(Star):
 
     @filter.llm_tool(name="search_chat_history")
     async def search_chat_history_tool(
-        self, event: AstrMessageEvent, query: str, sender_id: str = "", limit: int = 12
+        self, event: AstrMessageEvent, query: str, sender_id: str = "",
+        group_id: str = "", limit: int = 12
     ):
-        """在当前群的完整聊天事实层中搜索消息。
+        """在聊天事实层中搜索消息（默认当前会话，也可以指定别的群）。
 
         Args:
             query(string): 关键词或精确细节查询。
             sender_id(string): 可选发送者QQ号。
+            group_id(string): 要搜的群号**或群名**（如"数学指令讨论群"）；留空=当前会话。
             limit(number): 返回片段数，最大20。
         """
-        facade = await self._memory_facade(event)
+        scope_id = ""
+        if str(group_id or "").strip():
+            scope_id, _key, hint = await self._resolve_scope_ref(group_id)
+            if not scope_id:
+                return f"没能定位这个群：{hint}"
+        facade = await self._memory_facade(event, scope_id=scope_id or None)
         items = await facade.search_chat_history(
             query, sender_id=sender_id or None, limit=min(max(limit, 1), 20)
         )
-        return (compact_json([_public_value(item) for item in items], 12000))
+        payload = [_public_value(item) for item in items]
+        if str(group_id or "").strip() and not payload:
+            return f"（{group_id} 里没有匹配「{query}」的记录）"
+        return (compact_json(payload, 12000))
 
     @filter.llm_tool(name="get_chat_messages")
     async def get_chat_messages_tool(self, event: AstrMessageEvent, message_ids: list[str]):
@@ -7098,11 +7292,17 @@ class LongMemoryAgentPlugin(Star):
         """从NapCat读取群最近聊天记录（与本地完整存储互补）。
 
         Args:
-            group_id(string): 群号，留空使用当前群。
+            group_id(string): 群号**或群名**（如"数学指令讨论群"），留空使用当前群。
             count(number): 条数，最大60。
         """
         self._require_qq(event)
-        target = group_id or event.get_group_id()
+        target = str(group_id or "").strip()
+        if target and not target.isdigit():
+            resolved, key, hint = await self._resolve_scope_ref(target)
+            if not key:
+                return f"没能定位这个群：{hint}"
+            target = key
+        target = target or event.get_group_id()
         return (
             compact_json(await self.qq.group_history(target, min(max(int(count), 1), 60)), 14000))
 

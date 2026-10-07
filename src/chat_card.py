@@ -130,7 +130,10 @@ def build_card_html(messages: list[dict[str, Any]], *, title: str = "聊天记�
         "font-size:12px;padding:4px 8px;border-radius:4px;margin-bottom:5px;"
         "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
         f".footer{{text-align:center;color:{_TIME_COLOR};font-size:11px;margin-top:10px;}}"
-        "</style></head><body><div class='card'>"
+        "</style></head><body>"
+        # data-shot-fit：让截图管线按这个盒子的真实尺寸定画布（否则固定宽视口
+        # 会把卡片塞在左上角、其余全白——用户截图里的"消息只占一点点"）
+        "<div class='card' data-shot-fit>"
         f"<div class='title'><span>{_escape(title)}（{count}条）</span></div>"
         + rows + footer_html +
         "</div></body></html>"

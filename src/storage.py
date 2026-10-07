@@ -146,7 +146,11 @@ class Storage:
         db = self._conn()
         scope_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{platform}\0{account_id}\0{conversation_id}").hex
         await db.execute(
-            "INSERT INTO scopes(scope_id,platform,account_id,conversation_id,display_name,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(platform,account_id,conversation_id) DO UPDATE SET display_name=excluded.display_name",
+            # 名字只在拿得到时更新：入库链路常带空 display_name，直接覆盖会把
+            # 群名抹掉（实录：控制台会话列表只剩号码、按群名找不到会话）。
+            "INSERT INTO scopes(scope_id,platform,account_id,conversation_id,display_name,created_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(platform,account_id,conversation_id) DO UPDATE SET display_name="
+            "CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE scopes.display_name END",
             (scope_id, platform, account_id, conversation_id, display_name, utc_now()),
         )
         row = await self._fetchone("SELECT scope_id FROM scopes WHERE platform=? AND account_id=? AND conversation_id=?", (platform, account_id, conversation_id))
