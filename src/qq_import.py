@@ -271,6 +271,35 @@ def parse_export_folder(folder: Path, *, max_messages: int = 0) -> ImportedGroup
     return group
 
 
+# 纯占位（真内容没导出来）：拿它当"发言样本"喂模型，只会让它答非所问
+_PLACEHOLDER_TEXT = frozenset(_ELEMENT_PLACEHOLDER.values())
+
+
+def usable_samples(texts: Iterable[str], limit: int = 14) -> list[str]:
+    """挑出真正能看出「这个人是什么样」的发言样本。
+
+    实录：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
+    模型只能回一句"你发的是聊天记录片段，想让我做什么？"——样本本身没信息量。
+    这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾）。
+    """
+    usable: list[str] = []
+    for raw in texts:
+        text = " ".join(str(raw or "").split())
+        if not text:
+            continue
+        stripped = text
+        for token in _PLACEHOLDER_TEXT:
+            stripped = stripped.replace(token, "")
+        if len(stripped.strip(" ：:，,。.！!？?~～、")) < 4:
+            continue
+        usable.append(text[:80])
+    if len(usable) <= limit:
+        return usable
+    step = max(1, len(usable) // limit)
+    picked = usable[::step][:limit]
+    return picked
+
+
 def discover_groups(root: Path, *, max_messages: int = 0) -> list[ImportedGroup]:
     """zip 根目录下每一层文件夹当作一个群（也容忍多包一层目录）。"""
     candidates: list[Path] = []

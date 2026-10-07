@@ -18,6 +18,12 @@ def _float(value: Any, default: float, low: float, high: float) -> float:
         return default
 
 
+def _mode(value: Any, default: str = "auto") -> str:
+    """三态开关：auto / always / off（写错一律回默认）。"""
+    text = str(value or "").strip().lower()
+    return text if text in ("auto", "always", "off") else default
+
+
 @dataclass(slots=True)
 class PluginConfig:
     enabled: bool
@@ -79,6 +85,7 @@ class PluginConfig:
     plan_interval_hours: int
     origin_wake_prefixes: str
     style_learn_hours: int
+    system_prompt_folding: str
     auto_install_deps: bool
     browser_headful: bool
     browser_auto_install: bool
@@ -183,6 +190,7 @@ class PluginConfig:
             plan_interval_hours=_int(d.get("plan_interval_hours"), 6, 1, 24),
             origin_wake_prefixes=str(d.get("origin_wake_prefixes", "/") or "/"),
             style_learn_hours=_int(d.get("style_learn_hours"), 3, 0, 168),
+            system_prompt_folding=_mode(d.get("system_prompt_folding")),
             auto_install_deps=bool(d.get("auto_install_deps", True)),
             browser_headful=bool(d.get("browser_headful", False)),
             browser_auto_install=bool(d.get("browser_auto_install", True)),

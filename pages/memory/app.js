@@ -1210,19 +1210,24 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       });
       say("");
       say(`共 ${report.groups.length} 个群、${report.messages} 条消息；` +
+          `学到说话风格 ${report.style || 0} 条、黑话 ${report.lexicon || 0} 个；` +
           `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条`);
       (report.groups || []).forEach((group) => {
         const tag = group.whitelisted ? "白名单（含印象学习）" : "仅入库";
+        const culture = `；风格 ${group.style || 0} 条 / 黑话 ${group.lexicon || 0} 个`
+          + (group.culture_skip ? ` ⚠ ${group.culture_skip}` : "")
+          + (group.culture_error ? ` ⚠ ${group.culture_error}` : "");
         const learn = group.whitelisted
           ? `；印象 ${group.impressions || 0} 条 / 档案 ${group.profiles || 0} 条`
             + `（试了 ${group.attempted || 0} 人`
             + (group.skip_no_samples ? `，样本不足 ${group.skip_no_samples} 人` : "")
             + (group.unparsed ? `，模型输出没解析出来 ${group.unparsed} 人` : "")
+            + (group.call_failed ? `，模型没调通 ${group.call_failed} 人` : "")
             + (group.failed ? `，写库失败 ${group.failed} 次` : "")
             + (group.provider ? `，用模型 ${group.provider}` : "")
             + "）"
           : "";
-        say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}${learn}` +
+        say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}${culture}${learn}` +
             (group.error ? ` ⚠ ${group.error}` : "") +
             (group.learn_error ? ` ⚠ ${group.learn_error}` : "") +
             (group.skip ? ` ⚠ ${group.skip}` : ""));

@@ -314,6 +314,16 @@
     "description": "说话风格学习周期（小时）：每隔几小时用 LLM 总结群友的口头禅与语气存入风格档案，回复时自动模仿（0=关闭）",
     "default": 3
   },
+  "system_prompt_folding": {
+    "type": "string",
+    "description": "system 提示词兜底：有的模型/网关会把 system 消息整条丢掉（提示词、JSON 格式要求全失效，表现是模型答非所问、学什么都学不成）。auto=自动探测并按需把规则搬进用户消息；always=总是搬（最稳，但模型两边都看会稍多花 token）；off=不搬",
+    "default": "auto",
+    "options": [
+      "auto",
+      "always",
+      "off"
+    ]
+  },
   "browser_auto_install": {
     "type": "bool",
     "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；关闭后仅检测上报",

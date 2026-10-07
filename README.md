@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.0.4-orange.svg" alt="v1.0.4">
+  <img src="https://img.shields.io/badge/version-v1.0.5-orange.svg" alt="v1.0.5">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -98,6 +98,7 @@
 3. 控制台 →「**快速学习**」上传这个 zip，剩下的它自己来：解析、入库、按时间归档。
 
 - **不在白名单里的群也能导入**——导入只写记忆，不影响你指定的白名单，也不代表它会去接管那个群；
+- **每个群都会被学一遍"群文化"**：说话风格规律（什么情境该怎么说）与群内黑话（先说清含义再记下来），之后在这个群说话会照着来；
 - **白名单群会顺带建群友印象**：按发言活跃度取前几个人，写印象、贴标签、攒带权重的心理要点；
 - 导入的记录和日常记忆进的是**同一个库**：控制台能搜能翻、记忆森林里能看到，后台也会慢慢把它们归纳成分层摘要（量大的话要跑一会儿）；
 - **结果会逐群打在面板上**（多少条消息、多少人、建了几条印象）；一条印象都没建也会写明原因（样本不足／选不到模型／模型输出没解析出来），不会有"什么都没发生"的沉默；
@@ -109,7 +110,7 @@
 ## 📑 常用配置
 
 <details>
-<summary><b>最常用的 20 项</b></summary>
+<summary><b>最常用的 21 项</b></summary>
 
 | 配置 | 默认 | 说明 |
 | :--- | :--- | :--- |
@@ -126,6 +127,7 @@
 | `proactive_interval_minutes` | `15` | 短巡查：通知/话题/私聊（0=关） |
 | `self_reflect_interval_hours` | `6` | 长打理：总结/说说/资料（0=关） |
 | `heartbeat_interval_seconds` | `120` | 心跳：执行日程/闲时消遣/潜水看群（0=关） |
+| `system_prompt_folding` | `auto` | 有的模型会吞掉 system 消息（规则全失效）→ 自动探测并把规则搬进用户消息 |
 | `task_queue_enabled` | `true` | 任务队列常驻执行器（一切皆任务） |
 | `sticker_learning` | `true` | 学习群里的表情包并自主使用 |
 | `enable_qzone` / `enable_qq_tools` | `true` | QQ 空间 / QQ 工具自主权 |

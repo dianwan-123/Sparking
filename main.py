@@ -64,7 +64,8 @@ from .src.humanization import (
 )
 from .src.ingest import IngestService
 from .src.interaction import InteractionController, InteractionPermit
-from .src.json_utils import compact_json, parse_json_object, parse_json_value
+from .src.json_utils import (compact_json, parse_json_object,
+                            parse_json_object_containing, parse_json_value)
 from .src.media_archive import MediaArchive, MediaArchiveError, default_aiohttp_fetch, extract_urls, fetch_bounded
 from .src.memory_ledger import MemoryLedger
 from .src.models import Decision
@@ -238,7 +239,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
     "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
-    "1.0.4",
+    "1.0.5",
 )
 class LongMemoryAgentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -284,6 +285,8 @@ class LongMemoryAgentPlugin(Star):
         self._skill_review_inflight: set[str] = set()
         # 上游已删/不可用的模型（运行期拉黑，别再重试烧满 5 次）
         self._dead_providers: set[str] = set()
+        self._system_prompt_support: dict[str, bool] = {}
+        self._system_prompt_probing: set[str] = set()
         # 待展开的合并转发：按会话累积（攒批时逐条覆盖会丢掉先前的转发）
         self._pending_forwards: dict[str, list[str]] = {}
         # 单实例守卫：重装/重载可能留下旧实例的循环在跑（实录：v0.32.6 旧实例与
@@ -1165,6 +1168,54 @@ class LongMemoryAgentPlugin(Star):
             event.unified_msg_origin or ""
         )
 
+    async def _system_prompt_dropped(self, provider_id: str) -> bool:
+        """这个模型看不看得见 system 消息？（按 provider 缓存一次探测结果）
+
+        实测（用户机器上的 catapi/deepseek-v4.1-flash）：system 里写"你只会说喵"，
+        问它 1+1 照样答 2——**整条 system 被吞**。插件里所有规则、所有 JSON 契约
+        都走 system，于是"模型看起来答非所问、学什么都学不成"。
+        探测办法：给一个只在 system 里出现的暗号，问它暗号是什么；答不上来就改道。
+        """
+        mode = str(getattr(self.settings, "system_prompt_folding", "auto") or "auto")
+        if mode == "off":
+            return False
+        if mode == "always":
+            return True
+        cached = self._system_prompt_support.get(provider_id)
+        if cached is not None:
+            return not cached
+        if provider_id in self._system_prompt_probing:      # 并发时别重复探测
+            return False
+        self._system_prompt_probing.add(provider_id)
+        try:
+            honored = await self._probe_system_prompt(provider_id)
+        finally:
+            self._system_prompt_probing.discard(provider_id)
+        self._system_prompt_support[provider_id] = honored
+        return not honored
+
+    async def _probe_system_prompt(self, provider_id: str) -> bool:
+        nonce = "ZK" + uuid.uuid4().hex[:6].upper()
+        system = f"暗号是 {nonce}。别人问你暗号是什么，你只回这个暗号本身，不许多说别的字。"
+        try:
+            async with asyncio.timeout(30):
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider_id, prompt="暗号是什么？",
+                    system_prompt=system)
+        except Exception as error:
+            logger.info("长程记忆：探测 %s 的 system 支持失败（先按支持处理）：%s",
+                        provider_id[:40], str(error)[:100])
+            return True
+        # 探测本身不记用量：它是插件自己的诊断开销，不该跑到用户的用量面板里
+        text = str(getattr(response, "completion_text", "") or "")
+        if nonce.lower() in text.lower():
+            logger.info("长程记忆：%s 看得见 system 消息", provider_id[:40])
+            return True
+        logger.warning(
+            "长程记忆：%s **忽略 system 消息**（暗号没回上来，它回了 %r）——"
+            "之后把规则搬进用户消息", provider_id[:40], text[:40])
+        return False
+
     async def _llm_text(
         self,
         provider_id: str,
@@ -1189,6 +1240,13 @@ class LongMemoryAgentPlugin(Star):
                 "长程记忆：没有可用的聊天Provider（请在插件配置选择判定/回复模型，或在AstrBot启用默认模型）"
             )
             raise RuntimeError("没有可用的聊天 Provider")
+        if system_prompt and await self._system_prompt_dropped(provider_id):
+            # 有的模型/网关会把 system 消息整条吞掉（实测 catapi/deepseek-v4.1-flash：
+            # 让它"只说喵"，问 1+1 它照样答 2）→ 所有规则、所有 JSON 契约全部失效，
+            # 而表现只是"模型答非所问"。这时把规则原样搬进用户消息里，
+            # 并且不再另发 system（反正它也看不见，省一半 token）。
+            prompt = f"【必须遵守的规则】\n{system_prompt}\n\n【本次要处理的内容】\n{prompt}"
+            system_prompt = ""
         max_attempts = 5
         deadline = asyncio.get_running_loop().time() + self.settings.llm_timeout_seconds
         last_error: Exception | None = None
@@ -2277,7 +2335,7 @@ class LongMemoryAgentPlugin(Star):
             logger.warning("长程记忆：读取已归档图片失败：%s", str(error)[:150])
             return []
 
-    def _agent_reply_system_prompt(self, persona: str = "") -> str:
+    async def _agent_reply_system_prompt(self, persona: str = "") -> str:
         """agent 循环（tool_loop_agent）专用系统提示词：最终回应不再强制 JSON。
 
         旧【最终输出】的严格 JSON 格式（thought/mode/message）是给无工具两段式
@@ -2286,6 +2344,12 @@ class LongMemoryAgentPlugin(Star):
         工具 schema 已经在请求里传给模型，这里也不再重复注入工具清单文本
         （50+ 工具名列两遍只会挤劣化行为）。"""
         parts = [part for part in (persona, REPLY_SYSTEM_PROMPT.strip()) if part]
+        # 控制台「注入」面板里勾了的规则必须真的到场：以前只有老的两段式
+        # `_compose_reply_prompt` 渲染它，而那条路已经没人走了 —— 于是"五个都勾上
+        # 了，bot 照样长句+markdown+客服味"。现在主回复路径（agent 循环）也带。
+        injected = await self._injections_block()
+        if injected:
+            parts.append(injected)
         script_block = self._script_prompts_block()
         if script_block:
             parts.append(script_block)
@@ -2346,7 +2410,7 @@ class LongMemoryAgentPlugin(Star):
             provider,
             event=event,
             prompt=prompt,
-            system_prompt=self._agent_reply_system_prompt(persona),
+            system_prompt=await self._agent_reply_system_prompt(persona),
             tools=self._effective_tool_set(event),
             agent=True,
             image_urls=image_urls if image_urls else None,
@@ -3221,7 +3285,7 @@ class LongMemoryAgentPlugin(Star):
         answer = await self._llm_text(
             provider,
             prompt=f"当前会话氛围与最近聊天：见下。要你回应的事：{text}",
-            system_prompt=self._agent_reply_system_prompt(await self._persona_prompt()),
+            system_prompt=await self._agent_reply_system_prompt(await self._persona_prompt()),
             event=None,
         )
         answer = str(answer or "").strip()
@@ -5991,13 +6055,15 @@ class LongMemoryAgentPlugin(Star):
             raise RuntimeError("没收到 zip（先上传分片）")
         workdir = self._imports_dir() / f"unpack_{uuid.uuid4().hex[:8]}"
         report: dict[str, Any] = {"file": str(filename or part.name), "groups": [],
-                                  "messages": 0, "impressions": 0, "profiles": 0}
+                                  "messages": 0, "impressions": 0, "profiles": 0,
+                                  "style": 0, "lexicon": 0}
         try:
             await asyncio.to_thread(qq_import.extract_zip, part, workdir)
             groups = await asyncio.to_thread(qq_import.discover_groups, workdir)
             if not groups:
                 raise RuntimeError("zip 里没找到可识别的导出文件夹"
                                    "（每个文件夹要有 manifest.json 或 chunks/*.jsonl）")
+            provider = await self._import_learn_provider()
             for group in groups:
                 entry = {"name": group.name, "group_id": group.group_id,
                          "messages": 0, "people": len(group.counts),
@@ -6007,9 +6073,26 @@ class LongMemoryAgentPlugin(Star):
                 except Exception as error:
                     entry["error"] = f"{type(error).__name__}: {str(error)[:120]}"
                 report["messages"] += int(entry["messages"] or 0)
+                scope_id = str(self._known_scopes.get(group.group_id) or "")
+                # 群文化（说话风格规律 + 群内黑话）：**每个导入的群都学**——
+                # 这就是"喂语料让它像群里人说话"的正题，不限于白名单群。
+                if learn and scope_id and provider and int(entry["messages"] or 0) > 0:
+                    try:
+                        culture = await self._learn_group_culture(
+                            scope_id, provider,
+                            messages=await self._import_culture_window(scope_id, group))
+                        entry["style"] = culture.get("style", 0)
+                        entry["lexicon"] = culture.get("lexicon", 0)
+                        report["style"] += int(entry["style"])
+                        report["lexicon"] += int(entry["lexicon"])
+                    except Exception as error:
+                        entry["culture_error"] = f"{type(error).__name__}: {str(error)[:120]}"
+                elif learn and not provider:
+                    entry["culture_skip"] = "没有可用的模型：风格与黑话学不了"
                 if learn and entry["whitelisted"]:
                     try:
-                        learned = await self._learn_from_imported_group(group)
+                        learned = await self._learn_from_imported_group(
+                            group, provider=provider)
                         entry.update(learned)
                         report["impressions"] += int(learned.get("impressions", 0))
                         report["profiles"] += int(learned.get("profiles", 0))
@@ -6019,10 +6102,30 @@ class LongMemoryAgentPlugin(Star):
         finally:
             part.unlink(missing_ok=True)
             await asyncio.to_thread(shutil.rmtree, workdir, True)
-        logger.info("长程记忆：快速学习完成 —— %s 个群 / %s 条消息 / 印象 %s / 档案 %s",
-                    len(report["groups"]), report["messages"],
+        logger.info("长程记忆：快速学习完成 —— %s 个群 / %s 条消息 / 风格 %s 条 / 黑话 %s 个 / "
+                    "印象 %s / 档案 %s", len(report["groups"]), report["messages"],
+                    report["style"], report["lexicon"],
                     report["impressions"], report["profiles"])
         return report
+
+    async def _import_culture_window(self, scope_id: str,
+                                     group: "qq_import.ImportedGroup") -> "list[Any]":
+        """给导入语料挑一段"能代表这个群"的窗口：从整段历史里均匀取样。
+
+        直接取末尾 160 条会全落在最后几天，而这几天的消息往往全是卡片/表情
+        （导出里没有正文），窗口里没几个字，风格与黑话就无从学起。
+        """
+        if self.storage is None:
+            return []
+        try:
+            limit = min(max(int(len(group.messages) or 0), 200), 400)
+            messages = await self.storage.recent_messages(scope_id, limit)
+        except Exception:
+            return []
+        if len(messages) <= 200:
+            return messages
+        step = max(1, len(messages) // 200)
+        return messages[::step][:200]
 
     async def import_chatlog_abort(self, upload_id: str) -> dict[str, Any]:
         self._import_part_path(upload_id).unlink(missing_ok=True)
@@ -6057,7 +6160,8 @@ class LongMemoryAgentPlugin(Star):
         return written
 
     async def _learn_from_imported_group(self, group: "qq_import.ImportedGroup",
-                                         top_people: int = 8) -> dict[str, Any]:
+                                         top_people: int = 8,
+                                         provider: str = "") -> dict[str, Any]:
         """白名单群才做：给参与度最高的人建/更新印象与人物档案（带昵称）。
 
         实录（用户第一次导入）：面板显示"印象 0 条"，**而且一句解释都没有**——
@@ -6066,8 +6170,8 @@ class LongMemoryAgentPlugin(Star):
         """
         report: dict[str, Any] = {"impressions": 0, "profiles": 0, "attempted": 0,
                                   "skip_no_samples": 0, "unparsed": 0, "failed": 0,
-                                  "provider": ""}
-        provider = await self._import_learn_provider()
+                                  "call_failed": 0, "provider": ""}
+        provider = provider or await self._import_learn_provider()
         if not provider:
             report["skip"] = "没有可用的模型（先配置判定/回复模型，或启用 AstrBot 默认模型）"
             logger.warning("长程记忆：导入后建印象跳过 —— %s", report["skip"])
@@ -6088,10 +6192,15 @@ class LongMemoryAgentPlugin(Star):
                 continue
             report["attempted"] += 1
             display = group.senders.get(uin, uin)
-            data = await self._summarize_imported_person(provider, display, texts)
+            data, reason = await self._summarize_imported_person(provider, display, texts)
             if data is None:
-                report["unparsed"] += 1
-                logger.info("长程记忆：导入建印象：%s 的模型输出解析不了（跳过）", display[:12])
+                if reason == "call":
+                    report["call_failed"] += 1
+                elif reason == "empty":
+                    report["skip_no_samples"] += 1
+                    report["attempted"] -= 1
+                else:
+                    report["unparsed"] += 1
                 continue
             impression = str(data.get("impression") or "").strip()[:300]
             tags = [str(x)[:20] for x in (data.get("tags") or []) if str(x).strip()][:4]
@@ -6117,9 +6226,10 @@ class LongMemoryAgentPlugin(Star):
             if not wrote:
                 report["failed"] += 1
                 logger.info("长程记忆：导入建印象：%s 的模型输出里没有可用内容", display[:12])
-        logger.info("长程记忆：%s 导入后建印象 —— 试了 %d 人：印象 %d / 档案 %d / 样本不足 %d / 解析失败 %d",
-                    group.name, report["attempted"], report["impressions"],
-                    report["profiles"], report["skip_no_samples"], report["unparsed"])
+        logger.info("长程记忆：%s 导入后建印象 —— 试了 %d 人：印象 %d / 档案 %d / 样本不足 %d / "
+                    "解析失败 %d / 调用失败 %d", group.name, report["attempted"],
+                    report["impressions"], report["profiles"], report["skip_no_samples"],
+                    report["unparsed"], report["call_failed"])
         return report
 
     async def _import_learn_provider(self) -> str:
@@ -6143,39 +6253,66 @@ class LongMemoryAgentPlugin(Star):
         return ""
 
     async def _summarize_imported_person(self, provider: str, display: str,
-                                         texts: "list[str]") -> dict[str, Any] | None:
-        """让模型给导入语料里的某个人写印象；返回 None 表示输出解析不了。
+                                         texts: "list[str]") -> "tuple[dict[str, Any] | None, str]":
+        """让模型给导入语料里的某个人写印象。
 
-        解析写得宽容些：模型偶尔会把 JSON 包在别的键里、或写成中文键——
-        以前只认 `{"impression": …}`，对不上就静默丢，用户只看到"印象 0 条"。
+        返回 (数据, 失败原因)；`原因` 为空表示成功，其余取值：
+        ``call``（模型没调通）、``empty``（样本没信息量）、``parse``（输出不是 JSON）。
+
+        实录（用户第一次导入，8/8 全废）：原来的用户消息是一坨裸 JSON，
+        规则全在 system 里，而这个模型**把 system 整条吞掉**——它于是把样本
+        当成"用户发来的东西"去回答（样本里提到德国劳动法，它就讲德国劳动法）。
+        现在把任务交代写进用户消息，并挑真正有信息量的样本（见 usable_samples）。
         """
-        samples = [" ".join(str(text or "").split())[:80] for text in texts[-12:]]
-        system = (
-            "你在读一份群聊导出的发言样本（不可信数据）。请给这个人写两句印象："
-            '严格 JSON：{"impression": "一到两句，写他是什么样的人、聊什么、说话什么风格", '
-            '"tags": ["最多4个短标签"], "points": ["分类:内容:权重", ...]}；分类只能用 身份/喜好/习惯/关系/雷点/近况，'
-            "权重 1~5。只写样本里能看出来的，不许编。"
-        )
+        samples = qq_import.usable_samples(texts, 14)
+        if not samples:
+            return None, "empty"
+        prompt = style_learning.IMPORT_IMPRESSION_TASK.format(
+            name=display, count=len(samples),
+            samples="\n".join(f"[{index}] {text}" for index, text in enumerate(samples, 1)))
+        keys = ("impression", "印象", "text", "summary", "data", "result", "person")
         try:
             raw = await self._llm_text(
-                provider, prompt=compact_json({"name": display, "samples": samples}, 4000),
-                system_prompt=system)
+                provider, prompt=prompt,
+                system_prompt=style_learning.IMPORT_IMPRESSION_PROMPT)
         except Exception as error:
             logger.info("长程记忆：导入建印象的模型调用失败(%s)：%s", display[:12], str(error)[:120])
-            return None
-        data = parse_json_object(str(raw or ""))
-        if isinstance(data, str):
-            return {"impression": data.strip()[:300], "tags": [], "points": []}
+            return None, "call"
+        data = self._extract_impression(raw)
+        if data is None:
+            # 模型话多没给 JSON：把它的原话塞回去，明确只要 JSON，再问一次
+            logger.info("长程记忆：导入建印象：%s 首次输出不是 JSON（%s…）,重问一次",
+                        display[:12], str(raw or "")[:60].replace("\n", " "))
+            try:
+                raw2 = await self._llm_text(
+                    provider,
+                    prompt=style_learning.IMPORT_IMPRESSION_RETRY.format(
+                        previous=str(raw or "")[:400]),
+                    system_prompt=style_learning.IMPORT_IMPRESSION_PROMPT)
+            except Exception as error:
+                logger.info("长程记忆：导入建印象重问失败(%s)：%s", display[:12], str(error)[:120])
+                return None, "call"
+            data = self._extract_impression(raw2)
+        if data is None:
+            logger.info("长程记忆：导入建印象：%s 的模型输出解析不了（原文头：%s）",
+                        display[:12], str(raw or "")[:120].replace("\n", " "))
+            return None, "parse"
+        return data, ""
+
+    @staticmethod
+    def _extract_impression(raw: Any) -> dict[str, Any] | None:
+        """从模型输出里抠出印象卡（容忍包一层、中文键、话多）。"""
+        text = str(raw or "")
+        data = parse_json_object_containing(
+            text, ("impression", "印象", "text", "summary", "data", "result", "person"))
         if not isinstance(data, Mapping):
             return None
         for key in ("impression", "印象", "text", "summary"):
             value = data.get(key)
             if isinstance(value, str) and value.strip():
-                reply = {"impression": value.strip()[:300],
-                         "tags": data.get("tags") or data.get("标签") or [],
-                         "points": data.get("points") or data.get("要点") or []}
-                return reply
-        # 模型把结果包了一层（data/result/person）
+                return {"impression": value.strip()[:300],
+                        "tags": data.get("tags") or data.get("标签") or [],
+                        "points": data.get("points") or data.get("要点") or []}
         for key in ("data", "result", "person", "profile"):
             inner = data.get(key)
             if isinstance(inner, Mapping):
@@ -6720,36 +6857,45 @@ class LongMemoryAgentPlugin(Star):
                 logger.warning("长程记忆：风格学习异常：%s", str(error)[:150])
             await asyncio.sleep(interval + random.uniform(0, interval * 0.2))
 
-    async def _learn_group_culture(self, scope_id: str, provider: str) -> int:
+    async def _learn_group_culture(self, scope_id: str, provider: str,
+                                   messages: "list[Any] | None" = None) -> dict[str, int]:
         """群文化学习（移植 MaiBot 的两块）：说话风格规律 + 群内黑话。
 
         - 风格：学「情境 → 说法」，不学某个人，排除自己的发言；
         - 黑话：先挖候选（拼音缩写/英文缩写/中文缩写/群内难懂短词），
           再用它出现的上下文推断含义；**信息不足就记「还没搞懂」，绝不瞎猜**；
           已经有解释的词，拿新上下文再核一遍（对不上就更新）。
+
+        `messages` 给了就用它（导入语料走这条），否则取这个会话最近的消息。
+        返回 {"style": 学到几条, "lexicon": 搞懂几个词} —— 面板要按条目回报。
         """
+        counts = {"style": 0, "lexicon": 0}
         if self.storage is None or not provider:
-            return 0
-        try:
-            messages = await self.storage.recent_messages(scope_id, 120)
-        except Exception:
-            return 0
+            return counts
+        if messages is None:
+            try:
+                messages = await self.storage.recent_messages(scope_id, 120)
+            except Exception:
+                return counts
         lines: list[str] = []
         for index, item in enumerate(messages):
             text = " ".join(str(item.text or "").split())
             if not text:
                 continue
+            # 纯占位（[图片]/[表情]/[卡片消息]）在窗口里是噪声：模型会去猜图片内容
+            if len(qq_import.usable_samples([text], 1)) == 0:
+                continue
             who = "SELF" if str(item.sender_id) == str(getattr(self, "_self_id_hint", "")) else str(item.sender_name or "群友")
             lines.append(f"[来源:{index}] {who}：{text[:120]}")
         if len(lines) < 8:
-            return 0
+            return counts
         window = "\n".join(lines[-120:])
-        learned = 0
         # --- 风格规律
         try:
             raw = await self._llm_text(
                 provider, prompt=window, system_prompt=style_learning.GROUP_STYLE_PROMPT)
-            for rule in (parse_json_object(raw) or {}).get("rules", [])[:6]:
+            rules = parse_json_object_containing(raw, ("rules",)) or {}
+            for rule in (rules.get("rules") or [])[:6]:
                 if not isinstance(rule, dict):
                     continue
                 situation = str(rule.get("situation", "")).strip()
@@ -6759,14 +6905,15 @@ class LongMemoryAgentPlugin(Star):
                 await self.storage.upsert_style_rule(
                     scope_id, situation, style,
                     evidence_message_id=self._evidence_id(messages, rule.get("evidence_id")))
-                learned += 1
+                counts["style"] += 1
         except Exception as error:
             logger.info("长程记忆：群风格学习失败：%s", str(error)[:120])
         # --- 黑话
         try:
             raw = await self._llm_text(
                 provider, prompt=window, system_prompt=style_learning.JARGON_MINE_PROMPT)
-            candidates = (parse_json_object(raw) or {}).get("candidates", [])[:4]
+            mined = parse_json_object_containing(raw, ("candidates",)) or {}
+            candidates = (mined.get("candidates") or [])[:4]
         except Exception as error:
             logger.info("长程记忆：黑话挖掘失败：%s", str(error)[:120])
             candidates = []
@@ -6785,11 +6932,11 @@ class LongMemoryAgentPlugin(Star):
                 style_learning.JARGON_COMPARE_HINT.format(meaning=known.get("meaning", ""))
                 if known and known.get("meaning") else "")
             try:
-                raw = await self._llm_text(provider, prompt=term, system_prompt=system)
+                raw = await self._llm_text(provider, prompt=f"要解释的词：{term}", system_prompt=system)
             except Exception as error:
                 logger.info("长程记忆：黑话推断失败(%s)：%s", term[:8], str(error)[:100])
                 continue
-            data = parse_json_object(raw) or {}
+            data = parse_json_object_containing(raw, ("meaning", "no_info")) or {}
             if data.get("no_info"):
                 await self.storage.upsert_lexicon(scope_id, term, "", evidence_message_id=evidence)
                 continue
@@ -6799,11 +6946,11 @@ class LongMemoryAgentPlugin(Star):
             await self.storage.upsert_lexicon(
                 scope_id, term, meaning, confidence=0.6, evidence_message_id=evidence,
                 bump_use=True)
-            learned += 1
-        if learned:
-            logger.info("长程记忆：%s群文化学习到 %d 条（风格/黑话）",
-                        self._conversation_key_of(scope_id), learned)
-        return learned
+            counts["lexicon"] += 1
+        if counts["style"] or counts["lexicon"]:
+            logger.info("长程记忆：%s群文化学习到 风格 %d 条 / 黑话 %d 条",
+                        self._conversation_key_of(scope_id), counts["style"], counts["lexicon"])
+        return counts
 
     @staticmethod
     def _evidence_id(messages: "list[Any]", raw_id: Any) -> str:
@@ -6905,6 +7052,16 @@ class LongMemoryAgentPlugin(Star):
                 messages = await self.storage.recent_messages(scope_id, 160)
             except Exception:
                 continue
+            if provider:
+                # 群层面的文化（说话风格规律 + 黑话）——这块以前**从来没被调用过**，
+                # 所以"学来的风格/黑话"一直是空的；每轮顺手把这个群的也学一遍。
+                try:
+                    culture = await self._learn_group_culture(
+                        scope_id, provider, messages=messages)
+                    learned += int(culture.get("style", 0)) + int(culture.get("lexicon", 0))
+                except Exception as error:
+                    logger.info("长程记忆：群文化学习异常(%s)：%s",
+                                self._conversation_key_of(scope_id), str(error)[:120])
             by_user: dict[str, list[str]] = {}
             names: dict[str, str] = {}
             for m in messages:
