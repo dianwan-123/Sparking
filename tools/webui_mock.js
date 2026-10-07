@@ -91,6 +91,22 @@
     backups: [{ name: "sparking-2026-10-07.db", size: 288000, created_at: "2026-10-07 03:00" }],
     events: [{ kind: "friend_request", text: "小明 请求加好友", created_at: "2026-10-07 10:00", handled: true }],
     mood: { mood: "雀跃", intensity: 0.62, note: "群里在夸它" },
+    injections: {
+      note: "注入会以【强制规则】的形式追加到系统提示；自带预设立即可用，可改内容。",
+      enabled: ["short-bubbles"],
+      items: [
+        { injection_id: "short-bubbles", name: "短消息拟人（每条都短）", builtin: true, enabled: true,
+          content: "【硬性】每条消息必须短：正文 ≤15 字，最多不超过 20 字。\
+【硬性】一句话就是一条消息；想说的多就拆成 2~4 条连发，绝不写成一段长文。\
+【硬性】单条消息里不许出现换行、不许分段、不许列点。" },
+        { injection_id: "no-assistant-tone", name: "禁客服腔/助手腔", builtin: true, enabled: false,
+          content: "【硬性】禁止任何客服与助手口吻：「您好」「请问有什么可以帮您」「希望对你有所帮助」。" },
+        { injection_id: "no-markdown", name: "禁 markdown 排版", builtin: true, enabled: false,
+          content: "【硬性】消息里不出现 markdown：# 标题、**加粗**、`代码`、- 列表、1. 编号一律不要。" },
+        { injection_id: "custom-0001", name: "别叫我主人", builtin: false, enabled: true,
+          content: "【硬性】不要称呼我为爸爸/主人，就叫 Rikka。" },
+      ],
+    },
   };
 
   window.AstrBotPluginPage = {
