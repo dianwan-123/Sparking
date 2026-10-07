@@ -163,7 +163,6 @@ QQ 只在服务端缓存转发资源一小段时间。Sparking 在**消息到达
 - SSH 运维与 computer use（让它真能操作电脑）
 - 多消息平台的接入与互通
 - 与本地 agent harness 互通
-- 多 bot 平台适配（NapCat 等）
 
 ## 📄 说明
 
