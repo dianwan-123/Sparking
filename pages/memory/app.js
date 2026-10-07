@@ -376,6 +376,7 @@
     { id: "caps", icon: "caps", title: "能力与拓展", desc: "bot 实际可调用的工具与已装载技能" },
     { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
     { id: "culture", icon: "culture", title: "群风格与心理", desc: "它学到的说话习惯、群内黑话、对你的了解与情绪记忆" },
+    { id: "learn", icon: "learn", title: "快速学习", desc: "导入导出的群聊天记录，让它一次学会这些群" },
     { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
     { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
   ];
@@ -396,6 +397,7 @@
     inject: '<path d="M12 3.5v9"/><path d="M12 15.5v5"/><circle cx="12" cy="13" r="2.6"/>'
       + '<path d="M5.5 6.5h4M5.5 10h3M14.5 6.5h4M14.5 10h3"/>',
     culture: '<path d="M4 5.5h16v11H8.5L4.5 20z"/><path d="M8 10h8M8 13h5"/>',
+    learn: '<path d="M12 4 3.5 8.5 12 13l8.5-4.5z"/><path d="M6 10.5V16c0 1.7 2.7 3 6 3s6-1.3 6-3v-5.5"/><path d="M20.5 8.5V14"/>',
   };
 
   function iconSvg(name) {
@@ -692,6 +694,7 @@
       case "caps": return loadCaps();
       case "inject": return loadInjections();
       case "culture": return loadCulture();
+      case "learn": return loadLearn();
       case "config": return loadConfig();
       case "ops": return loadOps();
       default: return undefined;
@@ -1163,6 +1166,90 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
 
   // ---------------------------------------------------------------- 能力
   // ---------------------------------------------------------------- 提示词注入
+  // ---------------------------------------------------------------- 快速学习（导入聊天记录）
+  const CHUNK_BYTES = 512 * 1024;      // 每片 512KB：桥接只发 JSON，必须切片
+
+  function readChunk(file, start, end) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result || "");
+        resolve(text.split(",", 2)[1] || "");
+      };
+      reader.onerror = () => reject(new Error("读取文件失败"));
+      reader.readAsDataURL(file.slice(start, end));
+    });
+  }
+
+  async function runImport() {
+    const input = $("learn-file");
+    const file = input && input.files && input.files[0];
+    if (!file) return toast("先选一个 zip", "error");
+    if (!/\.zip$/i.test(file.name)) return toast("要 zip 文件", "error");
+    const uploadId = "up" + Date.now().toString(36);
+    const total = Math.ceil(file.size / CHUNK_BYTES);
+    const box = $("learn-log");
+    box.hidden = false;
+    box.textContent = "";
+    const say = (line) => { box.textContent += line + "\n"; box.scrollTop = box.scrollHeight; };
+    say(`开始上传 ${file.name}（${(file.size / 1048576).toFixed(1)}MB，${total} 片）`);
+    const button = $("btn-learn-run");
+    button.disabled = true;
+    try {
+      for (let index = 0; index < total; index += 1) {
+        const data = await readChunk(file, index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
+        await post("import_chatlog_upload", { upload_id: uploadId, index, data });
+        if (index % 5 === 4 || index === total - 1) {
+          say(`  已上传 ${index + 1}/${total} 片`);
+        }
+      }
+      say("上传完成，正在解析…（群多的包要等一会儿）");
+      const learn = $("learn-learn") ? $("learn-learn").checked : true;
+      const report = await post("import_chatlog_finish", {
+        upload_id: uploadId, filename: file.name, learn,
+      });
+      say("");
+      say(`共 ${report.groups.length} 个群、${report.messages} 条消息；` +
+          `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条`);
+      (report.groups || []).forEach((group) => {
+        const tag = group.whitelisted ? "白名单（含印象学习）" : "仅入库";
+        say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}` +
+            (group.error ? ` ⚠ ${group.error}` : "") +
+            (group.learn_error ? ` ⚠ ${group.learn_error}` : ""));
+      });
+      toast("导入完成", "ok");
+      loadLearn();
+    } catch (error) {
+      say("失败：" + String(error.message || error));
+      try { await post("import_chatlog_abort", { upload_id: uploadId }); } catch (_) { /* 忽略 */ }
+      toast(String(error.message || error), "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function loadLearn() {
+    const box = $("learn-scopes");
+    if (!box) return;
+    box.textContent = "";
+    box.appendChild(el("div", "muted", "加载中…"));
+    let data;
+    try {
+      data = await get("imports");
+    } catch (error) {
+      box.textContent = "";
+      box.appendChild(el("div", "empty", String(error.message || error)));
+      return;
+    }
+    renderList(box, data.scopes || [], (row) => {
+      const title = el("div", "title");
+      title.appendChild(el("span", "", row.name || row.group_id));
+      title.appendChild(el("span", "tag", row.whitelisted ? "白名单" : "非白名单"));
+      title.appendChild(el("span", "tag", `${row.messages} 条`));
+      return itemShell(title, row.group_id, String(row.last_active || "").slice(0, 16), []);
+    }, "还没有导入过任何群");
+  }
+
   // ---------------------------------------------------------------- 群风格与心理
   async function loadCulture() {
     const groups = [["styleRules", "style_rules"], ["lexicon", "lexicon"],
@@ -1539,6 +1626,8 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     $("btn-forest-refresh").addEventListener("click", loadForest);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
     $("btn-refresh-culture").addEventListener("click", loadCulture);
+    $("btn-learn-run").addEventListener("click", runImport);
+    $("btn-learn-refresh").addEventListener("click", loadLearn);
     $("forest-filter").addEventListener("input", loadForest);
     $("btn-forest-new").addEventListener("click", () => forestEdit(null, null));
     $("btn-imp-save").addEventListener("click", async () => {

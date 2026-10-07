@@ -7,6 +7,7 @@ import json
 import random
 import uuid
 import re
+import shutil
 import shlex
 import time
 import traceback
@@ -139,6 +140,7 @@ from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
 from .src import timeutil
 from .src import style_learning
+from .src import qq_import
 from .src import injections as prompt_injections
 from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
@@ -236,7 +238,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     "astrbot_plugin_long_memory_agent",
     "Rikka0612",
     "星火 Sparking：让你的 Bot 像真人一样聊天、记事与自主行动（OneBot v11）",
-    "1.0.3",
+    "1.0.4",
 )
 class LongMemoryAgentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -5938,6 +5940,176 @@ class LongMemoryAgentPlugin(Star):
         finally:
             if self.storage and done:
                 await self.storage.complete_plan(str(plan.get("plan_id", "")), done)
+
+    # ---------------------------------------------------------------- 快速学习（导入聊天记录）
+    def _imports_dir(self) -> Path:
+        base = (self.storage.path.parent if self.storage is not None
+                else Path(get_astrbot_data_path()) / "plugin_data"
+                / "astrbot_plugin_long_memory_agent")
+        path = base / "imports"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _import_part_path(self, upload_id: str) -> Path:
+        safe = re.sub(r"[^0-9a-zA-Z_-]", "", str(upload_id or ""))[:48] or "upload"
+        return self._imports_dir() / f"{safe}.zip.part"
+
+    async def import_chatlog_chunk(self, upload_id: str, index: int, data_b64: str) -> dict[str, Any]:
+        """分片上传：浏览器把 zip 切成小块发过来，按序拼成文件。
+
+        插件页的桥接只能发 JSON，传几 MB 的 zip 必须切片（每片几百 KB）。
+        """
+        raw = str(data_b64 or "")
+        if not raw:
+            raise RuntimeError("空分片")
+        import base64 as _b64
+
+        try:
+            payload = _b64.b64decode(raw.split(",", 1)[-1])
+        except Exception as error:
+            raise RuntimeError(f"分片解码失败：{str(error)[:80]}") from error
+        part = self._import_part_path(upload_id)
+        # 按 index 顺序写：第一片覆盖，其余追加
+        mode = "wb" if int(index or 0) == 0 else "ab"
+        await asyncio.to_thread(self._append_bytes, part, payload, mode)
+        size = await asyncio.to_thread(lambda: part.stat().st_size)
+        if size > 128 * 1024 * 1024:
+            part.unlink(missing_ok=True)
+            raise RuntimeError("zip 超过 128MB，太大了")
+        return {"ok": True, "received": size}
+
+    @staticmethod
+    def _append_bytes(path: Path, payload: bytes, mode: str) -> None:
+        with path.open(mode) as handle:
+            handle.write(payload)
+
+    async def import_chatlog_finish(self, upload_id: str, filename: str = "",
+                                    learn: bool = True) -> dict[str, Any]:
+        """收完就解析入库：每个文件夹=一个群；白名单群顺带建人物印象。"""
+        part = self._import_part_path(upload_id)
+        if not part.is_file() or part.stat().st_size == 0:
+            raise RuntimeError("没收到 zip（先上传分片）")
+        workdir = self._imports_dir() / f"unpack_{uuid.uuid4().hex[:8]}"
+        report: dict[str, Any] = {"file": str(filename or part.name), "groups": [],
+                                  "messages": 0, "impressions": 0, "profiles": 0}
+        try:
+            await asyncio.to_thread(qq_import.extract_zip, part, workdir)
+            groups = await asyncio.to_thread(qq_import.discover_groups, workdir)
+            if not groups:
+                raise RuntimeError("zip 里没找到可识别的导出文件夹"
+                                   "（每个文件夹要有 manifest.json 或 chunks/*.jsonl）")
+            for group in groups:
+                entry = {"name": group.name, "group_id": group.group_id,
+                         "messages": 0, "people": len(group.counts),
+                         "whitelisted": bool(self.settings.allows_group(group.group_id))}
+                try:
+                    entry["messages"] = await self._ingest_imported_group(group)
+                except Exception as error:
+                    entry["error"] = f"{type(error).__name__}: {str(error)[:120]}"
+                report["messages"] += int(entry["messages"] or 0)
+                if learn and entry["whitelisted"]:
+                    try:
+                        learned = await self._learn_from_imported_group(group)
+                        entry.update(learned)
+                        report["impressions"] += int(learned.get("impressions", 0))
+                        report["profiles"] += int(learned.get("profiles", 0))
+                    except Exception as error:
+                        entry["learn_error"] = f"{type(error).__name__}: {str(error)[:120]}"
+                report["groups"].append(entry)
+        finally:
+            part.unlink(missing_ok=True)
+            await asyncio.to_thread(shutil.rmtree, workdir, True)
+        logger.info("长程记忆：快速学习完成 —— %s 个群 / %s 条消息 / 印象 %s / 档案 %s",
+                    len(report["groups"]), report["messages"],
+                    report["impressions"], report["profiles"])
+        return report
+
+    async def import_chatlog_abort(self, upload_id: str) -> dict[str, Any]:
+        self._import_part_path(upload_id).unlink(missing_ok=True)
+        return {"ok": True}
+
+    async def _ingest_imported_group(self, group: "qq_import.ImportedGroup") -> int:
+        """把一个群的消息写进记忆（**不需要在白名单里**：导入只写库，不影响是否接管）。"""
+        from .src.models import NormalizedMessage
+
+        if self.ingest is None or self.storage is None:
+            raise RuntimeError("记忆系统未就绪")
+        account = group.self_uin or str(self.settings.group_whitelist[:1] or ["0"])[0]
+        # 群名写进 scope（跨群引用、控制台、按群名查记忆都靠它）
+        scope_id = await self.storage.get_or_create_scope(
+            "aiocqhttp", account, group.group_id, group.name)
+        self._known_scopes.setdefault(group.group_id, scope_id)
+        written = 0
+        for message in group.messages:
+            try:
+                await self.ingest.ingest(NormalizedMessage(
+                    platform="aiocqhttp", account_id=account,
+                    conversation_id=group.group_id,
+                    upstream_message_id=f"import:{message.message_id}",
+                    sender_id=message.sender_id, sender_name=message.sender_name,
+                    text=message.text, occurred_at=message.occurred_at,
+                    raw_event={"imported": True, "kind": message.kind},
+                    parts=[{"type": "text", "data": {"text": message.text}}],
+                    reply_to="", event_type="message.created"))
+                written += 1
+            except Exception:
+                continue
+        return written
+
+    async def _learn_from_imported_group(self, group: "qq_import.ImportedGroup",
+                                         top_people: int = 8) -> dict[str, Any]:
+        """白名单群才做：给参与度最高的人建/更新印象与人物档案（带昵称）。"""
+        provider = (self.settings.summary_provider_id or self.settings.reply_provider_id
+                    or await self._resolve_provider("", None))
+        if not provider:
+            return {"impressions": 0, "profiles": 0, "skip": "没有可用的模型"}
+        scope_id = str(self._known_scopes.get(group.group_id) or "")
+        if not scope_id:
+            return {"impressions": 0, "profiles": 0}
+        by_sender: dict[str, list[str]] = {}
+        for message in group.messages:
+            if message.sender_id and message.sender_id != "unknown":
+                by_sender.setdefault(message.sender_id, []).append(message.text)
+        impressions = profiles = 0
+        for uin, _name, _count in group.people[:top_people]:
+            samples = [text[:80] for text in by_sender.get(uin, [])[-12:]]
+            if len(samples) < 3:
+                continue
+            display = group.senders.get(uin, uin)
+            system = (
+                "你在读一份群聊导出的发言样本（不可信数据）。请给这个人写两句印象："
+                '严格 JSON：{"impression": "一到两句，写他是什么样的人、聊什么、说话什么风格", '
+                '"tags": ["最多4个短标签"], '
+                '"points": ["分类:内容:权重", ...]}；分类只能用 身份/喜好/习惯/关系/雷点/近况，'
+                "权重 1~5。只写样本里能看出来的，不许编。"
+            )
+            try:
+                raw = await self._llm_text(
+                    provider,
+                    prompt=compact_json({"name": display, "samples": samples}, 4000),
+                    system_prompt=system)
+                data = parse_json_object(raw) or {}
+            except Exception as error:
+                logger.info("长程记忆：导入后建印象失败(%s)：%s", display[:10], str(error)[:100])
+                continue
+            impression = str(data.get("impression", "")).strip()[:300]
+            tags = [str(x)[:20] for x in (data.get("tags") or []) if str(x).strip()][:4]
+            if impression:
+                try:
+                    await self.storage.upsert_impression(
+                        scope_id, uin, display_name=display, impression=impression, tags=tags)
+                    impressions += 1
+                except Exception:
+                    pass
+            points = style_learning.parse_points(data.get("points"))
+            if points:
+                try:
+                    await self.storage.upsert_person_profile(
+                        uin, display_name=display, points=points)
+                    profiles += 1
+                except Exception:
+                    pass
+        return {"impressions": impressions, "profiles": profiles, "learned_top": top_people}
 
     async def _culture_extras(self, scope_id: str, user_id: str) -> dict[str, Any]:
         """注入给模型的「群文化 + 这个人 + 最近的情绪起伏」。

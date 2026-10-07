@@ -238,6 +238,27 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-learn" hidden>
+        <div class="card">
+          <h2>快速学习 <span class="muted">导入群聊天记录，一次学会这些群</span></h2>
+          <p class="muted">选一个 zip 上传即可：zip 根目录下**每个文件夹是一个群**
+            （QQChatExporter V5 导出的 chunked-jsonl，里面有 manifest.json 与 chunks/*.jsonl）。
+            不在白名单里的群也会导入记忆，只是不会有人物印象——印象只给白名单群建。
+            重复导入同一份不会重复计数。</p>
+          <div class="row wrap">
+            <input type="file" id="learn-file" accept=".zip">
+            <label class="check"><input type="checkbox" id="learn-learn" checked> 白名单群顺带建人物印象</label>
+            <button class="btn primary" id="btn-learn-run">开始导入</button>
+            <button class="btn ghost" id="btn-learn-refresh">刷新列表</button>
+          </div>
+          <pre class="output" id="learn-log" hidden></pre>
+        </div>
+        <div class="card">
+          <h2>已入库的会话</h2>
+          <div id="learn-scopes" class="list"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-config" hidden>
         <div class="toolbar">
           <input type="search" id="cfg-search" placeholder="搜配置项…">

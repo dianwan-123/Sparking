@@ -96,6 +96,13 @@
     backups: [{ name: "sparking-2026-10-07.db", size: 288000, created_at: "2026-10-07 03:00" }],
     events: [{ kind: "friend_request", text: "小明 请求加好友", created_at: "2026-10-07 10:00", handled: true }],
     mood: { mood: "雀跃", intensity: 0.62, note: "群里在夸它" },
+    imports: {
+      note: "支持 QQChatExporter V5 导出的 chunked-jsonl：zip 根目录下每个文件夹是一个群。不在白名单里的群也能导入，只是不会建人物印象。",
+      scopes: [
+        { group_id: "1095747640", name: "数学指令讨论群", messages: 8720, last_active: "2026-09-12T11:00:26+00:00", whitelisted: true },
+        { group_id: "1046398077", name: "BE指令饮品店☕️", messages: 10422, last_active: "2026-09-12T10:58:02+00:00", whitelisted: false },
+      ],
+    },
     culture: {
       scope: "123456789",
       note: "说话风格与黑话是按群学的；人物档案与情绪记忆跨群共用一份。",

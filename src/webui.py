@@ -50,6 +50,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("tasks", "任务队列"),
     ("injections", "提示词注入"),
     ("culture", "群风格与心理"),
+    ("imports", "快速学习"),
 )
 
 WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
@@ -64,6 +65,9 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("impression_save", "写人物印象"),
     ("impression_delete", "删人物印象"),
     ("affinity_adjust", "调好感度"),
+    ("import_chatlog_upload", "上传聊天记录分片"),
+    ("import_chatlog_finish", "解析导入聊天记录"),
+    ("import_chatlog_abort", "取消导入"),
     ("style_rule_delete", "删一条群说话风格"),
     ("lexicon_save", "改/加一条群内词条"),
     ("lexicon_delete", "删一条群内词条"),
@@ -391,6 +395,32 @@ class PageAPI:
     async def _read_plans(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         limit = min(max(int(query.get("limit", 30) or 30), 1), 200)
         return list(await self.storage.pending_plans(limit))
+
+    async def _read_imports(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """快速学习面板：能导入什么格式、已导入过哪些群。"""
+        rows = await self.storage.all_scopes("aiocqhttp")
+        imported = []
+        for row in rows:
+            scope_id = str(row.get("scope_id") or "")
+            if not scope_id:
+                continue
+            counts = await self.storage.scope_activity([scope_id])
+            stat = counts.get(scope_id) or {}
+            imported.append({
+                "group_id": str(row.get("conversation_id") or ""),
+                "name": str(row.get("display_name") or ""),
+                "messages": int(stat.get("messages", 0) or 0),
+                "last_active": str(stat.get("last_active") or ""),
+                "whitelisted": bool(self.host.settings.allows_group(
+                    str(row.get("conversation_id") or ""))),
+            })
+        imported.sort(key=lambda item: -item["messages"])
+        return {
+            "scopes": imported[:50],
+            "note": ("支持 QQChatExporter V5 导出的 chunked-jsonl：zip 根目录下每个文件夹是一个群"
+                     "（含 manifest.json 与 chunks/*.jsonl）。**不在白名单里的群也能导入**，"
+                     "只是不会建人物印象——印象只给白名单群建。"),
+        }
 
     async def _read_culture(self, query: Mapping[str, Any]) -> dict[str, Any]:
         """群说话风格 / 群内黑话 / 人物心理档案 / 情绪记忆（MaiBot 式的那两块）。"""
@@ -1061,6 +1091,19 @@ class PageAPI:
             raise WebUIError("缺少 plan_id")
         ok = await self.storage.drop_plan(plan_id)
         return {"ok": bool(ok), "plan_id": plan_id}
+
+    async def _do_import_chatlog_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return await self.host.import_chatlog_chunk(
+            str(body.get("upload_id") or ""), int(body.get("index") or 0),
+            str(body.get("data") or ""))
+
+    async def _do_import_chatlog_finish(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return await self.host.import_chatlog_finish(
+            str(body.get("upload_id") or ""), str(body.get("filename") or ""),
+            bool(body.get("learn", True)))
+
+    async def _do_import_chatlog_abort(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return await self.host.import_chatlog_abort(str(body.get("upload_id") or ""))
 
     async def _do_style_rule_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
         rule_id = str(body.get("rule_id") or "").strip()
