@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+from .timeutil import zone as _zone
+
 import asyncio
 import json
 import time
@@ -137,7 +139,7 @@ def in_window(window: Mapping[str, Any] | None, moment: datetime | None = None) 
         start = _parse_hhmm(str(daily[0]))
         end = _parse_hhmm(str(daily[1]))
         if start and end:
-            local = now.astimezone()
+            local = now.astimezone(_zone())
             minutes = local.hour * 60 + local.minute
             lower = start[0] * 60 + start[1]
             upper = end[0] * 60 + end[1]
@@ -165,7 +167,7 @@ def next_window_start(window: Mapping[str, Any] | None,
     if isinstance(daily, (list, tuple)) and len(daily) == 2:
         start = _parse_hhmm(str(daily[0]))
         if start:
-            local = now.astimezone()
+            local = now.astimezone(_zone())
             target = local.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
             if target <= local:
                 target = target + timedelta(days=1)

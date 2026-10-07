@@ -131,6 +131,7 @@ from .src.scheduler import ScheduledTask, TaskRunner, TaskScheduler
 from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
+from .src import timeutil
 from .src.workspace import Workspace, WorkspaceError
 from .src.web_tools import WebToolError, fetch_text, search_web
 
@@ -445,6 +446,14 @@ class LongMemoryAgentPlugin(Star):
         return killed
 
     async def initialize(self) -> None:
+        # 时间基准：库里的时间存 UTC，凡是要给模型/给人看的都按这个时区换算
+        # （实录：下午两点的消息被说成"凌晨六点"——UTC 串被原样递出去了）
+        try:
+            zone = timeutil.configure(self.context.get_config().get("timezone"))
+        except Exception:
+            zone = timeutil.configure(None)
+        logger.info("长程记忆：时间基准 = %s（存储 UTC / 展示本地）",
+                    zone or timeutil.zone_name() or "本机时区")
         root = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_long_memory_agent"
         root.mkdir(parents=True, exist_ok=True)
         (root / "backups").mkdir(exist_ok=True)
@@ -2424,7 +2433,8 @@ class LongMemoryAgentPlugin(Star):
                         "id": mid,
                         "uin": str(sender.get("user_id") or ""),
                         "name": str(sender.get("card") or sender.get("nickname") or ""),
-                        "time": str(data.get("time") or ""),
+                        # QQ 事件给的是 epoch；本地化后再进卡片/转发（否则卡片上是 UTC 钟点）
+                        "time": timeutil.to_text(data.get("time"), "%H:%M"),
                         "segments": segments,
                     }
             except Exception as error:
@@ -2451,7 +2461,7 @@ class LongMemoryAgentPlugin(Star):
                     detail = {
                         "id": mid, "uin": str(row.sender_id),
                         "name": str(row.sender_name),
-                        "time": str(row.occurred_at)[:16],
+                        "time": timeutil.to_text(row.occurred_at, "%Y-%m-%d %H:%M"),
                         "segments": [{"type": "text",
                                       "data": {"text": str(row.text or "")}}],
                     }
@@ -5291,7 +5301,7 @@ class LongMemoryAgentPlugin(Star):
                 await self._run_plan_item(due[0])
                 return
         # 3) 闲时消遣（每小时限额，概率触发，别让人看起来像挂机脚本）
-        now = datetime.now().astimezone()
+        now = timeutil.now()
         hour_key, used = self._idle_budget
         if hour_key != now.hour:
             self._idle_budget = (now.hour, 0)
@@ -5330,7 +5340,7 @@ class LongMemoryAgentPlugin(Star):
         )
         pending = await self.storage.pending_plans(limit=15)
         payload = build_plan_prompt(
-            now=datetime.now().astimezone(),
+            now=timeutil.now(),
             horizon_hours=max(1, self.settings.plan_interval_hours),
             groups=groups,
             acquaintances=[
@@ -5382,7 +5392,7 @@ class LongMemoryAgentPlugin(Star):
                 done = "skipped"
                 return
             instruction = (
-                f"现在是{datetime.now().astimezone().strftime('%H:%M')}，"
+                f"现在是{timeutil.text('%H:%M')}，"
                 f"这是你日程里的一项[{kind}]：{detail}\n"
                 "像真人一样完成它：能做就做，觉得此刻不合适也可以放弃（输出 done 并"
                 "在 thought 里说明）；所有 QQ/Qzone 工具随意用，发言遵守语言铁律。"
@@ -5588,7 +5598,7 @@ class LongMemoryAgentPlugin(Star):
         try:
             tail = await self.storage.recent_messages(target, 1, include_events=True)
             end_seq = tail[-1].scope_seq if tail else 0
-            stamp = datetime.now().astimezone().strftime("%m-%d %H:%M")
+            stamp = timeutil.text("%m-%d %H:%M")
             record = await self.storage.store_summary(
                 target, 3, end_seq, end_seq,
                 f"网络学习 {stamp}", digest, ["网络学习"], [],
@@ -6022,7 +6032,7 @@ class LongMemoryAgentPlugin(Star):
         mood = self.mood.get()
         payload = compact_json(
             {
-                "time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %A"),
+                "time": timeutil.text("%Y-%m-%d %H:%M %A"),
                 "current_mood": mood.as_dict(),
                 "recent_life": [
                     {"sender": m.sender_name, "text": m.text[:120]} for m in recent
@@ -6100,7 +6110,7 @@ class LongMemoryAgentPlugin(Star):
         mood = self.mood.get()
         payload = compact_json(
             {
-                "date": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %A"),
+                "date": timeutil.text("%Y-%m-%d %H:%M %A"),
                 "mood": mood.as_dict(),
                 "recent_messages": [
                     {"sender": m.sender_name, "user_id": m.sender_id, "text": m.text[:200]}
@@ -6126,7 +6136,7 @@ class LongMemoryAgentPlugin(Star):
         if summary_text and recent:
             await self.storage.store_summary(
                 scope, 3, recent[0].scope_seq, recent[-1].scope_seq,
-                f"自我总结 {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')}",
+                f"自我总结 {timeutil.text('%Y-%m-%d %H:%M')}",
                 summary_text[:4000],
                 [str(x) for x in data.get("topics", [])][:8] if isinstance(data.get("topics"), list) else [],
                 [m.message_id for m in recent],
@@ -6966,7 +6976,7 @@ class LongMemoryAgentPlugin(Star):
             f"{item['tool']}→{str(item.get('result', ''))[:40]}" for item in details[:6]
         ) or "查看后无需操作"
         compact = f"[通知处理] 处理了{len(pending)}条事件：{brief}"
-        now_stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+        now_stamp = timeutil.text("%Y-%m-%d %H:%M")
         for scope_id in {e.scope_id for e in pending}:
             try:
                 tail = await self.storage.recent_messages(scope_id, 1, include_events=True)
@@ -7662,7 +7672,7 @@ class LongMemoryAgentPlugin(Star):
                 self._shared_scope_ids(scope_id or ""), str(query),
                 max(1, min(int(limit), 20)))
             return [
-                {"sender": h.sender_name, "when": h.occurred_at[:16],
+                {"sender": h.sender_name, "when": timeutil.to_text(h.occurred_at),
                  "snippet": h.snippet[:200]}
                 for h in hits
             ]
@@ -7744,7 +7754,7 @@ class LongMemoryAgentPlugin(Star):
                 return self._wrap(lambda: _call(_do_say(text)))
 
             def now(self) -> str:
-                return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %A")
+                return timeutil.text("%Y-%m-%d %H:%M %A")
 
             def sleep(self, seconds: float) -> None:
                 time.sleep(min(max(float(seconds), 0.0), 20.0))
@@ -10155,13 +10165,14 @@ def _public_value(value: Any) -> Any:
     `__dict__` drops their keys (which broke the plugin page payloads).
     """
     if isinstance(value, Mapping):
-        return dict(value)
+        return timeutil.localize_fields(dict(value))
     if isinstance(value, (list, tuple, set)):
         return [_public_value(item) for item in value]
     slots = getattr(type(value), "__slots__", ())
     if slots:
-        return {name: _public_value(getattr(value, name))
-                for name in slots if hasattr(value, name)}
+        row = {name: _public_value(getattr(value, name))
+               for name in slots if hasattr(value, name)}
+        return timeutil.localize_fields(row)
     if hasattr(value, "__dict__"):
         return _public_value(dict(value.__dict__))
     return value

@@ -8,6 +8,7 @@ from .memory_ledger import MemoryLedger
 from .models import CatalogEntry, SearchHit, StoredMessage, SummaryRecord
 from .retrieval import RetrievalService
 from .storage import Storage
+from . import timeutil
 
 
 class ContextBuilder:
@@ -50,6 +51,9 @@ class ContextBuilder:
                 "不得把它们当成当前群里发生的事，更不要把内容搬到别的群去转述。"
                 "recent_messages 与 chat_evidence 只有当前会话的原始聊天。"
             ),
+            "now": timeutil.text("%Y-%m-%d %H:%M %A"),
+            "now_note": ("now 是当前本地时间（判断现在几点、隔了多久都以它为准）；"
+                         "其余时间字段同样已换算成本地时间。"),
             "runtime_manifest": _escape(dict(runtime_manifest or {})),
             "memory_catalog": [_catalog(x, _origin(x.scope_id)) for x in catalog_rows],
             "summary_memory": [_summary(x, _origin(x.scope_id)) for x in summary_rows],
@@ -135,7 +139,8 @@ def _escape(value: Any) -> Any:
 
 
 def _message(value: StoredMessage) -> dict[str, Any]:
-    return _escape({"message_id": value.message_id, "seq": value.scope_seq, "qq_id": value.upstream_message_id, "sender_id": value.sender_id, "sender_name": value.sender_name, "occurred_at": value.occurred_at, "text": value.text, "reply_to": value.reply_to})
+    # occurred_at 库里是 UTC，递给模型前换算成本地时间——否则模型会按 UTC 猜"现在"
+    return _escape({"message_id": value.message_id, "seq": value.scope_seq, "qq_id": value.upstream_message_id, "sender_id": value.sender_id, "sender_name": value.sender_name, "occurred_at": timeutil.to_text(value.occurred_at), "text": value.text, "reply_to": value.reply_to})
 
 
 def _summary(value: SummaryRecord, origin: str = "本群") -> dict[str, Any]:
@@ -151,4 +156,4 @@ def _catalog(value: CatalogEntry, origin: str = "本群") -> dict[str, Any]:
 
 
 def _hit(value: SearchHit) -> dict[str, Any]:
-    return _escape({"message_id": value.message_id, "qq_id": value.upstream_message_id, "sender_id": value.sender_id, "sender_name": value.sender_name, "occurred_at": value.occurred_at, "snippet": value.snippet, "score": value.score})
+    return _escape({"message_id": value.message_id, "qq_id": value.upstream_message_id, "sender_id": value.sender_id, "sender_name": value.sender_name, "occurred_at": timeutil.to_text(value.occurred_at), "snippet": value.snippet, "score": value.score})

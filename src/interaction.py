@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .timeutil import now as _tz_now
+
 import asyncio
 import inspect
 import random
@@ -31,7 +33,7 @@ class InteractionController:
                  quiet_end_hour: int = 7,
                  max_random_wait_seconds: float = 15,
                  clock: Callable[[], float] = time.monotonic,
-                 wall_clock: Callable[[], datetime] = datetime.now,
+                 wall_clock: Callable[[], datetime] | None = None,
                  random_uniform: Callable[[float, float], float] = random.uniform,
                  error_handler: Callable[[BaseException], Any] | None = None) -> None:
         if min(debounce_seconds, group_cooldown_seconds, user_cooldown_seconds,
@@ -47,7 +49,7 @@ class InteractionController:
         self.quiet_end_hour = quiet_end_hour
         self.max_random_wait_seconds = max_random_wait_seconds
         self._clock = clock
-        self._wall_clock = wall_clock
+        self._wall_clock = wall_clock or _tz_now
         self._random_uniform = random_uniform
         self._error_handler = error_handler
         self._generation: dict[Hashable, int] = defaultdict(int)
