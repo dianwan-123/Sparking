@@ -34,7 +34,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 SCRIPT_API_VERSION = 1
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -78,13 +78,28 @@ class ScriptExtensionAPI:
         self._manager.log(self.name, message)
 
     def config(self) -> dict[str, Any]:
-        """读取 ``data_dir/config.json``（用户可随时手改，每次调用都重读）。"""
-        path = self.data_dir / "config.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        """读取本拓展的配置（``data_dir/config.json`` 覆盖 ``config.default.json``）。
+
+        每个拓展可以在自己的文件夹里放 ``config.default.json``（默认值模板，随插件走），
+        用户的改动写到数据目录的 ``config.json``（升级不丢）。**每次调用都重读**，
+        所以控制台改完立刻生效，不用重载拓展。
+        """
+        return self._manager.effective_config(self.name)
+
+    def config_schema(self) -> dict[str, Any]:
+        """配置模板（``config.default.json``），控制台据此渲染表单。"""
+        return self._manager.config_template(self.name)
+
+    def get_config(self, key: str = "", default: Any = None) -> Any:
+        """取一个配置项：``get_config()`` 给整份，``get_config("api_key")`` 给单项。"""
+        data = self.config()
+        if not str(key or "").strip():
+            return data
+        return data.get(str(key), default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        """改一个配置项（写进用户配置文件，立即对后续调用生效）。"""
+        self._manager.set_config_value(self.name, str(key), value)
 
     def now(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -257,6 +272,9 @@ def validate_manifest(raw: Any, source: Path) -> dict[str, Any]:
         "tools": clean_tools,
         "prompts": [str(x) for x in prompts if str(x).strip()],
         "permissions": permissions,
+        # 默认是否启用：拓展可以声明 default_enabled=false（内置实验性拓展用），
+        # 用户随时能在控制台打开；用户的选择优先于这里的默认值。
+        "default_enabled": bool(raw.get("default_enabled", True)),
         # 未知字段一律忽略（向前兼容：老插件读新 manifest 不炸）
     }
 
@@ -389,6 +407,10 @@ class ScriptExtension:
             "tools": self.manifest.get("tools", []),
             "error": self.error,
             "loaded_at": self.loaded_at,
+            "config": self._manager.effective_config(self.id),
+            "config_template": self._manager.config_template(self.id),
+            "enabled": self._manager.is_enabled(self.id),
+            "default_enabled": bool(self.manifest.get("default_enabled", True)),
         }
 
 
@@ -435,6 +457,91 @@ class ScriptExtensionManager:
         path = self.data_root / ext_id
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    # ---- 启用状态（拓展可以声明默认关闭；用户的选择优先并落盘） ----
+    def _state_path(self) -> Path:
+        self.data_root.mkdir(parents=True, exist_ok=True)
+        return self.data_root / "_extensions.json"
+
+    def _state(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._state_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def is_enabled(self, ext_id: str) -> bool:
+        """用户改过就用用户的选择；没改过看拓展自己声明的 default_enabled。"""
+        ext = self.get(ext_id)
+        if ext is None:
+            return False
+        overrides = self._state().get("enabled")
+        if isinstance(overrides, dict) and ext_id in overrides:
+            return bool(overrides[ext_id])
+        return bool(ext.manifest.get("default_enabled", True))
+
+    def set_enabled(self, ext_id: str, enabled: bool) -> bool:
+        if self.get(ext_id) is None:
+            raise ScriptExtensionError(f"没有叫 {ext_id} 的拓展")
+        state = self._state()
+        overrides = state.get("enabled")
+        if not isinstance(overrides, dict):
+            overrides = {}
+        overrides[ext_id] = bool(enabled)
+        state["enabled"] = overrides
+        try:
+            self._state_path().write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as error:
+            raise ScriptExtensionError(f"写入拓展状态失败：{error}") from error
+        self.log(ext_id, "已启用" if enabled else "已关闭")
+        return bool(enabled)
+
+    # ---- 拓展配置（模板随拓展走，用户改动落在数据目录） ----
+    def config_path(self, ext_id: str) -> Path:
+        return self.data_dir(ext_id) / "config.json"
+
+    def config_template(self, ext_id: str) -> dict[str, Any]:
+        """拓展自带的默认配置（``<拓展目录>/config.default.json``）。"""
+        ext = self.get(ext_id)
+        if ext is None:
+            return {}
+        path = Path(ext.folder) / "config.default.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def effective_config(self, ext_id: str) -> dict[str, Any]:
+        """模板打底 + 用户改动覆盖（用户没写过的项用默认值）。"""
+        data = dict(self.config_template(ext_id))
+        try:
+            raw = json.loads(self.config_path(ext_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            data.update(raw)
+        return data
+
+    def save_config(self, ext_id: str, values: Mapping[str, Any]) -> dict[str, Any]:
+        """整份写入用户配置（控制台用）。未知键也保留——拓展可能读自定义字段。"""
+        if self.get(ext_id) is None:
+            raise ScriptExtensionError(f"没有叫 {ext_id} 的拓展")
+        clean = {str(k): v for k, v in dict(values or {}).items() if str(k).strip()}
+        path = self.config_path(ext_id)
+        try:
+            path.write_text(json.dumps(clean, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except OSError as error:
+            raise ScriptExtensionError(f"写入配置失败：{error}") from error
+        self.log(ext_id, f"配置已更新（{len(clean)} 项）")
+        return self.effective_config(ext_id)
+
+    def set_config_value(self, ext_id: str, key: str, value: Any) -> dict[str, Any]:
+        current = self.effective_config(ext_id)
+        current[str(key)] = value
+        return self.save_config(ext_id, current)
 
     async def llm(self, prompt: str, system_prompt: str, provider_id: str) -> str:
         if self._llm is None:
@@ -586,6 +693,8 @@ class ScriptExtensionManager:
         for ext in sorted(self.extensions.values(), key=lambda e: e.id):
             if ext.error and ext.module is None:
                 continue
+            if not self.is_enabled(ext.id):
+                continue          # 关闭的拓展不向模型暴露工具
             for tool in ext.manifest.get("tools", []):
                 rows.append({
                     "script": ext.id,
@@ -600,6 +709,8 @@ class ScriptExtensionManager:
         for ext in sorted(self.extensions.values(), key=lambda e: e.id):
             if ext.module is None and ext.error:
                 continue
+            if not self.is_enabled(ext.id):
+                continue
             rows.extend(ext.prompts())
         return rows
 
@@ -608,4 +719,7 @@ class ScriptExtensionManager:
         if ext is None:
             known = "、".join(self.extensions) or "无"
             raise ScriptExtensionError(f"没有叫 {ext_id} 的拓展（已加载：{known}）")
+        if not self.is_enabled(ext_id):
+            raise ScriptExtensionError(
+                f"拓展 {ext_id} 已关闭（控制台「能力与拓展」里可以打开）")
         return await ext.call_tool(tool, params)

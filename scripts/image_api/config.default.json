@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "quality": "1k",
+  "auto_aspect": true,
+  "default_size": "1024x1024",
+  "cooldown_seconds": 60,
+  "timeout_seconds": 120,
+  "extra_body": {},
+  "note": "本拓展尚未完工，暂不可用。enabled=true 只是让工具可用；出图前请确认接口真的支持 /images/generations。"
+}

@@ -324,6 +324,11 @@
       "off"
     ]
   },
+  "enable_silence_followup": {
+    "type": "bool",
+    "description": "聊天生动性：话说到一半对方一直不回时，按节奏追问（越等越急、最多追问 4 次、静默时段不发、对方一回来立刻清空）",
+    "default": true
+  },
   "browser_auto_install": {
     "type": "bool",
     "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；关闭后仅检测上报",

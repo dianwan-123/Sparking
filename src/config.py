@@ -86,6 +86,7 @@ class PluginConfig:
     origin_wake_prefixes: str
     style_learn_hours: int
     system_prompt_folding: str
+    enable_silence_followup: bool
     auto_install_deps: bool
     browser_headful: bool
     browser_auto_install: bool
@@ -191,6 +192,7 @@ class PluginConfig:
             origin_wake_prefixes=str(d.get("origin_wake_prefixes", "/") or "/"),
             style_learn_hours=_int(d.get("style_learn_hours"), 3, 0, 168),
             system_prompt_folding=_mode(d.get("system_prompt_folding")),
+            enable_silence_followup=bool(d.get("enable_silence_followup", True)),
             auto_install_deps=bool(d.get("auto_install_deps", True)),
             browser_headful=bool(d.get("browser_headful", False)),
             browser_auto_install=bool(d.get("browser_auto_install", True)),

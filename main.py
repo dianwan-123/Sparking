@@ -143,6 +143,7 @@ from .src import timeutil
 from .src import style_learning
 from .src import qq_import
 from .src import injections as prompt_injections
+from .src import followup
 from .src import memory_export
 from .src import data_tools, pdf_reader, program_host
 from .src.workspace import Workspace, WorkspaceError
@@ -236,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.6"
+PLUGIN_VERSION = "1.0.7"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -313,6 +314,10 @@ class LongMemoryAgentPlugin(Star):
         self._dead_providers: set[str] = set()
         self._system_prompt_support: dict[str, bool] = {}
         self._system_prompt_probing: set[str] = set()
+        # 任务自定义条件的临时暂存（条件代码里可用 kv_get/kv_set 记状态）
+        self._condition_kv: dict[str, Any] = {}
+        # 「话说到一半对方不说话了」的悬置状态（scope_id -> Dangling）
+        self._dangling: dict[str, followup.Dangling] = {}
         # 待展开的合并转发：按会话累积（攒批时逐条覆盖会丢掉先前的转发）
         self._pending_forwards: dict[str, list[str]] = {}
         # 单实例守卫：重装/重载可能留下旧实例的循环在跑（实录：v0.32.6 旧实例与
@@ -578,6 +583,8 @@ class LongMemoryAgentPlugin(Star):
                 self.storage,
                 concurrency=max(1, int(getattr(self.settings, "task_concurrency", 2) or 2)))
             await self.task_queue.ensure_table()
+            # 自定义触发条件：队列到点后问这里「条件满足了吗」（bot 自己写的判定代码）
+            self.task_queue.condition_check = self._task_condition_check
             self.task_queue_runner = TaskQueueRunner(
                 self.task_queue, self._task_handlers(),
                 tick_seconds=int(getattr(self.settings, "task_tick_seconds", 15) or 15),
@@ -1452,6 +1459,8 @@ class LongMemoryAgentPlugin(Star):
             return
         assert self.ingest and self.retrieval and self.interactions
         stored = await self.ingest.ingest(normalized)
+        # 对方回话了 → 之前「悬着的话头」就此结束（不再追问）
+        self._note_dangling_reply(str(stored.scope_id))
         self._known_scopes[self._conversation_key(event)] = stored.scope_id
         is_self_message = str(stored.sender_id) == str(event.get_self_id())
         # 情绪系统 v2：每条用户消息产生一个确定性情绪增量（效价/唤醒轴）
@@ -3406,7 +3415,7 @@ class LongMemoryAgentPlugin(Star):
                             delay_minutes: int = 0, interval_minutes: int = 0,
                             max_runs: int = 1, daily_window: str = "",
                             not_before: str = "", not_after: str = "",
-                            priority: int = 0):
+                            priority: int = 0, condition: str = ""):
         """给自己排一个任务/日程——**这是你自主行动的主入口**（一切皆任务）。
         kind 说明：reply=到点说一句话；agent=到点带工具自主干一轮（最常用）；
         tool=到点调某个工具（args_json 给参数）；notify=到点发一条消息；reflect=自我总结；
@@ -3427,9 +3436,20 @@ class LongMemoryAgentPlugin(Star):
             not_before(string): 有效期起点（ISO 时间，可留空）。
             not_after(string): 有效期终点（ISO 时间，超出即作废）。
             priority(number): -5~5，越大越先执行。
+            condition(string): **自定义触发条件**（可选）：一段 Python 判定代码，到点先跑它，
+                返回 True 才执行、False 就过一会儿再问。沙箱里有：`quiet_scopes(hours)` 找多久没
+                说话的会话、`scopes()` 列会话、`last_active(scope)`、`hours_since(scope)`、
+                `messages(scope, limit)` 看消息、`now`、`kv_get/kv_set` 记状态。
+                例：`return bool(quiet_scopes(6))`（等有群安静 6 小时再动）、
+                `return now.hour >= 22`（只在夜里）。
         """
         if self.task_queue is None:
             return "任务队列未启用"
+        condition_code = str(condition or "").strip()
+        if condition_code:
+            problem = self._validate_task_condition(condition_code)
+            if problem:
+                return f"条件代码有问题，任务没建：{problem}"
         window: dict[str, Any] = {}
         if not_before.strip():
             window["after"] = not_before.strip()
@@ -3446,7 +3466,7 @@ class LongMemoryAgentPlugin(Star):
             conversation=conversation, payload=payload if isinstance(payload, dict) else {},
             priority=int(priority or 0), delay_seconds=float(delay_minutes or 0) * 60,
             interval_seconds=int(interval_minutes or 0) * 60, max_runs=int(max_runs),
-            window=window, source="bot")
+            window=window, source="bot", condition=condition_code)
         logger.info("长程记忆：新增任务 %s（%s，%s）", task.task_id[:10], task.kind,
                     "长期" if task.is_long_term else "短期")
         return compact_json({
@@ -3455,6 +3475,28 @@ class LongMemoryAgentPlugin(Star):
             "long_term": task.is_long_term, "max_runs": task.max_runs,
             "window": window, "hint": "task_list 可查队列，task_cancel 可撤销",
         }, 1200)
+
+    @filter.llm_tool(name="find_quiet_scopes")
+    async def find_quiet_scopes_tool(self, event: AstrMessageEvent, hours: float = 6,
+                                     limit: int = 10):
+        """找出**多久没人说话**的会话（群里/私聊都算），用来「闲着没事找人聊聊」。
+
+        返回每个会话安静了多久、最后活跃时间、有多少条消息。**不要只挑最久的那个**——
+        结合你记得的印象挑一个「聊起来自然」的（老朋友、最近聊到一半的、有话题的），
+        然后自己去发起一句问候或话题（send_group / send_private，或直接用正常回复）。
+
+        Args:
+            hours(number): 至少安静多少小时才算（默认 6）。
+            limit(number): 最多返回几个，默认 10。
+        """
+        rows = self._condition_globals("").get("quiet_scopes")(float(hours or 6))
+        picked = list(rows)[:max(1, min(int(limit or 10), 30))]
+        return compact_json({
+            "quiet": picked,
+            "hint": ("挑一个合适的主动搭话：优先「聊到一半被打断的」和熟人；"
+                     "别挑刚吵过架或明确说过别烦TA的；问候要短、要具体（提上次聊的事）。"),
+            "count": len(rows),
+        }, 4000)
 
     @filter.llm_tool(name="task_list")
     async def task_list_tool(self, event: AstrMessageEvent, status: str = "",
@@ -3479,6 +3521,8 @@ class LongMemoryAgentPlugin(Star):
                 "runs": f"{t.runs_done}/{('∞' if t.max_runs < 0 else t.max_runs)}",
                 "interval_minutes": t.interval_seconds // 60,
                 "window": t.window, "source": t.source,
+                "condition": t.condition[:120] if t.condition else "",
+                "condition_checks": t.condition_checks,
                 "last_error": t.last_error[:80], "last_result": t.last_result[:80],
             } for t in tasks],
         }, 6000)
@@ -4129,6 +4173,15 @@ class LongMemoryAgentPlugin(Star):
                 except Exception as error:
                     logger.info("长程记忆：text_to_image 失败，降级发送纯文本：%s", str(error)[:120])
             await event.send(chain.message(bubble))
+            # 记下「在等对方回话」——对方一直不回，心跳会来追问（见 _follow_up_round）
+            try:
+                scope_now = await self._scope_for_event(event)
+                if scope_now:
+                    self._note_dangling_open(
+                        scope_now, self._conversation_key(event), bubble,
+                        asked_question=bubble.rstrip().endswith(("？", "?")))
+            except Exception:
+                pass
         elif action == "sticker" and self.stickers:
             sticker = self.stickers.resolve(str(descriptor.get("sticker_id") or ""))
             if sticker is None:
@@ -5907,6 +5960,11 @@ class LongMemoryAgentPlugin(Star):
             if due:
                 await self._run_plan_item(due[0])
                 return
+        # 2.5) 话说到一半没人回？按节奏追问（用户要的「聊天生动性」）
+        try:
+            await self._follow_up_round()
+        except Exception as error:
+            logger.info("长程记忆：追问轮异常：%s", str(error)[:150])
         # 3) 闲时消遣（每小时限额，概率触发，别让人看起来像挂机脚本）
         now = timeutil.now()
         hour_key, used = self._idle_budget
@@ -9104,6 +9162,276 @@ class LongMemoryAgentPlugin(Star):
                 time.sleep(min(max(float(seconds), 0.0), 20.0))
 
         return {"bot": _BotSandbox()}
+
+    # ---------------------------------------------------------------- 任务条件（bot 自己写的判定代码）
+    @staticmethod
+    def _condition_source(code: str) -> str:
+        """把条件代码包进一个函数体——bot 会写 `return ...`，而顶层 return 是语法错误。"""
+        lines = str(code or "").splitlines()
+        body = chr(10).join("    " + line for line in lines)
+        return ("def __condition__():" + chr(10)
+                + (body or "    return False") + chr(10))
+
+    def _validate_task_condition(self, code: str) -> str:
+        """建任务时先体检一遍条件代码；返回空串=没问题，否则一句人话原因。
+
+        把语法错误挡在"建任务"这一步，免得建一堆永远跑不通的任务。
+        """
+        body = str(code or "").strip()
+        if not body:
+            return ""
+        if len(body) > 2000:
+            return "条件代码太长了（≤2000 字）"
+        try:
+            compile(self._condition_source(body), "<task_condition>", "exec")
+        except SyntaxError as error:
+            return f"语法错误：{error.msg}（第 {error.lineno} 行）"
+        return ""
+
+    async def _task_condition_check(self, task: Any) -> bool:
+        """任务队列的钩子：这个任务的自定义条件满足了吗。"""
+        return await self._eval_task_condition(
+            str(getattr(task, "condition", "") or ""),
+            str(getattr(task, "scope_id", "") or ""))
+
+    async def _eval_task_condition(self, code: str, scope_id: str = "") -> bool:
+        """求值一个任务条件；出错/超时一律当作"还不满足"（下次再问）。"""
+        body = str(code or "").strip()
+        if not body:
+            return True
+        outcome = await self._run_condition_code(body, scope_id)
+        if isinstance(outcome, str):
+            logger.info("长程记忆：任务条件未满足/出错：%s", outcome[:160])
+            return False
+        return bool(outcome)
+
+    async def _run_condition_code(self, code: str, scope_id: str = "") -> "Any":
+        """跑条件代码：返回真值，或一句错误说明（字符串）。"""
+        import contextlib
+        import io as _io
+
+        sandbox = self._condition_globals(scope_id)
+
+        def _run() -> Any:
+            buffer = _io.StringIO()
+            namespace: dict[str, Any] = {"__name__": "task_condition", **sandbox}
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    exec(compile(self._condition_source(code), "<task_condition>", "exec"),
+                         namespace)  # noqa: S102
+                    return namespace["__condition__"]()
+            except Exception as error:
+                return f"{type(error).__name__}: {str(error)[:160]}"
+
+        try:
+            async with asyncio.timeout(10):
+                return await asyncio.to_thread(_run)
+        except TimeoutError:
+            return "条件求值超时（10 秒）"
+
+    def _condition_globals(self, scope_id: str = "") -> dict[str, Any]:
+        """条件代码能用的东西：**只读查询 + kv 暂存**，不给发送/执行能力。
+
+        bot 写的是"什么时候该动手"的判断，所以这里只给"看"的能力；真要动手，
+        等条件满足后由任务本体（agent 循环）去做。全部同步调用（条件代码是同步的），
+        内部通过宿主事件循环把异步查询跑完。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def _call(coro: Any, timeout: float = 15.0) -> Any:
+            """把异步查询在同步的条件代码里跑完。
+
+            - 条件代码通常跑在工作线程（求值走了 to_thread）→ 提交回宿主事件循环；
+            - 万一就在事件循环线程里（如测试直接调 quiet_scopes）→ 另起线程跑新循环，
+              **不能** run_coroutine_threadsafe 到当前循环，否则自己等自己死锁。
+            """
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is None and loop is not None and loop.is_running():
+                return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+            if running is not None:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, coro).result(timeout=timeout)
+            return asyncio.run(coro)
+
+        def _label(scope: str) -> str:
+            return self._conversation_key_of(scope) or str(scope)[:8]
+
+        def _do_quiet(hours: float) -> list[dict[str, Any]]:
+            """多久没说话的会话（按最后一条消息算）。"""
+            if self.storage is None:
+                return []
+            scopes = self._shared_scope_ids(scope_id or None)
+            stats = _call(self.storage.scope_activity(list(scopes)))
+            cutoff = timeutil.now() - timedelta(hours=max(0.1, float(hours)))
+            quiet = []
+            for scope, stat in stats.items():
+                last = timeutil.parse(stat.get("last_active"))
+                if last is not None and last >= cutoff:
+                    continue
+                quiet.append({
+                    "scope": scope, "key": _label(scope),
+                    "last_active": timeutil.to_text(stat.get("last_active")),
+                    "hours_silent": (round((timeutil.now() - last).total_seconds() / 3600, 1)
+                                     if last is not None else None),
+                    "messages": int(stat.get("messages", 0) or 0),
+                })
+            quiet.sort(key=lambda item: item["hours_silent"] if item["hours_silent"]
+                       is not None else 1e9, reverse=True)
+            return quiet
+
+        def _do_scopes() -> list[dict[str, Any]]:
+            if self.storage is None:
+                return []
+            scopes = self._shared_scope_ids(scope_id or None)
+            stats = _call(self.storage.scope_activity(list(scopes)))
+            rows = []
+            for scope in scopes:
+                stat = stats.get(scope) or {}
+                rows.append({
+                    "scope": scope, "key": _label(scope),
+                    "last_active": timeutil.to_text(stat.get("last_active")),
+                    "messages": int(stat.get("messages", 0) or 0),
+                    "is_current": scope == scope_id,
+                })
+            return rows
+
+        def _do_last_active(scope: str = "") -> str:
+            target = str(scope or scope_id).strip()
+            if not target or self.storage is None:
+                return ""
+            stats = _call(self.storage.scope_activity([target]))
+            return timeutil.to_text((stats.get(target) or {}).get("last_active"))
+
+        def _do_hours_since(scope: str = "") -> float:
+            target = str(scope or scope_id).strip()
+            if not target or self.storage is None:
+                return -1.0
+            stats = _call(self.storage.scope_activity([target]))
+            last = timeutil.parse((stats.get(target) or {}).get("last_active"))
+            if last is None:
+                return -1.0
+            return round((timeutil.now() - last).total_seconds() / 3600, 2)
+
+        def _do_messages(scope: str = "", limit: int = 20) -> list[dict[str, Any]]:
+            target = str(scope or scope_id).strip()
+            if not target or self.storage is None:
+                return []
+            rows = _call(self.storage.recent_messages(
+                target, max(1, min(int(limit), 50))))
+            return [{"sender": m.sender_name, "text": str(m.text or "")[:200],
+                     "at": timeutil.to_text(m.occurred_at),
+                     "is_self": str(m.upstream_message_id or "").startswith("self:")}
+                    for m in rows]
+
+        def _kv_get(key: str, default: Any = None) -> Any:
+            return self._condition_kv.get(str(key), default)
+
+        def _kv_set(key: str, value: Any) -> None:
+            self._condition_kv[str(key)] = value
+
+        return {
+            "now": timeutil.now(),
+            "time": time,
+            "timedelta": timedelta,
+            "scope_id": scope_id,
+            "quiet_scopes": _do_quiet,
+            "scopes": _do_scopes,
+            "last_active": _do_last_active,
+            "hours_since": _do_hours_since,
+            "messages": _do_messages,
+            "kv_get": _kv_get,
+            "kv_set": _kv_set,
+        }
+
+    # ---------------------------------------------------------------- 悬着的话头（追问）
+    def _note_dangling_reply(self, scope_id: str) -> None:
+        """对方回话了：清掉这个会话的悬置状态。"""
+        if scope_id:
+            self._dangling.pop(str(scope_id), None)
+
+    def _note_dangling_open(self, scope_id: str, conversation: str, text: str,
+                            *, asked_question: bool = False) -> None:
+        """我们刚开口 → 记下「在等对方回话」。纯表情/戳一戳不算话头。"""
+        topic = " ".join(str(text or "").split())[:120]
+        if not scope_id or len(topic) < 2:
+            return
+        self._dangling[str(scope_id)] = followup.Dangling(
+            scope_id=str(scope_id), conversation=str(conversation or ""),
+            opened_at=datetime.now(timezone.utc).isoformat(),
+            topic=topic, waiting_question=bool(asked_question))
+
+    async def _follow_up_round(self) -> None:
+        """心跳里的一轮：话说到一半没人回 → 按节奏追问一次。
+
+        用户要的「生动」不是照抄某句话，而是这三件事：
+        ①注意到状态变了（有悬着的话头）；②有自己的节奏（越等越急、口气递进）；
+        ③有边界（次数上限、静默时段不发、对方一回来立刻清零）。
+        说什么交给模型（带上口气与话头），这里只管节奏。
+        """
+        if not self._dangling or not self._ready():
+            return
+        if not getattr(self.settings, "enable_silence_followup", True):
+            return
+        now = timeutil.now()
+        self._dangling = followup.prune(self._dangling, now=now)
+        for scope_id, dangling in list(self._dangling.items()):
+            blocked = time.monotonic() < self._send_blockade.get(scope_id, 0.0)
+            due, tone, why = followup.should_follow_up(
+                dangling, now=now, quiet=self.interactions.is_quiet(), blocked=blocked)
+            if not due:
+                continue
+            await self._send_follow_up(scope_id, dangling, tone, why)
+            return          # 一轮只追问一个会话，别像轰炸
+
+    async def _send_follow_up(self, scope_id: str, dangling: "followup.Dangling",
+                              tone: str, why: str) -> None:
+        """真发一句追问（口气与话头交给模型）。"""
+        brief = followup.follow_up_brief(dangling, tone)
+        provider = self.settings.reply_provider_id or self.settings.summary_provider_id
+        line = ""
+        try:
+            raw = await self._llm_text(
+                provider, prompt=compact_json({
+                    "conversation": dangling.conversation,
+                    "last_thing_we_said": dangling.topic,
+                    "how_long_they_are_silent": why,
+                }, 2000), system_prompt=brief)
+            line = _bubble_text(self._sanitize_outgoing(raw))
+        except Exception as error:
+            logger.info("长程记忆：追问生成失败：%s", str(error)[:120])
+        dangling.follow_ups += 1
+        dangling.last_follow_up_at = datetime.now(timezone.utc).isoformat()
+        if line and await self._send_text_to_scope(scope_id, line):
+            logger.info("长程记忆：对方沉默太久，追问了一句（%s / 第 %d 次）",
+                        tone, dangling.follow_ups)
+        if dangling.follow_ups >= followup.MAX_FOLLOW_UPS:
+            # 最后一次问完就放下：不再惦记这段话头
+            self._dangling.pop(scope_id, None)
+
+    async def _send_text_to_scope(self, scope_id: str, text: str) -> bool:
+        """往某个会话发一句话（群里要白名单；私聊直接发）。"""
+        key = self._conversation_key_of(scope_id)
+        self._bind_gateway_client()
+        try:
+            if key.startswith("private:"):
+                await self._script_send_private(key.split(":", 1)[1], text)
+                return True
+            if self.settings.allows_group(key) and self.gateway is not None:
+                await self.gateway.execute(
+                    "send_group_msg", group_id=int(key),
+                    message=[{"type": "text", "data": {"text": text}}])
+                return True
+        except Exception as error:
+            logger.info("长程记忆：追问发送失败（%s）：%s", key, str(error)[:120])
+        return False
 
     async def _run_python_sandbox(
         self, code: str, event: AstrMessageEvent | None, scope_id: str,

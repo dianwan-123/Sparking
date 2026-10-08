@@ -90,6 +90,8 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("intent_remove", "撤事件条件指令"),
     ("extension_toggle", "开关拓展"),
     ("extension_reload", "重载拓展"),
+    ("extension_config_save", "保存拓展配置"),
+    ("extension_config_reset", "恢复拓展默认配置"),
     ("compress", "压缩记忆"),
     ("reflect", "让 bot 自我总结"),
     ("backup", "备份"),
@@ -1290,18 +1292,53 @@ class PageAPI:
         return {"ok": True, "result": result}
 
     async def _do_extension_toggle(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        registry = getattr(self.host, "_extensions", None)
-        if registry is None:
-            raise WebUIError("拓展系统未启用")
         extension_id = str(body.get("id") or "").strip()
         if not extension_id:
             raise WebUIError("缺少 id")
         want_enabled = bool(body.get("enabled", True))
+        manager = getattr(self.host, "_scripts", None)
+        # 先看 scripts 拓展（它们有自己的启用状态，能声明默认关闭）
+        if manager is not None and manager.get(extension_id) is not None:
+            manager.set_enabled(extension_id, want_enabled)
+            return {"ok": True, "id": extension_id, "enabled": want_enabled,
+                    "kind": "script"}
+        registry = getattr(self.host, "_extensions", None)
+        if registry is None:
+            raise WebUIError("拓展系统未启用")
         if want_enabled:
             registry.enable(extension_id)
         else:
             registry.disable(extension_id)
-        return {"ok": True, "id": extension_id, "enabled": want_enabled}
+        return {"ok": True, "id": extension_id, "enabled": want_enabled, "kind": "bundle"}
+
+    async def _do_extension_config_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        manager = getattr(self.host, "_scripts", None)
+        if manager is None:
+            raise WebUIError("脚本拓展未启用")
+        ext_id = str(body.get("id") or "").strip()
+        if not ext_id:
+            raise WebUIError("缺少 id")
+        values = body.get("config")
+        if not isinstance(values, Mapping):
+            raise WebUIError("config 必须是对象")
+        try:
+            saved = manager.save_config(ext_id, values)
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200]) from error
+        return {"ok": True, "id": ext_id, "config": saved}
+
+    async def _do_extension_config_reset(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        manager = getattr(self.host, "_scripts", None)
+        if manager is None:
+            raise WebUIError("脚本拓展未启用")
+        ext_id = str(body.get("id") or "").strip()
+        if not ext_id:
+            raise WebUIError("缺少 id")
+        try:
+            manager.config_path(ext_id).unlink(missing_ok=True)
+        except OSError as error:
+            raise WebUIError(f"删除配置失败：{error}") from error
+        return {"ok": True, "id": ext_id, "config": manager.effective_config(ext_id)}
 
     async def _do_extension_reload(self, body: Mapping[str, Any]) -> dict[str, Any]:
         manager = getattr(self.host, "_scripts", None)

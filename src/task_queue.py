@@ -16,12 +16,18 @@
   `max_runs=1` 一次性、`max_runs=3` 跑三次、`interval_seconds>0` 定时反复（`max_runs=-1` 无限）；
 - 失败带**指数退避重试**（≤3 次）与 `last_error` 记录；一切变更落 `updated_at`；
 - 执行体由宿主注入（`handlers: {kind: callable}`），本模块不依赖插件内部。
+
+**自定义触发条件（v1.0.7 新增）**：任务除了"到点"，还能带一段**判定代码**
+（`condition`）。到点后先把条件交给宿主求值，为真才执行、为假就顺延再试——
+这样 bot 可以自己写"等某个群安静 30 分钟再说话""只在有人在线时执行"这类条件。
+本模块只负责"什么时候问条件"，代码怎么跑由宿主注入（`condition_check`）。
 """
 from __future__ import annotations
 
 from .timeutil import zone as _zone
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -110,6 +116,8 @@ class Task:
     last_result: str = ""
     window: dict[str, Any] = field(default_factory=dict)
     # window: {"after": iso, "before": iso, "daily": ["09:00", "22:00"]}
+    condition: str = ""                    # 自定义触发条件（宿主求值的判定代码）
+    condition_checks: int = 0              # 条件判假顺延了多少次（面板可见）
 
     @property
     def is_long_term(self) -> bool:
@@ -120,6 +128,7 @@ class Task:
         data["long_term"] = self.is_long_term
         data["runs_left"] = ("∞" if self.max_runs < 0
                              else max(0, self.max_runs - self.runs_done))
+        data["has_condition"] = bool(self.condition.strip())
         return data
 
 
@@ -199,7 +208,14 @@ class TaskQueue:
         "interval_seconds INTEGER NOT NULL DEFAULT 0, max_runs INTEGER NOT NULL DEFAULT 1,"
         "runs_done INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,"
         "last_error TEXT NOT NULL DEFAULT '', last_result TEXT NOT NULL DEFAULT '',"
-        "window_json TEXT NOT NULL DEFAULT '{}')"
+        "window_json TEXT NOT NULL DEFAULT '{}',"
+        "condition_text TEXT NOT NULL DEFAULT '',"
+        "condition_checks INTEGER NOT NULL DEFAULT 0)"
+    )
+    # 老库补列（SQLite 的 ADD COLUMN 是幂等的：重复加会报错，忽略即可）
+    MIGRATE_SQL = (
+        "ALTER TABLE tasks ADD COLUMN condition_text TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE tasks ADD COLUMN condition_checks INTEGER NOT NULL DEFAULT 0",
     )
     INDEX_SQL = ("CREATE INDEX IF NOT EXISTS idx_tasks_queue "
                  "ON tasks(status, next_run_at, priority)")
@@ -212,6 +228,11 @@ class TaskQueue:
     async def ensure_table(self) -> None:
         db = self.storage._conn()
         await db.execute(self.TABLE_SQL)
+        for statement in self.MIGRATE_SQL:
+            try:
+                await db.execute(statement)
+            except Exception:
+                pass          # 列已存在
         await db.execute(self.INDEX_SQL)
         await db.commit()
 
@@ -222,6 +243,7 @@ class TaskQueue:
         priority: int = 0, run_at: Any = None, delay_seconds: float = 0,
         interval_seconds: int = 0, max_runs: int = 1,
         window: Mapping[str, Any] | None = None, source: str = "bot",
+        condition: str = "",
     ) -> Task:
         kind = str(kind or KIND_CUSTOM).strip().lower()
         if kind not in ALL_KINDS:
@@ -237,20 +259,21 @@ class TaskQueue:
             created_at=_now(), updated_at=_now(), next_run_at=moment.isoformat(),
             interval_seconds=max(0, int(interval_seconds)),
             max_runs=int(max_runs), window=dict(window or {}),
+            condition=str(condition or "")[:2000],
         )
         db = self.storage._conn()
         async with self.storage._write_lock:
             await db.execute(
                 "INSERT INTO tasks(task_id,kind,title,detail,payload_json,scope_id,"
                 "conversation,priority,status,source,created_at,updated_at,next_run_at,"
-                "interval_seconds,max_runs,window_json) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "interval_seconds,max_runs,window_json,condition_text) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task.task_id, task.kind, task.title, task.detail,
                  json.dumps(task.payload, ensure_ascii=False), task.scope_id,
                  task.conversation, task.priority, task.status, task.source,
                  task.created_at, task.updated_at, task.next_run_at,
                  task.interval_seconds, task.max_runs,
-                 json.dumps(task.window, ensure_ascii=False)))
+                 json.dumps(task.window, ensure_ascii=False), task.condition))
             await db.commit()
         return task
 
@@ -297,6 +320,15 @@ class TaskQueue:
                     if task.scope_id and any(
                             item.scope_id == task.scope_id for item in claimed):
                         continue  # 同一会话一次只跑一个（队列语义）
+                    if task.condition.strip():
+                        # 自定义条件（bot 自己写的判定代码）：为真才执行，为假顺延再问
+                        ready = await self._condition_ready(task)
+                        if not ready:
+                            await db.execute(
+                                "UPDATE tasks SET next_run_at=?, condition_checks="
+                                "condition_checks+1, updated_at=? WHERE task_id=?",
+                                (self._condition_retry_at(task), _now(), task.task_id))
+                            continue
                     await db.execute(
                         "UPDATE tasks SET status=?, updated_at=?, last_run_at=? "
                         "WHERE task_id=?",
@@ -310,6 +342,26 @@ class TaskQueue:
         for task in claimed:
             self._running.add(task.task_id)
         return claimed
+
+    def _condition_retry_at(self, task: Task) -> str:
+        """条件没满足时，下次什么时候再问：取 min(间隔, 15 分钟)，最少 1 分钟。"""
+        gap = int(task.interval_seconds) if task.interval_seconds > 0 else 900
+        gap = max(60, min(gap, 900))
+        return (datetime.now(timezone.utc) + timedelta(seconds=gap)).isoformat()
+
+    async def _condition_ready(self, task: Task) -> bool:
+        """问宿主"这个自定义条件满足了吗"；没接条件求值器就当作满足（老行为）。"""
+        checker = getattr(self, "condition_check", None)
+        if checker is None:
+            return True
+        try:
+            result = checker(task)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as error:
+            self.condition_error = f"{type(error).__name__}: {error}"[:200]
+            return False
+        return bool(result)
 
     async def finish(self, task: Task, *, result: str = "") -> Task:
         """任务跑完：一次性→done；多次/定时→重排下一次（超次数或区间外→结束）。"""
@@ -392,6 +444,9 @@ class TaskQueue:
         if "window" in changes and isinstance(changes["window"], Mapping):
             fields.append("window_json=?")
             values.append(json.dumps(changes["window"], ensure_ascii=False))
+        if "condition" in changes and changes["condition"] is not None:
+            fields.append("condition_text=?")
+            values.append(str(changes["condition"])[:2000])
         if not fields:
             return False
         fields.append("updated_at=?")
@@ -466,6 +521,8 @@ class TaskQueue:
             max_runs=int(get("max_runs", 1) or 0), runs_done=int(get("runs_done", 0) or 0),
             attempts=int(get("attempts", 0) or 0), last_error=str(get("last_error")),
             last_result=str(get("last_result")), window=load(get("window_json"), {}),
+            condition=str(get("condition_text")), 
+            condition_checks=int(get("condition_checks", 0) or 0),
         )
 
 

@@ -103,6 +103,20 @@
         { group_id: "1046398077", name: "BE指令饮品店☕️", messages: 10422, last_active: "2026-09-12T10:58:02+00:00", whitelisted: false },
       ],
     },
+    tasks: {
+      stats: { pending: 2, running: 0, done: 12, failed: 1, expired: 0 },
+      tasks: [
+        { task_id: "t1", kind: "agent", title: "找个安静群搭话", status: "pending",
+          next_run_at: "2026-10-08T15:30:00+00:00", runs_done: 0, max_runs: -1,
+          interval_minutes: 120, long_term: true, source: "bot",
+          condition: "return bool(quiet_scopes(8))", condition_checks: 5,
+          window: { daily: ["09:00", "23:00"] } },
+        { task_id: "t2", kind: "notify", title: "提醒他交作业", status: "pending",
+          next_run_at: "2026-10-08T20:00:00+00:00", runs_done: 0, max_runs: 1,
+          source: "user", window: {} },
+      ],
+      legacy: [],
+    },
     backup_memory: {
       current_embedding_model: "bge-m3",
       counts: { scopes: 3, messages: 17844, summaries: 126, memories: 412, catalog: 88, embeddings: 2931 },

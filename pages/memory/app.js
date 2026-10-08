@@ -1135,9 +1135,15 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       if (row.window && row.window.daily) {
         title.appendChild(el("span", "tag", `${row.window.daily[0]}-${row.window.daily[1]}`));
       }
+      // 自定义触发条件：有条件的任务要看得出来（还在等条件 / 已经判假几次）
+      if (row.condition) {
+        title.appendChild(el("span", "tag",
+          row.condition_checks ? `等条件（判过 ${row.condition_checks} 次）` : "等条件"));
+      }
       const when = row.next_run_at ? "下次 " + String(row.next_run_at).slice(0, 19) : "";
-      const note = row.last_error ? "上次失败：" + row.last_error
-        : (row.last_result ? "上次：" + row.last_result : "");
+      const note = (row.condition ? `条件：${row.condition}` + (row.last_error ? "；" : "")
+        : "") + (row.last_error ? "上次失败：" + row.last_error
+        : (row.last_result ? "上次：" + row.last_result : ""));
       const cancel = actionBtn("撤销", async () => {
         try {
           await post(row.legacy ? "task_cancel" : "task_cancel", { task_id: row.task_id });
@@ -1538,9 +1544,12 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       id: bundle.id, name: bundle.name || bundle.id, description: bundle.description || "",
       enabled: bundle.enabled !== false, tools: (bundle.tools || []).length, kind: "内置包",
     })).concat(scripts.map((script) => ({
-      id: script.id, name: script.name || script.id, description: script.description || "",
+      id: script.id, name: script.display_name || script.name || script.id,
+      description: script.description || "",
       enabled: script.enabled !== false, tools: (script.tools || []).length,
       kind: script.origin === "learned" ? "自学习技能" : "脚本拓展",
+      error: script.error || "",
+      config: script.config || {}, template: script.config_template || {},
     })));
     renderList($("extensions"), rows, (row) => {
       const title = el("div", "title");
@@ -1562,8 +1571,94 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
           loadCaps();
         } catch (error) { toast(String(error.message || error), "error"); }
       });
-      return itemShell(title, row.description, "", [toggle, reload]);
+      const buttons = [toggle, reload];
+      // 有配置模板（或已经存过配置）的拓展：给一个「配置」按钮，改完立即生效
+      if (row.kind === "脚本拓展"
+          && (Object.keys(row.template || {}).length || Object.keys(row.config || {}).length)) {
+        buttons.push(actionBtn("配置", () => extConfigDialog(row)));
+      }
+      const detail = row.error ? `${row.description} ⚠ ${row.error}` : row.description;
+      return itemShell(title, detail, "", buttons);
     }, "没有额外拓展");
+  }
+
+  // 拓展配置：自绘表单（键值对，值的类型按模板猜：bool→开关、number→数字框、其余文本框）
+  function extConfigDialog(row) {
+    const overlay = el("div", "modal-overlay");
+    const box = el("div", "modal");
+    box.appendChild(el("h3", "", `${row.name} · 配置`));
+    box.appendChild(el("p", "modal-msg",
+      "改完点保存即生效（拓展每次调用都会重读配置）。留空表示不设置该键。"));
+    const fields = {};
+    const keys = Array.from(new Set(
+      Object.keys(row.template || {}).concat(Object.keys(row.config || {}))));
+    if (!keys.length) {
+      box.appendChild(el("p", "muted", "这个拓展没有配置项"));
+    }
+    keys.forEach((key) => {
+      const wrap = el("div", "cfg-row");
+      wrap.appendChild(el("label", "muted", key));
+      const sample = (row.config || {})[key] !== undefined
+        ? row.config[key] : (row.template || {})[key];
+      let input;
+      if (typeof sample === "boolean") {
+        input = el("input");
+        input.type = "checkbox";
+        input.checked = Boolean(sample);
+      } else {
+        input = el("input");
+        input.type = typeof sample === "number" ? "number" : "text";
+        input.value = sample === undefined || sample === null ? "" : String(sample);
+        if (key.toLowerCase().includes("key") || key.toLowerCase().includes("token")) {
+          input.type = "password";
+        }
+      }
+      input.dataset.kind = typeof sample;
+      fields[key] = input;
+      wrap.appendChild(input);
+      box.appendChild(wrap);
+    });
+    const row2 = el("div", "row");
+    const save = el("button", "btn primary", "保存");
+    const reset = el("button", "btn ghost", "恢复默认");
+    const cancel = el("button", "btn ghost", "取消");
+    save.addEventListener("click", async () => {
+      const payload = {};
+      Object.keys(fields).forEach((key) => {
+        const input = fields[key];
+        if (input.type === "checkbox") { payload[key] = input.checked; return; }
+        const raw = String(input.value || "");
+        if (raw === "") return;                       // 空=不设置这个键
+        if (input.dataset.kind === "number") {
+          const num = Number(raw);
+          payload[key] = Number.isFinite(num) ? num : raw;
+        } else if (input.dataset.kind === "boolean") {
+          payload[key] = raw === "true";
+        } else { payload[key] = raw; }
+      });
+      try {
+        await post("extension_config_save", { id: row.id, config: payload });
+        toast("配置已保存", "ok");
+        overlay.remove();
+        loadCaps();
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
+    reset.addEventListener("click", async () => {
+      try {
+        await post("extension_config_reset", { id: row.id });
+        toast("已恢复默认", "ok");
+        overlay.remove();
+        loadCaps();
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
+    cancel.addEventListener("click", () => overlay.remove());
+    row2.appendChild(save); row2.appendChild(reset); row2.appendChild(cancel);
+    box.appendChild(row2);
+    overlay.appendChild(box);
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
   }
 
   function renderCapabilities() {
