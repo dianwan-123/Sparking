@@ -63,9 +63,12 @@
       },
     },
     scopes: [
-      { group_id: "123456789", display_name: "数学指令讨论群", messages: 9821 },
-      { group_id: "987654321", display_name: "BE指令饮品店", messages: 6223 },
-      { group_id: "556677", display_name: "私聊 · 小明", messages: 1800 },
+      { group_id: "123456789", display_name: "数学指令讨论群", messages: 9821,
+        tag: "学生党，聊数学与指令", scope_id: "s1" },
+      { group_id: "987654321", display_name: "BE指令饮品店", messages: 6223,
+        tag: "游戏群，随便聊", scope_id: "s2" },
+      { group_id: "556677", display_name: "私聊 · 小明", messages: 1800,
+        tag: "", scope_id: "s3" },
     ],
     messages: { messages: [
       { message_id: 1, sender_name: "小明", text: "rotated ~ 0 锁死仰角不就行了", occurred_at: "2026-10-07 14:11:02" },
