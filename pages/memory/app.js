@@ -872,6 +872,7 @@
     const actions = el("div", "actions");
     if (node.editable) {
       actions.appendChild(actionBtn("编辑", () => forestEdit(node)));
+      actions.appendChild(actionBtn("让 bot 改", () => forestAskBot(node)));
       actions.appendChild(actionBtn("删除", async () => {
         if (!(await askConfirm({ title: "删除这个记忆节点", danger: true, okText: "删除",
                                  message: `${node.label}\n${(node.hint || "").slice(0, 80)}` }))) return;
@@ -958,6 +959,33 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       box.textContent = "";
       box.appendChild(el("div", "empty", String(error.message || error)));
     }
+  }
+
+  // 让 bot 自己改这条记忆：把节点现状 + 你的要求发给它，它调 memory_edit 动手
+  async function forestAskBot(node) {
+    const want = await askPrompt({
+      title: "让 bot 改这条记忆",
+      fields: [
+        { key: "note", label: "你想让它怎么改",
+          value: "", multiline: true,
+          placeholder: "例：这条记错了，其实我早就不学 Rust 了，现在在写 Go" },
+      ],
+      okText: "交给它改",
+    });
+    if (!want || !String(want.note || "").trim()) return;
+    try {
+      toast("已交给它，稍等…", "ok");
+      const out = await post("memory_edit_by_bot", scopeParams({
+        node_id: node.id, label: node.label || "", hint: node.hint || "",
+        instruction: String(want.note).trim(),
+      }));
+      toast(out && out.changed ? "它已经改好了" : "它看过后没改（理由见提示）", "ok");
+      if (out && out.reply) {
+        await askConfirm({ title: "它说", message: String(out.reply).slice(0, 600),
+                           okText: "知道了", cancelText: "" });
+      }
+      loadForest();
+    } catch (error) { toast(String(error.message || error), "error"); }
   }
 
   let forestEditing = { nodeId: "" };
@@ -1057,6 +1085,21 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         toast("已切换到 " + row.group_id);
         refresh();
       });
+      const tagBtn = actionBtn(row.tag ? "改标签" : "加标签", async () => {
+        const answer = await askPrompt({
+          title: "群标签",
+          fields: [{ key: "tag", label: "这个群是干什么的（用来判断什么话该在这儿说）",
+                     value: row.tag || "", placeholder: "例：工作群 / 亲友群 / 游戏群" }],
+          okText: "保存",
+        });
+        if (!answer) return;
+        try {
+          await post("scope_tag_save", { group_id: row.group_id, scope_id: row.scope_id,
+                                         tag: String(answer.tag || "").trim() });
+          toast("标签已保存", "ok");
+          loadGroups();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      });
       const wipe = actionBtn("清空该群", async () => {
         if (!(await askConfirm({
           title: "清空该群记忆", danger: true, okText: "清空",
@@ -1068,7 +1111,8 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
           loadGroups();
         } catch (error) { toast(String(error.message || error), "error"); }
       }, "danger");
-      return itemShell(title, "", row.last_at ? "最后消息 " + row.last_at : "", [use, wipe]);
+      return itemShell(title, "", row.last_at ? "最后消息 " + row.last_at : "",
+                       [use, tagBtn, wipe]);
     }, "还没有任何群数据");
 
     renderList($("topics"), topics, (row) => {

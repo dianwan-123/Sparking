@@ -91,6 +91,8 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("extension_toggle", "开关拓展"),
     ("extension_reload", "重载拓展"),
     ("extension_config_save", "保存拓展配置"),
+    ("scope_tag_save", "保存群标签"),
+    ("memory_edit_by_bot", "让 bot 改一条记忆"),
     ("extension_config_reset", "恢复拓展默认配置"),
     ("compress", "压缩记忆"),
     ("reflect", "让 bot 自我总结"),
@@ -244,6 +246,7 @@ class PageAPI:
                 "group_id": conversation,
                 "scope_id": scope,
                 "display_name": str(row.get("display_name") or ""),
+                "tag": str(row.get("tag") or ""),
                 "messages": stats.get("message_identities", 0),
                 "summaries": stats.get("summary_nodes", 0),
                 "memories": stats.get("memory_items", 0),
@@ -1310,6 +1313,75 @@ class PageAPI:
         else:
             registry.disable(extension_id)
         return {"ok": True, "id": extension_id, "enabled": want_enabled, "kind": "bundle"}
+
+    async def _do_memory_edit_by_bot(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """把"这条记忆要改成什么"交给 bot，由它自己调 memory_edit 动手。
+
+        这是"智能记忆修改"的第二条路：用户说清意图，bot 决定怎么改（改哪条、改成什么），
+        并留下修订记录。它不动手时会说明理由，不假装改了。
+        """
+        node_id = str(body.get("node_id") or "").strip()
+        instruction = str(body.get("instruction") or "").strip()
+        if not node_id:
+            raise WebUIError("缺少 node_id")
+        if not instruction:
+            raise WebUIError("说清你想让它怎么改")
+        _group, scope = self._scope_of(body)
+        host = self.host
+        label = str(body.get("label") or "")[:120]
+        hint = str(body.get("hint") or "")[:400]
+        prompt = (
+            "用户觉得这条记忆不对，要你改。\n"
+            f"记忆节点：{node_id}\n标题：{label}\n内容：{hint}\n"
+            f"用户的要求：{instruction}\n\n"
+            "请调用 memory_edit 工具动手（action=update 改内容、action=forget 删掉错的；"
+            "node_id 用上面这个）。改完用一句话说明你改了什么；如果你判断不该改，"
+            "就说清为什么（别假装改了）。"
+        )
+        try:
+            # 不带 agent 循环（没有会话事件、也没必要让它去调一堆工具）：
+            # 让它给出结构化决定，再由宿主落地到同一条记忆上。
+            raw = await host._llm_text(
+                host.settings.reply_provider_id or host.settings.summary_provider_id,
+                prompt=prompt + chr(10) + chr(10) + (
+                    '只输出 JSON：{"action":"update|forget|keep",'
+                    '"subject":"新标题（action=update 时给）",'
+                    '"value":"新内容（action=update 时给）",'
+                    '"reply":"一句话对用户说"}'),
+                system_prompt=("你在修改自己的长期记忆。只动这一条，别改别的；"
+                               "拿不准就用 action=keep 并说清原因，不要瞎改。"))
+        except Exception as error:
+            raise WebUIError(f"它没能完成：{type(error).__name__}: {error}"[:200]) from error
+        from .json_utils import parse_json_object as _parse
+        decision = _parse(str(raw or "")) or {}
+        act = str(decision.get("action") or "keep").strip().lower()
+        entry_id = node_id.split("item:catalog:")[-1]
+        changed = False
+        if act == "update" and (str(decision.get("value") or "").strip()
+                                or str(decision.get("subject") or "").strip()):
+            changed = await self.storage.edit_catalog_entry(
+                entry_id, subject=str(decision.get("subject") or "").strip() or None,
+                value=str(decision.get("value") or "").strip() or None,
+                note="控制台：让 bot 改")
+        elif act == "forget":
+            changed = await self.storage.forget_catalog_entry(
+                entry_id, note="控制台：让 bot 判定这条是错的")
+        reply = str(decision.get("reply") or raw or "")[:600]
+        return {"ok": True, "reply": reply, "changed": bool(changed),
+                "action": act}
+
+    async def _do_scope_tag_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """给会话写一个标签（这个群是干什么的）——防串群的提示词工程。"""
+        scope = str(body.get("scope_id") or "").strip()
+        if not scope:
+            _group, scope = self._scope_of(body)
+        if not scope:
+            raise WebUIError("缺少 scope_id 或 group_id")
+        tag = str(body.get("tag") or "").strip()[:200]
+        ok = await self.storage.set_scope_tag(scope, tag)
+        if not ok:
+            raise WebUIError("没找到这个会话")
+        return {"ok": True, "scope_id": scope, "tag": tag}
 
     async def _do_extension_config_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
         manager = getattr(self.host, "_scripts", None)

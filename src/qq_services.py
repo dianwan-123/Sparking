@@ -267,15 +267,62 @@ class QzoneService:
         )
         return _json_safe(result)
 
+    # 发说说的去重/冷却状态（跨调用保留；进程重启后从头算，代价可接受）
+    _publish_history: "list[tuple[float, str]]" = []
+    _PUBLISH_COOLDOWN_SECONDS = 900.0      # 15 分钟内不再发第二条
+    _PUBLISH_SIMILAR_RATIO = 0.72          # 与近 10 条相似度超过这个就不发
+
+    @staticmethod
+    def _similarity(left: str, right: str) -> float:
+        """两段文字的相似度（按 2-gram 重合率，中文短文本够用且无依赖）。"""
+        a, b = str(left or ""), str(right or "")
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        grams_a = {a[i:i + 2] for i in range(len(a) - 1)} or {a}
+        grams_b = {b[i:i + 2] for i in range(len(b) - 1)} or {b}
+        if not grams_a or not grams_b:
+            return 0.0
+        return len(grams_a & grams_b) / len(grams_a | grams_b)
+
+    def _publish_blocker(self, text: str) -> str:
+        """该不该拦这条说说？返回空串=可以发，否则一句人话原因。
+
+        实录（用户）："bot 会把一件事反复发几次空间"——同一件事被它当成新灵感反复发。
+        真人不会这样，所以这里拦下来并告诉它为什么（它好换点别的说）。
+        """
+        now = time.monotonic()
+        QzoneService._publish_history = [
+            item for item in QzoneService._publish_history
+            if now - item[0] < 3600
+        ]
+        recent = QzoneService._publish_history
+        for _stamp, previous in recent[-10:]:
+            if self._similarity(text, previous) >= self._PUBLISH_SIMILAR_RATIO:
+                return ("这件事你刚发过一条很像的说说，别再重复发了——"
+                        "想发就换个别的、真的新的内容，或者干脆这次不发。")
+        if recent:
+            waited = now - recent[-1][0]
+            left = self._PUBLISH_COOLDOWN_SECONDS - waited
+            if left > 0:
+                return (f"你 {int(waited // 60)} 分钟前刚发过说说，"
+                        f"再等 {max(1, int(left // 60))} 分钟（或换个真正新的内容）。")
+        return ""
+
     async def publish(self, text: str, images: list[str] | None = None) -> dict[str, Any]:
         text = str(text).strip()
         if not text or len(text) > 1000:
             raise QzoneError("publish text must be 1-1000 characters")
+        blocker = self._publish_blocker(text)
+        if blocker:
+            raise QzoneError(blocker)
         try:
             params: dict[str, Any] = {"content": text}
             if images:
                 params["images"] = [str(x)[:500] for x in images[:9]]
             result = await self.gateway.execute("send_qzone_msg", **params)
+            QzoneService._publish_history.append((time.monotonic(), text))
             tid = ""
             if isinstance(result, dict):
                 tid = str(result.get("tid") or (result.get("data") or {}).get("tid", ""))

@@ -22,7 +22,7 @@ SCHEMA_VERSION = 1
 _TABLE_COLUMNS: dict[str, frozenset] = {}
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS scopes(scope_id TEXT PRIMARY KEY,platform TEXT NOT NULL,account_id TEXT NOT NULL,conversation_id TEXT NOT NULL,display_name TEXT NOT NULL DEFAULT '',next_seq INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,UNIQUE(platform,account_id,conversation_id));
+CREATE TABLE IF NOT EXISTS scopes(scope_id TEXT PRIMARY KEY,platform TEXT NOT NULL,account_id TEXT NOT NULL,conversation_id TEXT NOT NULL,display_name TEXT NOT NULL DEFAULT '',tag TEXT NOT NULL DEFAULT '',next_seq INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,UNIQUE(platform,account_id,conversation_id));
 CREATE TABLE IF NOT EXISTS event_headers(event_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,scope_seq INTEGER NOT NULL,event_type TEXT NOT NULL,upstream_message_id TEXT NOT NULL,sender_id TEXT NOT NULL,occurred_at TEXT NOT NULL,dedupe_key TEXT NOT NULL,payload_hash TEXT NOT NULL,schema_version INTEGER NOT NULL DEFAULT 1,ingested_at TEXT NOT NULL,UNIQUE(scope_id,scope_seq),UNIQUE(scope_id,dedupe_key));
 CREATE TABLE IF NOT EXISTS event_payloads(event_id TEXT PRIMARY KEY REFERENCES event_headers(event_id) ON DELETE CASCADE,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS message_identities(message_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,upstream_message_id TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(scope_id,upstream_message_id));
@@ -103,6 +103,7 @@ class Storage:
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
+        await self._add_scope_tag_column()
         await self._load_table_columns()
         return self
 
@@ -185,9 +186,9 @@ class Storage:
         """Every known scope, so a cold start can rehydrate its scope map from
         disk instead of waiting for the first inbound message of each chat."""
         if platform:
-            rows = await self._fetchall("SELECT scope_id,platform,account_id,conversation_id,display_name FROM scopes WHERE platform=?", (platform,))
+            rows = await self._fetchall("SELECT scope_id,platform,account_id,conversation_id,display_name,tag FROM scopes WHERE platform=?", (platform,))
         else:
-            rows = await self._fetchall("SELECT scope_id,platform,account_id,conversation_id,display_name FROM scopes", ())
+            rows = await self._fetchall("SELECT scope_id,platform,account_id,conversation_id,display_name,tag FROM scopes", ())
         return [
             {"scope_id": str(row["scope_id"]), "platform": str(row["platform"]),
              "account_id": str(row["account_id"]), "conversation_id": str(row["conversation_id"]),
@@ -1712,6 +1713,109 @@ class Storage:
     async def request_rebuild(self, scope_id: str, reason: str = "manual") -> str:
         return await self.enqueue_job("rebuild", {"reason": reason[:500]}, scope_id, f"rebuild:{scope_id}:{reason}")
 
+    # ---------------------------------------------------------- 记忆条目：人工 / bot 自改
+    async def recent_catalog(self, scope_ids: "Sequence[str]",
+                             limit: int = 20) -> list[Any]:
+        """最近的记忆账本条目（给 bot 的 memory_edit list 用）。"""
+        scopes = [s for s in dict.fromkeys(scope_ids or []) if s]
+        if not scopes:
+            return []
+        marks = ",".join("?" for _ in scopes)
+        rows = await self._fetchall(
+            f"SELECT * FROM catalog_entries WHERE scope_id IN ({marks}) "
+            "AND status='active' ORDER BY updated_at DESC LIMIT ?",
+            (*scopes, _limit(limit, 100)))
+        return [_ledger_entry(row) for row in rows]
+
+    async def search_catalog(self, scope_ids: "Sequence[str]", query: str,
+                             limit: int = 20) -> list[Any]:
+        """按关键词搜记忆条目（标题或内容命中）。"""
+        scopes = [s for s in dict.fromkeys(scope_ids or []) if s]
+        keyword = str(query or "").strip()
+        if not scopes or not keyword:
+            return []
+        marks = ",".join("?" for _ in scopes)
+        like = f"%{_escape_like(keyword)}%"
+        rows = await self._fetchall(
+            f"SELECT * FROM catalog_entries WHERE scope_id IN ({marks}) "
+            "AND status='active' AND (subject LIKE ? ESCAPE '\\' "
+            "OR value LIKE ? ESCAPE '\\') ORDER BY updated_at DESC LIMIT ?",
+            (*scopes, like, like, _limit(limit, 100)))
+        return [_ledger_entry(row) for row in rows]
+
+    async def edit_catalog_entry(self, entry_id: str, *, subject: str | None = None,
+                                 value: str | None = None, note: str = "") -> bool:
+        """改一条记忆（写修订记录，审计可追）。subject/value 给 None 表示不动那项。"""
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        row = await self._fetchone(
+            "SELECT memory_id, subject, value FROM catalog_entries WHERE entry_id=?",
+            (entry_id,))
+        if row is None:
+            return False
+        memory_id = str(row["memory_id"])
+        new_subject = str(row["subject"]) if subject is None else str(subject)[:200]
+        new_value = str(row["value"]) if value is None else str(value)[:2000]
+        now = utc_now()
+        db = self._conn()
+        async with self._write_lock:
+            await self._begin_write(db)
+            try:
+                await db.execute(
+                    "UPDATE catalog_entries SET subject=?, value=?, updated_at=? "
+                    "WHERE entry_id=?", (new_subject, new_value, now, entry_id))
+                await db.execute(
+                    "UPDATE memory_items SET subject=?, updated_at=? WHERE memory_id=?",
+                    (new_subject, now, memory_id))
+                await db.execute(
+                    "INSERT INTO memory_revisions(memory_revision_id, memory_id, revision_no, "
+                    "value, operation, created_at) SELECT ?, ?, COALESCE(MAX(revision_no),0)+1, "
+                    "?, ?, ? FROM memory_revisions WHERE memory_id=?",
+                    (f"rev-{uuid.uuid4().hex[:16]}", memory_id, new_value,
+                     (f"edit:{note}" if note else "edit")[:120], now, memory_id))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return True
+
+    async def forget_catalog_entry(self, entry_id: str, *, note: str = "") -> bool:
+        """"忘掉"一条记忆：条目标记 archived（不再进上下文），但保留可追溯的修订记录。
+
+        不直接 DELETE：删掉就查不到"它曾经记过什么"，而记忆错的场景恰恰需要回溯。
+        """
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        row = await self._fetchone(
+            "SELECT memory_id FROM catalog_entries WHERE entry_id=?", (entry_id,))
+        if row is None:
+            return False
+        memory_id = str(row["memory_id"])
+        now = utc_now()
+        db = self._conn()
+        async with self._write_lock:
+            await self._begin_write(db)
+            try:
+                await db.execute(
+                    "UPDATE catalog_entries SET status='archived', updated_at=? "
+                    "WHERE entry_id=?", (now, entry_id))
+                await db.execute(
+                    "UPDATE memory_items SET status='archived', updated_at=? "
+                    "WHERE memory_id=?", (now, memory_id))
+                await db.execute(
+                    "INSERT INTO memory_revisions(memory_revision_id, memory_id, revision_no, "
+                    "value, operation, created_at) SELECT ?, ?, COALESCE(MAX(revision_no),0)+1, "
+                    "'', ?, ? FROM memory_revisions WHERE memory_id=?",
+                    (f"rev-{uuid.uuid4().hex[:16]}", memory_id,
+                     (f"forget:{note}" if note else "forget")[:120], now, memory_id))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return True
+
     # ---------------------------------------------------------- 记忆导出 / 导入
     async def export_memory(self, *, scope_ids: "Sequence[str] | None" = None) -> dict[str, list[dict[str, Any]]]:
         """按表导出记忆行（打包在 src/memory_export.py，那里也定义了表清单）。
@@ -1948,6 +2052,41 @@ class Storage:
             return dict(row)
         return {key: value for key, value in row.items() if key in allowed}
 
+    async def _add_scope_tag_column(self) -> None:
+        """老库补 `scopes.tag`（群标签：这个群是干什么的）。"""
+        try:
+            await self._conn().execute("ALTER TABLE scopes ADD COLUMN tag TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass          # 列已存在
+        try:
+            await self._conn().commit()
+        except Exception:
+            pass
+
+    async def set_scope_tag(self, scope_id: str, tag: str) -> bool:
+        """写一个会话的标签（控制台用）。"""
+        if not str(scope_id or "").strip():
+            return False
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "UPDATE scopes SET tag=? WHERE scope_id=?",
+                (str(tag or "").strip()[:200], str(scope_id)))
+            await self._conn().commit()
+        return bool(cursor.rowcount)
+
+    async def get_scope_tag(self, scope_id: str) -> str:
+        row = await self._fetchone("SELECT tag FROM scopes WHERE scope_id=?", (str(scope_id),))
+        return str(row["tag"] or "") if row is not None else ""
+
+    async def all_scope_tags(self, platform: str | None = None) -> dict[str, str]:
+        """scope_id → 标签（只返回有标签的）。"""
+        if platform:
+            rows = await self._fetchall(
+                "SELECT scope_id, tag FROM scopes WHERE platform=? AND tag != ''", (platform,))
+        else:
+            rows = await self._fetchall("SELECT scope_id, tag FROM scopes WHERE tag != ''")
+        return {str(row["scope_id"]): str(row["tag"]) for row in rows}
+
     async def _load_table_columns(self) -> None:
         """把各表的真实列名缓存下来（导入时用来过滤多余字段）。"""
         for name in ("scopes", "event_headers", "message_identities", "message_revisions",
@@ -2045,6 +2184,13 @@ def _event_dedupe_key(message: NormalizedMessage, payload_hash: str) -> str:
         return f"event:{raw_id}"
     stable = "\0".join((message.event_type, message.upstream_message_id, message.sender_id, message.occurred_at, payload_hash))
     return hashlib.sha256(stable.encode()).hexdigest()
+
+
+def _ledger_entry(row: Any) -> Any:
+    """catalog_entries 行 → CatalogEntry（复用 memory_ledger 的转换，保持形状一致）。"""
+    from .memory_ledger import _entry
+
+    return _entry(row)
 
 
 def _limit(value: int, high: int) -> int:

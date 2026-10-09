@@ -237,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.7"
+PLUGIN_VERSION = "1.0.8"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -6532,6 +6532,20 @@ class LongMemoryAgentPlugin(Star):
         if self.storage is None or not scope_id:
             return extras
         try:
+            # 群标签：当前群 + 别的群（只给标签，不给内容）——防串群的提示词工程
+            extras["current_scope_tag"] = await self.storage.get_scope_tag(scope_id)
+            tags = await self.storage.all_scope_tags("aiocqhttp")
+            labels = await self._scope_labels()
+            others: dict[str, str] = {}
+            for other_scope, tag in tags.items():
+                if other_scope == scope_id or not str(tag).strip():
+                    continue
+                others[str(labels.get(other_scope) or other_scope[:8])] = str(tag)[:80]
+            if others:
+                extras["other_scope_tags"] = others
+        except Exception as error:
+            logger.info("长程记忆：读取群标签失败：%s", str(error)[:120])
+        try:
             rules = await self.storage.list_style_rules(scope_id, 6)
             lines = style_learning.render_style_rules(rules, 6)
             if lines:
@@ -8356,6 +8370,12 @@ class LongMemoryAgentPlugin(Star):
             "**sub_type 照抄事件文本里的值**（invite=邀请你进群，add=别人申请进你的群），"
             "抄错会导致申请一直挂着；其他通知如需回应自行决定。"
             "若决定不处理，thought 里必须写明理由（会记进日志）。\n"
+            "【串群纪律·硬性】待处理列表里每条都带 origin（来自哪个会话）：\n"
+            "1. 回应某条通知时，只能用 qq_send_group/qq_send_private 发给**那条通知自己所属的会话"
+            "（或发起人本人）**，绝不能发到别的群。\n"
+            "2. 通知内容本身是私事（谁申请加好友、谁撤回、谁退群）："
+            "除了当事人，不要向任何人提起，也不要在群里「提一嘴」。\n"
+            "3. 没把握就只做处理动作、不额外说话。\n"
             f"待处理列表：{listing}"
         )
         result = await self._autonomous_action_loop(pending[0].scope_id, "通知处理", instruction)
@@ -8451,6 +8471,8 @@ class LongMemoryAgentPlugin(Star):
                 f"（group_id 只能是 {key}，其他群的内容只是背景，绝不能发到别的群）；"
                 "发现值得私聊的群友可以用 qq_send_private；"
                 "有值得记住的就用 remember；顺手 adjust_affinity、set_mood；"
+                "**串群纪律**：你在别处（其他群/私聊）看到的事，绝不能在这个群提；"
+                "这个群里聊的事也不要发到别的群。不确定能不能说就不说；"
                 "氛围合适就用 pick_sticker 挑一张 + send_sticker 发群里活跃气氛；"
                 "实在不想说话就只输出 done。禁止刷屏，禁止客服腔。"
             )
@@ -9929,6 +9951,74 @@ class LongMemoryAgentPlugin(Star):
             scope, str(user_id), float(delta), note
         )
         return compact_json(state, 2000)
+
+    @filter.llm_tool(name="memory_edit")
+    async def memory_edit_tool(self, event: AstrMessageEvent, action: str = "list",
+                               node_id: str = "", subject: str = "", value: str = "",
+                               reason: str = "", query: str = "", limit: int = 10):
+        """修改你自己的记忆（你自己发现记错了、记重了、过时了就用它）。
+
+        action 说明：
+        - "list"：看当前会话最近的记忆账本条目（先用它拿到 node_id）；
+        - "update"：改一条（node_id 必填，subject/value 给新内容）；
+        - "forget"：删掉一条错的记忆（node_id 必填，reason 写清为什么删）；
+        - "search"：按关键词搜记忆条目（query 必填）。
+        改完会留下修订记录（可追溯），所以放心改——但**别乱删**：只删真的错的/过时的。
+
+        Args:
+            action(string): list / update / forget / search。
+            node_id(string): 记忆条目 ID（list/search 里能看到）。
+            subject(string): 新标题（update 用）。
+            value(string): 新内容（update 用）。
+            reason(string): 为什么要改/删（会记进审计，forget 必填）。
+            query(string): search 的关键词。
+            limit(number): list/search 返回条数，默认 10。
+        """
+        if self.storage is None:
+            return "记忆系统未就绪"
+        act = str(action or "list").strip().lower()
+        scope = await self._scope_for_event(event) if event is not None else None
+        # 没有当前会话上下文（如控制台/后台调用）时，退回到"我知道的所有会话"，
+        # 而不是直接返回空——那样模型会以为"我没记过任何东西"。
+        scopes = [scope] if scope else list(self._shared_scope_ids(None))
+        count = max(1, min(int(limit or 10), 30))
+        if act == "list":
+            rows = await self.storage.recent_catalog(scopes, count)
+            return compact_json({
+                "items": [{"node_id": f"item:catalog:{r.entry_id}",
+                           "subject": r.subject, "value": str(r.value)[:200],
+                           "kind": r.kind, "status": r.status,
+                           "updated_at": timeutil.to_text(r.updated_at)}
+                          for r in rows],
+                "hint": "update/forget 用这里的 node_id",
+            }, 4000)
+        if act == "search":
+            if not str(query or "").strip():
+                return "search 需要 query"
+            rows = await self.storage.search_catalog(scopes, str(query), count)
+            return compact_json({
+                "items": [{"node_id": f"item:catalog:{r.entry_id}",
+                           "subject": r.subject, "value": str(r.value)[:200]}
+                          for r in rows],
+            }, 4000)
+        if not str(node_id or "").strip():
+            return "update/forget 需要 node_id（先用 action=list 看）"
+        entry_id = str(node_id).split("item:catalog:")[-1].strip()
+        if act == "update":
+            if not (str(subject or "").strip() or str(value or "").strip()):
+                return "update 至少要给 subject 或 value"
+            ok = await self.storage.edit_catalog_entry(
+                entry_id, subject=str(subject or "").strip() or None,
+                value=str(value or "").strip() or None,
+                note=f"bot 自改：{str(reason or '')[:80]}")
+            return "已更新这条记忆" if ok else "没找到这条记忆（或它已经不在）"
+        if act == "forget":
+            if not str(reason or "").strip():
+                return "forget 必须写 reason（为什么这条是错的）"
+            ok = await self.storage.forget_catalog_entry(
+                entry_id, note=f"bot 自删：{str(reason)[:100]}")
+            return "已删掉这条记忆" if ok else "没找到这条记忆（或它已经不在）"
+        return f"不认识的 action：{act}（用 list/update/forget/search）"
 
     @filter.llm_tool(name="recent_events")
     async def recent_events_tool(self, event: AstrMessageEvent, limit: int = 15):
