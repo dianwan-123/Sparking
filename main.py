@@ -237,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.8"
+PLUGIN_VERSION = "1.0.9"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -6340,16 +6340,32 @@ class LongMemoryAgentPlugin(Star):
         scope_id = await self.storage.get_or_create_scope(
             "aiocqhttp", account, group.group_id, group.name)
         self._known_scopes.setdefault(group.group_id, scope_id)
+        # 导出记录里**自己**的发言要认出来（manifest 的 selfUin / selfName）。
+        # 不认的话：它不认自己说过的话（"刚说不认账"），my_recent_words 里也永远
+        # 没有它的历史发言——那块只认 self: 前缀。
+        self_ids = {str(group.self_uin or "").strip()}
+        self_names = {str(group.self_name or "").strip()}
+        self_ids.discard("")
+        self_names.discard("")
         written = 0
         for message in group.messages:
+            mine = (str(message.sender_id or "") in self_ids
+                    or str(message.sender_uid or "") in self_ids
+                    or (self_names and str(message.sender_name or "").strip() in self_names))
+            upstream = f"import:{message.message_id}"
+            if mine:
+                # 用 self: 前缀标记成"我发的"（与实时链路一致），并把说话人写成"我"
+                upstream = f"self:import:{message.message_id}"
             try:
                 await self.ingest.ingest(NormalizedMessage(
                     platform="aiocqhttp", account_id=account,
                     conversation_id=group.group_id,
-                    upstream_message_id=f"import:{message.message_id}",
-                    sender_id=message.sender_id, sender_name=message.sender_name,
+                    upstream_message_id=upstream,
+                    sender_id=str(group.self_uin or "self") if mine else message.sender_id,
+                    sender_name="我" if mine else message.sender_name,
                     text=message.text, occurred_at=message.occurred_at,
-                    raw_event={"imported": True, "kind": message.kind},
+                    raw_event={"imported": True, "kind": message.kind,
+                               "self": bool(mine)},
                     parts=[{"type": "text", "data": {"text": message.text}}],
                     reply_to="", event_type="message.created"))
                 written += 1

@@ -60,7 +60,7 @@ class CompressionService:
         if not summaries or any(x.scope_id != scope_id or x.level not in allowed for x in summaries):
             raise ValueError(f"L{level} inputs must be same-scope lower-level summaries")
         ordered = sorted(summaries, key=lambda x: x.start_seq)
-        items = [{"summary_id": x.summary_id, "level": x.level, "range": [x.start_seq, x.end_seq], "title": x.title, "body": x.body, "citations": x.citations} for x in ordered]
+        items = [{"summary_id": x.summary_id, "level": x.level, "range": [x.start_seq, x.end_seq], "title": x.title, "body": x.body, "citations": x.citations, "created_at": x.created_at} for x in ordered]
         citations = list(dict.fromkeys(item for summary in ordered for item in summary.citations))
         return await self._compress(scope_id, level, ordered[0].start_seq, ordered[-1].end_seq, items, citations, [x.summary_id for x in ordered])
 
@@ -90,7 +90,10 @@ class CompressionService:
             data = _sanitize_aggregate(raw, allowed_ids, sorted(allowed_ids))
         manifest = {"level": level, "messages": sorted(allowed_ids), "summaries": packed_summary_ids, "input_count": len(packed_items)}
         body = json.dumps({key: data[key] for key in _REQUIRED_ARRAYS if key not in {"topics", "citations", "memory_proposals"}}, ensure_ascii=False, separators=(",", ":"))
-        record = await self.storage.store_summary(scope_id, level, packed_start, packed_end, str(data["title"])[:500], body, data["topics"], data["citations"], packed_summary_ids, manifest, self.model)
+        # 「这段内容发生在什么时候」：L1 看消息时间，L2/L3 看子摘要覆盖的时间范围。
+        # 不传的话 store_summary 会记成"写入时间"，导入的老记录就会被当成刚发生的事。
+        happened_at = _happened_at(packed_items)
+        record = await self.storage.store_summary(scope_id, level, packed_start, packed_end, str(data["title"])[:500], body, data["topics"], data["citations"], packed_summary_ids, manifest, self.model, occurred_at=happened_at)
         if level == 1 and data["topics"]:
             try:
                 await self.storage.upsert_topics(scope_id, data["topics"], packed_end)
@@ -99,7 +102,9 @@ class CompressionService:
         if self.ledger:
             for index, proposal in enumerate(data["memory_proposals"]):
                 try:
-                    await self.ledger.apply_proposal(scope_id, proposal, f"summary:{record.summary_id}:{index}")
+                    await self.ledger.apply_proposal(
+                        scope_id, proposal, f"summary:{record.summary_id}:{index}",
+                        occurred_at=happened_at)
                 except ValueError:
                     continue
         return record
@@ -346,6 +351,27 @@ def _ids_in_items(items: Sequence[Mapping[str, Any]]) -> set[str]:
             result.add(str(item["message_id"]))
         result.update(str(value) for value in item.get("citations", []) if str(value))
     return result
+
+
+def _happened_at(items: Sequence[Mapping[str, Any]]) -> str:
+    """这段内容**什么时候发生的**：取输入项里最早的时间（L1 是消息、L2/L3 是子摘要）。
+
+    取"最早"而不是"最晚"：一条记忆说的是"从那时开始发生的事"，配上时间纪律里
+    "先跟 now 比"，最早的锚点最不容易把旧事说成新事。
+    """
+    stamps: list[str] = []
+    for item in items:
+        for key in ("occurred_at", "at", "created_at"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                stamps.append(value)
+                break
+    if not stamps:
+        return ""
+    try:
+        return min(stamps)
+    except Exception:
+        return stamps[0]
 
 
 def _item_range(items: Sequence[Mapping[str, Any]], fallback_start: int, fallback_end: int) -> tuple[int, int]:

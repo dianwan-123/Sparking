@@ -17,7 +17,7 @@ class MemoryLedger:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
 
-    async def apply_proposal(self, scope_id: str, proposal: Mapping[str, Any], idempotency_key: str | None = None) -> CatalogEntry:
+    async def apply_proposal(self, scope_id: str, proposal: Mapping[str, Any], idempotency_key: str | None = None, occurred_at: str = "") -> CatalogEntry:
         kind = str(proposal.get("kind", "")).strip().lower()
         subject = str(proposal.get("subject", "")).strip()[:256]
         value = str(proposal.get("value", "")).strip()[:8000]
@@ -46,10 +46,13 @@ class MemoryLedger:
                         raise RuntimeError("memory projection missing")
                     return found
                 memory_id, revision_id, entry_id, now = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex, utc_now()
-                await db.execute("INSERT INTO memory_items VALUES(?,?,?,?,?,?,?,?,?,?)", (memory_id, scope_id, kind, subject, status, confidence, revision_id, idempotency_key, now, now))
-                await db.execute("INSERT INTO memory_revisions VALUES(?,?,?,?,?,?)", (revision_id, memory_id, 1, value, "create", now))
+                # 同 store_summary：条目时间用「内容发生时间」而不是「写入时间」，
+                # 否则导入的老记录会被当成刚记下的新事。
+                happened_at = str(occurred_at or "").strip() or now
+                await db.execute("INSERT INTO memory_items VALUES(?,?,?,?,?,?,?,?,?,?)", (memory_id, scope_id, kind, subject, status, confidence, revision_id, idempotency_key, happened_at, happened_at))
+                await db.execute("INSERT INTO memory_revisions VALUES(?,?,?,?,?,?)", (revision_id, memory_id, 1, value, "create", happened_at))
                 await db.executemany("INSERT INTO memory_evidence VALUES(?,?)", [(memory_id, item) for item in evidence])
-                await db.execute("INSERT INTO catalog_entries VALUES(?,?,?,?,?,?,?,?,?,?)", (entry_id, memory_id, scope_id, kind, subject, value, status, confidence, _json(evidence), now))
+                await db.execute("INSERT INTO catalog_entries VALUES(?,?,?,?,?,?,?,?,?,?)", (entry_id, memory_id, scope_id, kind, subject, value, status, confidence, _json(evidence), happened_at))
                 await db.commit()
             except BaseException:
                 await db.rollback()

@@ -614,7 +614,7 @@ class Storage:
         # 去掉首行标记，只留正文
         return text.split("\n", 1)[1].strip() if "\n" in text else text.strip()
 
-    async def store_summary(self, scope_id: str, level: int, start_seq: int, end_seq: int, title: str, body: str, topics: Sequence[str], message_ids: Sequence[str] = (), input_summary_ids: Sequence[str] = (), manifest: dict[str, Any] | None = None, model: str = "", prompt_version: str = "1") -> SummaryRecord:
+    async def store_summary(self, scope_id: str, level: int, start_seq: int, end_seq: int, title: str, body: str, topics: Sequence[str], message_ids: Sequence[str] = (), input_summary_ids: Sequence[str] = (), manifest: dict[str, Any] | None = None, model: str = "", prompt_version: str = "1", occurred_at: str = "") -> SummaryRecord:
         if level not in {1, 2, 3}:
             raise ValueError("summary level must be 1, 2, or 3")
         message_ids = list(dict.fromkeys(message_ids))
@@ -622,11 +622,15 @@ class Storage:
         await self._validate_owned(scope_id, "message_identities", "message_id", message_ids)
         await self._validate_owned(scope_id, "summary_nodes", "summary_id", input_summary_ids)
         db, summary_id, now = self._conn(), uuid.uuid4().hex, utc_now()
+        # created_at 记的是「这段内容**什么时候发生的**」，不是「什么时候压缩的」。
+        # 实录：导入 2022 年的聊天记录后压缩，摘要 created_at 写成今天 → 模型把它
+        # 当成刚发生的事（旧事当新事）。所以压缩方要把被覆盖内容的真实时间传进来。
+        happened_at = str(occurred_at or "").strip() or now
         data = manifest or {"messages": message_ids, "summaries": input_summary_ids}
         async with self._write_lock:
             await self._begin_write(db)
             try:
-                await db.execute("INSERT INTO summary_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, _json(list(topics)), _json(data), model, prompt_version, "active", now))
+                await db.execute("INSERT INTO summary_nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, _json(list(topics)), _json(data), model, prompt_version, "active", happened_at))
                 await db.executemany("INSERT INTO summary_inputs(summary_id,input_message_id) VALUES(?,?)", [(summary_id, item) for item in message_ids])
                 await db.executemany("INSERT INTO summary_inputs(summary_id,input_summary_id) VALUES(?,?)", [(summary_id, item) for item in input_summary_ids])
                 await db.executemany("INSERT INTO summary_citations VALUES(?,?,?)", [(summary_id, item, "") for item in message_ids])
@@ -645,7 +649,7 @@ class Storage:
             except BaseException:
                 await db.rollback()
                 raise
-        return SummaryRecord(summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, list(topics), message_ids, now)
+        return SummaryRecord(summary_id, scope_id, level, int(start_seq), int(end_seq), title, body, list(topics), message_ids, happened_at)
 
     async def upsert_topics(self, scope_id: str, topics: Sequence[str], last_seq: int) -> int:
         """把一批话题写进 group_topics（同 scope 同标题 hits+1 并推进 last_seq）。
