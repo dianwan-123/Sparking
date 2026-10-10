@@ -9026,6 +9026,39 @@ class LongMemoryAgentPlugin(Star):
         return (compact_json(
             await self.qq.handle_friend_request(flag, bool(approve), remark), 4000))
 
+    @filter.llm_tool(name="qq_join_group")
+    async def qq_join_group_tool(self, event: AstrMessageEvent, group_id: str = "",
+                                 answer: str = ""):
+        """关于"加入群聊"的**能力说明**（先读这里，别硬试）。
+
+        SnowLuma / OneBot 的 193 个动作里**没有"主动加群"这个接口**——
+        只有：`set_group_add_option`（设置本群的加群选项）、
+        `set_group_add_request`（处理**别人**发给你的加群请求/邀请，见 qq_handle_group_invite）、
+        `get_group_ignore_add_request`（看被忽略的入群请求）。
+        所以：
+        - 别人邀请你进群 / 申请进你的群 → 用 qq_handle_group_invite 处理（可以同意）；
+        - 想**主动**进一个陌生群 → 协议层做不到，请让群管理员邀请你，或让主人手动拉；
+        - 想要群号相关的事（看群资料/成员/公告）→ qq_group_list / qq_group_members /
+          napcat_call(get_group_info)。
+
+        Args:
+            group_id(string): 你想加入的群号（仅用于说明，不会真的加）。
+            answer(string): 验证答案（仅用于说明）。
+        """
+        return compact_json({
+            "can_join_proactively": False,
+            "reason": ("SnowLuma/OneBot 没有提供「主动加群」的动作（已核对 193 个动作与 openapi）；"
+                       "协议层只能处理别人发来的邀请/申请。"),
+            "what_you_can_do": [
+                "别人邀请你进群 → qq_handle_group_invite(flag, approve=true)（同意）",
+                "别人申请进你的群 → qq_handle_group_invite(flag, approve=true, sub_type='add')",
+                "看被忽略的入群请求 → napcat_call(get_group_ignore_add_request)",
+                "看某个群的资料 → napcat_call(get_group_info, {group_id})",
+            ],
+            "how_to_actually_join": "请群管理员邀请你，或让主人手动拉你进群。",
+            "requested": {"group_id": str(group_id or ""), "answer": str(answer or "")[:60]},
+        }, 2500)
+
     @filter.llm_tool(name="qq_handle_group_invite")
     async def qq_group_invite_tool(self, event: AstrMessageEvent, flag: str,
                                    approve: bool = True, reason: str = "",
@@ -9100,16 +9133,92 @@ class LongMemoryAgentPlugin(Star):
         return (compact_json(await self.qq.set_special_title(group_id, user_id, title), 4000))
 
     @filter.llm_tool(name="qq_set_profile")
-    async def qq_profile_tool(self, event: AstrMessageEvent, nickname: str = "", longnick: str = ""):
-        """修改Bot自己的昵称和签名。
+    async def qq_profile_tool(self, event: AstrMessageEvent, nickname: str = "",
+                              longnick: str = "", personal_note: str = "",
+                              sex: int = -1):
+        """修改Bot自己的资料：昵称、签名、个性签名（personal_note）、性别。
 
         Args:
             nickname(string): 新昵称，留空不修改。
             longnick(string): 新签名，留空不修改。
+            personal_note(string): 个性签名/心情短语，留空不修改。
+            sex(number): 性别 0未知/1男/2女；-1=不修改（默认）。
         """
         self._require_qq(event)
-        return (compact_json(
-            await self.qq.set_profile(nickname=nickname or None, longnick=longnick or None), 4000))
+        return (compact_json(await self.qq.set_profile(
+            nickname=nickname or None, longnick=longnick or None,
+            personal_note=personal_note or None,
+            sex=None if int(sex) < 0 else int(sex)), 4000))
+
+    @filter.llm_tool(name="qq_my_profile")
+    async def qq_my_profile_tool(self, event: AstrMessageEvent):
+        """看**你自己**的账号资料：QQ 号、昵称、头像地址、资料卡获赞数。
+
+        想换头像/改昵称之前先看这里；也能用来确认"我现在叫什么"。
+        """
+        self._require_qq(event)
+        info = await self.qq.login_info()
+        uin = str(info.get("user_id") or info.get("uin") or "")
+        likes: Any = {}
+        try:
+            likes = await self.qq.profile_like(count=5)
+        except Exception as error:
+            likes = {"error": str(error)[:80]}
+        return compact_json({
+            "uin": uin,
+            "nickname": str(info.get("nickname") or ""),
+            "avatar_url": self.qq.avatar_url(uin, 640) if uin else "",
+            "profile_likes": likes,
+            "hint": ("改资料用 qq_set_profile（nickname/personal_note/longnick 签名/sex）；"
+                     "换头像用 qq_set_avatar；"
+                     "想把头像/资料存下来用 qq_download_profile"),
+        }, 4000)
+
+    @filter.llm_tool(name="qq_download_profile")
+    async def qq_download_profile_tool(self, event: AstrMessageEvent, user_id: str = "",
+                                       group_id: str = "", kind: str = "avatar"):
+        """下载头像/资料图到本地媒体库，返回 media_id（可用 send_image 发出去）。
+
+        头像走 QQ 官方地址（q1.qlogo.cn）；不给 user_id 就下载**你自己**的头像。
+        kind=avatar（QQ 头像）/ group_avatar（群头像，要给 group_id）。
+
+        Args:
+            user_id(string): QQ 号（留空=自己）。
+            group_id(string): 群号（kind=group_avatar 时必填）。
+            kind(string): avatar / group_avatar。
+        """
+        self._require_qq(event)
+        which = str(kind or "avatar").strip().lower()
+        if which == "group_avatar":
+            target = str(group_id or "").strip()
+            if not target:
+                return "群头像要给 group_id"
+            url = self.qq.group_avatar_url(target, 640)
+            note = f"群头像 {target}"
+        else:
+            target = str(user_id or "").strip()
+            if not target:
+                info = await self.qq.login_info()
+                target = str(info.get("user_id") or info.get("uin") or "")
+            if not target:
+                return "拿不到 QQ 号（先配置 QQ 通道）"
+            url = self.qq.avatar_url(target, 640)
+            note = f"头像 {target}"
+        try:
+            payload = await fetch_bounded(url, 8 * 1024 * 1024)
+        except Exception as error:
+            return f"下载失败：{type(error).__name__}: {str(error)[:120]}"
+        if not payload:
+            return "下载失败：没拿到内容"
+        if not self._looks_like_image(payload):
+            return "下载到的不是图片（可能这个号没有头像）"
+        if self.media is None:
+            return "媒体归档未启用（enable_media_archive）"
+        record = await self.media.save_bytes(
+            payload, scope_id="studio", kind="image", mime="image/png", note=note)
+        media_id = str(record.item_id)
+        return compact_json({"ok": True, "media_id": media_id, "from": url,
+                             "hint": "send_image(media_id) 发给用户"}, 1500)
 
     @filter.llm_tool(name="qq_set_status")
     async def qq_status_tool(self, event: AstrMessageEvent, status: int = 0):
@@ -10207,6 +10316,105 @@ class LongMemoryAgentPlugin(Star):
         )
         return compact_json(state, 2000)
 
+    @filter.llm_tool(name="memory_manage")
+    async def memory_manage_tool(self, event: AstrMessageEvent, action: str = "survey",
+                                 summary_ids: str = "", reason: str = "",
+                                 group_id: str = "", limit: int = 12):
+        """打理你自己的记忆：先看家底 → **优先压缩** → 实在没必要才遗忘。
+
+        **铁律（用户定的）**：能压就压，别动不动就忘。
+        - "survey"：看记忆家底（各层摘要条数/字符量、账本条目数），拿 summary_id 用；
+        - "list"：列出这一层最近的摘要（给 level 就用它，否则列 L1）；
+        - "compress"：把**你挑的**几条**同级**摘要合并成更高一层（内容不丢，只是变精炼）
+          ——L1→L2、L2→L3；**L3 已经是最顶层，压不了**；
+        - "forget"：归档几条摘要（**最后手段**：只有那种"完全没必要留着"的才用，
+          比如纯寒暄流水、重复内容、已被更好摘要覆盖的；必须写清 reason）。
+
+        判断标准：这条记忆以后还会被问到/还有情感价值 → 压缩；只是流水账/重复/已过时 → 遗忘。
+
+        Args:
+            action(string): survey / list / compress / forget。
+            summary_ids(string): 逗号分隔的摘要 id（compress 要 ≥2 条且同级；forget 可 1 条起）。
+            reason(string): 为什么压/为什么忘（forget 必填）。
+            group_id(string): 群号或群名，留空=当前会话。
+            limit(number): list 返回条数，默认 12。
+        """
+        if self.storage is None or self.compression is None:
+            return "记忆系统未就绪"
+        scope = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个会话：{hint}"
+            scope = resolved
+        if not scope:
+            return "还没有这个会话的记忆"
+        scopes = self._shared_scope_ids(scope)
+        act = str(action or "survey").strip().lower()
+        ids = [x.strip() for x in str(summary_ids or "").replace("，", ",").split(",")
+               if x.strip()]
+
+        if act == "survey":
+            inventory = await self.storage.memory_inventory(scopes)
+            rows = await self.storage.list_summaries(scope, 8, levels=(1, 2, 3))
+            return compact_json({
+                "inventory": inventory,
+                "recent_summaries": [
+                    {"summary_id": r.summary_id, "level": r.level, "title": r.title[:60],
+                     "at": timeutil.to_text(r.created_at, "%Y-%m-%d")}
+                    for r in rows],
+                "rule": ("能压就压：compress 把几条同级摘要并成更高一层（内容不丢）；"
+                         "只有「完全没必要留着」的流水/重复/过时内容才 forget（要写 reason）。"),
+            }, 6000)
+
+        if act == "list":
+            level = int(limit) if 1 <= int(limit) <= 3 else 1
+            rows = await self.storage.list_summaries(scope, 20, levels=(level,))
+            return compact_json({
+                "level": level,
+                "summaries": [
+                    {"summary_id": r.summary_id, "title": r.title[:70],
+                     "at": timeutil.to_text(r.created_at, "%Y-%m-%d"),
+                     "chars": len(str(r.body))}
+                    for r in rows],
+                "hint": "compress 时把要合并的 summary_id 用逗号连起来（要同一层、至少两条）",
+            }, 8000)
+
+        if act == "compress":
+            if len(ids) < 2:
+                return "压缩至少要挑两条同级摘要（先 action=list 看看有哪些）"
+            try:
+                merged = await self.compression.merge_summaries(scope, ids)
+            except Exception as error:
+                return f"压不了：{str(error)[:160]}"
+            logger.info("长程记忆：bot 自己把 %d 条摘要压成 L%d（%s）",
+                        len(ids), merged.level, merged.title[:40])
+            return compact_json({
+                "ok": True, "merged_into": merged.summary_id, "level": merged.level,
+                "title": merged.title[:80], "from": ids,
+                "note": "内容没丢，只是并成更高一层了",
+            }, 2000)
+
+        if act == "forget":
+            if not ids:
+                return "遗忘要指定 summary_ids（先用 action=list）"
+            if not str(reason or "").strip():
+                return "遗忘必须写 reason（为什么这条完全没必要留着）"
+            done, missed = [], []
+            for summary_id in ids:
+                ok = await self.storage.archive_summary(scope, summary_id,
+                                                        note=str(reason)[:100])
+                (done if ok else missed).append(summary_id)
+            logger.info("长程记忆：bot 自己遗忘 %d 条摘要（理由：%s）",
+                        len(done), str(reason)[:60])
+            return compact_json({
+                "ok": bool(done), "forgotten": done, "not_found": missed,
+                "reason": str(reason)[:100],
+                "note": "是归档不是物理删：以后想查还能查回来",
+            }, 2000)
+
+        return f"不认识的 action：{act}（用 survey/list/compress/forget）"
+
     @filter.llm_tool(name="memory_edit")
     async def memory_edit_tool(self, event: AstrMessageEvent, action: str = "list",
                                node_id: str = "", subject: str = "", value: str = "",
@@ -10313,6 +10521,68 @@ class LongMemoryAgentPlugin(Star):
         """
         self._require_qzone(event)
         return (compact_json(await self.qzone.list_feeds(min(max(int(count), 1), 20)), 14000))
+
+    @filter.llm_tool(name="qzone_friend_feeds")
+    async def qzone_friend_feeds_tool(self, event: AstrMessageEvent, count: int = 10,
+                                      page: int = 1):
+        """看**好友空间动态**（谁发了什么）——逛空间从这里开始。
+
+        返回每位作者的 QQ 号/昵称/时间/key（key 只是 feed 句柄）。
+        想对某条**说说**点赞或评论，要先 qzone_friend_posts(uin) 拿到那条的 tid。
+
+        Args:
+            count(number): 本页条数，默认 10（最大 20）。
+            page(number): 页码，默认 1（只有首页可靠）。
+        """
+        self._require_qzone(event)
+        return compact_json(
+            await self.qzone.friend_feeds(count=min(max(int(count), 1), 20),
+                                          page=max(1, int(page))), 12000)
+
+    @filter.llm_tool(name="qzone_friend_posts")
+    async def qzone_friend_posts_tool(self, event: AstrMessageEvent, uin: str,
+                                      count: int = 10):
+        """看**某个好友**的说说列表（拿 tid 用；tid 是点赞/评论的钥匙）。
+
+        Args:
+            uin(string): 好友 QQ 号。
+            count(number): 条数，默认 10（最大 20）。
+        """
+        self._require_qzone(event)
+        posts = await self.qzone.friend_posts(uin, count=min(max(int(count), 1), 20))
+        return compact_json({"uin": str(uin), "posts": posts,
+                             "hint": "对某条点赞用 qzone_like_friend(uin,tid)；评论用 qzone_comment_friend"}, 10000)
+
+    @filter.llm_tool(name="qzone_like_friend")
+    async def qzone_like_friend_tool(self, event: AstrMessageEvent, uin: str,
+                                     tid: str, created_time: int = 0):
+        """给**好友**的说说点赞（tid 从 qzone_friend_posts 拿）。
+
+        Args:
+            uin(string): 说说所属好友 QQ 号。
+            tid(string): 说说 tid。
+            created_time(number): 说说发表时间（unix 秒，给了更可靠；没有填 0）。
+        """
+        self._require_qzone(event)
+        result = await self.qzone.like_friend_post(
+            uin, tid, created_time if int(created_time or 0) > 0 else None)
+        return compact_json({"ok": True, "result": result, "uin": str(uin),
+                             "tid": str(tid)}, 2000)
+
+    @filter.llm_tool(name="qzone_comment_friend")
+    async def qzone_comment_friend_tool(self, event: AstrMessageEvent, uin: str,
+                                        tid: str, content: str):
+        """评论**好友**的说说（tid 从 qzone_friend_posts 拿）。
+
+        Args:
+            uin(string): 说说所属好友 QQ 号。
+            tid(string): 说说 tid。
+            content(string): 评论内容，1-500 字（像真人说话，别客服腔）。
+        """
+        self._require_qzone(event)
+        result = await self.qzone.comment_friend_post(uin, tid, content)
+        return compact_json({"ok": True, "result": result, "uin": str(uin),
+                             "tid": str(tid)}, 2000)
 
     @filter.llm_tool(name="qzone_publish")
     async def qzone_publish_tool(self, event: AstrMessageEvent, text: str):

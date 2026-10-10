@@ -1457,6 +1457,67 @@ class Storage:
             for row in rows
         ]
 
+    async def get_summaries_by_ids(self, scope_id: str,
+                                   summary_ids: "Sequence[str]") -> list[SummaryRecord]:
+        """按 id 取摘要（bot 自己挑要压缩/遗忘的那些）。"""
+        ids = [str(x) for x in dict.fromkeys(summary_ids or []) if str(x).strip()][:60]
+        if not ids or not scope_id:
+            return []
+        marks = ",".join("?" for _ in ids)
+        rows = await self._fetchall(
+            f"SELECT * FROM summary_nodes WHERE scope_id=? AND summary_id IN ({marks})",
+            (scope_id, *ids))
+        result: list[SummaryRecord] = []
+        for row in rows:
+            citations = await self._fetchall(
+                "SELECT message_id FROM summary_citations WHERE summary_id=? "
+                "ORDER BY message_id", (row["summary_id"],))
+            result.append(SummaryRecord(
+                str(row["summary_id"]), str(row["scope_id"]), int(row["level"]),
+                int(row["start_seq"]), int(row["end_seq"]), str(row["title"]),
+                str(row["body"]), json.loads(row["topics_json"]),
+                [str(x["message_id"]) for x in citations], str(row["created_at"])))
+        return result
+
+    async def archive_summary(self, scope_id: str, summary_id: str, *,
+                              note: str = "") -> bool:
+        """把一条摘要归档（**不物理删**：还能查回来，但不再进上下文）。
+
+        这是"遗忘"的落地方式——记忆记错了/过时了要能回溯，物理删就查不到了。
+        """
+        if not scope_id or not summary_id:
+            return False
+        async with self._write_lock:
+            cursor = await self._conn().execute(
+                "UPDATE summary_nodes SET status='archived' WHERE scope_id=? "
+                "AND summary_id=? AND status='active'", (scope_id, summary_id))
+            await self._conn().commit()
+        return bool(cursor.rowcount)
+
+    async def memory_inventory(self, scope_ids: "Sequence[str]") -> dict[str, Any]:
+        """记忆家底：各层摘要条数与字符量、账本条目、消息数——bot 决策前先看它。"""
+        scopes = [s for s in dict.fromkeys(scope_ids or []) if s]
+        if not scopes:
+            return {}
+        marks = ",".join("?" for _ in scopes)
+        levels = await self._fetchall(
+            f"SELECT level, COUNT(*) AS n, COALESCE(SUM(LENGTH(body)),0) AS chars "
+            f"FROM summary_nodes WHERE scope_id IN ({marks}) AND status='active' "
+            "GROUP BY level ORDER BY level", (*scopes,))
+        catalog = await self._fetchone(
+            f"SELECT COUNT(*) AS n FROM catalog_entries WHERE scope_id IN ({marks}) "
+            "AND status='active'", (*scopes,))
+        messages = await self._fetchone(
+            f"SELECT COUNT(*) AS n FROM message_identities WHERE scope_id IN ({marks})",
+            (*scopes,))
+        return {
+            "levels": {int(row["level"]): {"count": int(row["n"]),
+                                           "chars": int(row["chars"])}
+                       for row in levels},
+            "catalog": int(catalog["n"]) if catalog else 0,
+            "messages": int(messages["n"]) if messages else 0,
+        }
+
     async def unconsumed_summaries(self, scope_id: str, level: int, consumed_by_level: int, limit: int = 5) -> list[SummaryRecord]:
         """Active summaries of `level` not yet used as input by `consumed_by_level`."""
         rows = await self._fetchall(

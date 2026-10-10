@@ -109,13 +109,55 @@ class QQService:
             "set_group_special_title", group_id=int(group_id), user_id=int(user_id),
             special_title=str(title)[:30])
 
-    async def set_profile(self, *, nickname: str | None = None, longnick: str | None = None) -> Any:
-        results = []
+    async def set_profile(self, *, nickname: str | None = None, longnick: str | None = None,
+                          personal_note: str | None = None, sex: int | None = None) -> Any:
+        """改自己的资料。`set_qq_profile` 一次能带 nickname/personal_note/sex
+        （SnowLuma catalog：nickname 选填、personal_note 选填、sex 0未知/1男/2女）；
+        签名走 `set_self_longnick`（那是另一个动作）。"""
+        results: list[Any] = []
+        payload: dict[str, Any] = {}
         if nickname:
-            results.append(await self.gateway.execute("set_qq_profile", nickname=str(nickname)[:24]))
+            payload["nickname"] = str(nickname)[:24]
+        if personal_note is not None:
+            payload["personal_note"] = str(personal_note)[:120]
+        if sex is not None:
+            try:
+                payload["sex"] = max(0, min(int(sex), 2))
+            except (TypeError, ValueError):
+                payload["sex"] = 0
+        if payload:
+            results.append(await self.gateway.execute("set_qq_profile", **payload))
         if longnick is not None:
-            results.append(await self.gateway.execute("set_self_longnick", longNick=str(longnick)[:120]))
+            results.append(await self.gateway.execute(
+                "set_self_longnick", longNick=str(longnick)[:120]))
         return results
+
+    async def login_info(self) -> dict[str, Any]:
+        """自己的账号信息（uin/昵称）——用来拼头像地址、确认身份。"""
+        payload = await self.gateway.execute("get_login_info")
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        return _json_safe(data) if isinstance(data, dict) else {}
+
+    async def profile_like(self, user_id: str | int | None = None,
+                           start: int = 0, count: int = 20) -> Any:
+        """资料卡点赞情况（谁给我点过赞）。"""
+        params: dict[str, Any] = {"start": int(start), "count": min(max(int(count), 1), 50)}
+        if user_id:
+            params["user_id"] = int(user_id)
+        return _json_safe(await self.gateway.execute("get_profile_like", **params))
+
+    @staticmethod
+    def avatar_url(user_id: str | int, size: int = 640) -> str:
+        """QQ 官方头像地址（没有"下载头像"的动作，但官方有固定 URL）。
+
+        插件做聊天卡片时本来就在用 q1.qlogo.cn，这里把它固化成可复用的入口。
+        """
+        return f"https://q1.qlogo.cn/g?b=qq&nk={int(user_id)}&s={int(size)}"
+
+    @staticmethod
+    def group_avatar_url(group_id: str | int, size: int = 640) -> str:
+        """群头像地址（同样走 q1.qlogo.cn）。"""
+        return f"https://p.qlogo.cn/gh/{int(group_id)}/{int(group_id)}/{int(size)}/"
 
     async def set_online_status(self, status: int = 0, ext_status: int = 0) -> Any:
         return await self.gateway.execute(
@@ -247,6 +289,74 @@ class QzoneService:
             session = self._session
             payload = {"hostUin": session["uin"], "uin": session["uin"], "g_tk": session["g_tk"], **data}
             return await self._poster(path, session["cookie"], payload)
+
+    async def friend_feeds(self, count: int = 10, page: int = 1) -> dict[str, Any]:
+        """好友动态（`get_qzone_feeds`）：返回 feeds[]，每项含作者 uin/昵称/时间/key/html。
+
+        注意：`key` 是 Qzone 的 feed 句柄，**不是 tid**——要对某条说说点赞/评论，
+        得先 `friend_posts(uin)` 拿那条说说的 tid。这里把 html 去掉（太长），
+        并把时间换算成可读文本，方便模型判断"这条是不是新的"。
+        """
+        payload = await self.gateway.execute(
+            "get_qzone_feeds", page_num=max(1, int(page)),
+            count=min(max(int(count), 1), 20))
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            return {"feeds": [], "has_more": False}
+        feeds = []
+        for item in (data.get("feeds") or []):
+            if not isinstance(item, dict):
+                continue
+            feeds.append({
+                "uin": item.get("uin"),
+                "nickname": str(item.get("nickname") or "")[:40],
+                "time": item.get("time"),
+                "appid": item.get("appid"),
+                "key": str(item.get("key") or "")[:200],
+                "is_taotao": int(item.get("appid") or 0) == 311,
+            })
+        return {"feeds": feeds, "has_more": bool(data.get("has_more"))}
+
+    async def friend_posts(self, uin: str | int, count: int = 10,
+                           pos: int = 0) -> list[dict[str, Any]]:
+        """某个好友的说说列表（`get_qzone_msg_list(target_uin=…)`）——拿 tid 用。"""
+        payload = await self.gateway.execute(
+            "get_qzone_msg_list", target_uin=int(uin),
+            pos=max(0, int(pos)), num=min(max(int(count), 1), 20))
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        rows = data.get("msglist") if isinstance(data, dict) else None
+        posts: list[dict[str, Any]] = []
+        for item in (rows or []):
+            if not isinstance(item, dict):
+                continue
+            posts.append({
+                "tid": str(item.get("tid") or ""),
+                "content": str(item.get("content") or "")[:200],
+                "created_time": item.get("created_time"),
+                "comment_count": item.get("comment_count"),
+                "like_count": item.get("like_count"),
+                "uin": uin,
+            })
+        return posts
+
+    async def like_friend_post(self, uin: str | int, tid: str,
+                               created_time: Any = None) -> Any:
+        """给**好友**的说说点赞（要 tid + target_uin + abstime）。"""
+        params: dict[str, Any] = {"tid": str(tid), "target_uin": int(uin)}
+        try:
+            if created_time is not None:
+                params["abstime"] = int(created_time)
+        except (TypeError, ValueError):
+            pass
+        return _json_safe(await self.gateway.execute("like_qzone", **params))
+
+    async def comment_friend_post(self, uin: str | int, tid: str, content: str) -> Any:
+        """评论**好友**的说说（要 tid + target_uin + content）。"""
+        text = str(content or "").strip()
+        if not text or len(text) > 500:
+            raise QzoneError("评论要 1-500 字")
+        return _json_safe(await self.gateway.execute(
+            "comment_qzone", tid=str(tid), content=text, target_uin=int(uin)))
 
     async def list_feeds(self, count: int = 10, uin: str | None = None) -> Any:
         try:

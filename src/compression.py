@@ -56,6 +56,28 @@ class CompressionService:
             created.append(await self.compress_l3(scope_id, episodes))
         return created
 
+    async def merge_summaries(self, scope_id: str,
+                              summary_ids: "Sequence[str]") -> SummaryRecord:
+        """把 bot **自己挑**的若干条同级摘要合并成一条更高层的（L1→L2、L2→L3）。
+
+        这是"压缩"的落地方式（用户要求优先走它）：内容没丢，只是变精炼；
+        层级规则跟自动 roll_up 一致——L1 合成 L2、L2 合成 L3；L3 已经是最顶层，
+        合并不了（调用方应该改走遗忘）。
+        """
+        records = await self.storage.get_summaries_by_ids(scope_id, summary_ids)
+        if len(records) < 2:
+            raise ValueError("压缩至少要两条摘要（少于两条就没什么可压的）")
+        levels = {int(item.level) for item in records}
+        if len(levels) != 1:
+            raise ValueError("只能合并同一层的摘要（L1 和 L2 不能混在一起压）")
+        level = levels.pop()
+        if level >= 3:
+            raise ValueError("L3 已经是最顶层的长期记忆，没法再往上压——"
+                             "真的没用就改用遗忘")
+        target = level + 1
+        return await self._compress_summaries(
+            scope_id, target, records, {level})
+
     async def _compress_summaries(self, scope_id: str, level: int, summaries: Sequence[SummaryRecord], allowed: set[int]) -> SummaryRecord:
         if not summaries or any(x.scope_id != scope_id or x.level not in allowed for x in summaries):
             raise ValueError(f"L{level} inputs must be same-scope lower-level summaries")
