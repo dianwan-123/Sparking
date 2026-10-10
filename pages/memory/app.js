@@ -1266,8 +1266,9 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         .map((g) => Number(g.input_chars || 0)));
       say(`共 ${report.groups.length} 个群、${report.messages} 条消息；` +
           `学到说话风格 ${report.style || 0} 条、黑话 ${report.lexicon || 0} 个；` +
-          `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条` +
-          (biggest ? `；单次喂给模型最多约 ${(biggest / 1000).toFixed(1)} 千字符`
+          `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条；` +
+          `模型调用 ${report.calls || 0} 次` +
+          (biggest ? `（单次最多约 ${(biggest / 1000).toFixed(1)} 千字符）`
                    : "（可在配置里调 import_learn_chars 加大单次输入量）"));
       (report.groups || []).forEach((group) => {
         const tag = group.whitelisted ? "白名单（含印象学习）" : "仅入库";
@@ -1283,6 +1284,7 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
             + (group.call_failed ? `，模型没调通 ${group.call_failed} 人` : "")
             + (group.failed ? `，写库失败 ${group.failed} 次` : "")
             + (group.provider ? `，用模型 ${group.provider}` : "")
+            + (group.calls ? `，模型调用 ${group.calls} 次` : "")
             + "）"
           : "";
         say(`  · ${group.name}（${group.group_id}）：${group.messages} 条 / ${group.people} 人 — ${tag}${culture}${learn}` +

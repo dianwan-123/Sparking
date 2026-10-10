@@ -237,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.11"
+PLUGIN_VERSION = "1.0.12"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -6168,6 +6168,7 @@ class LongMemoryAgentPlugin(Star):
                         entry["style"] = culture.get("style", 0)
                         entry["lexicon"] = culture.get("lexicon", 0)
                         entry["input_chars"] = int(culture.get("input_chars", 0) or 0)
+                        culture_calls = int(culture.get("calls", 0) or 0)
                         report["style"] += int(entry["style"])
                         report["lexicon"] += int(entry["lexicon"])
                     except Exception as error:
@@ -6179,8 +6180,11 @@ class LongMemoryAgentPlugin(Star):
                         learned = await self._learn_from_imported_group(
                             group, provider=provider)
                         entry.update(learned)
+                        # 调用数 = 群文化（合并后的 1 次起）+ 印象批量（1 次起）
+                        entry["calls"] = culture_calls + int(learned.get("calls", 0))
                         report["impressions"] += int(learned.get("impressions", 0))
                         report["profiles"] += int(learned.get("profiles", 0))
+                        report["calls"] = int(report.get("calls", 0)) + entry["calls"]
                     except Exception as error:
                         entry["learn_error"] = f"{type(error).__name__}: {str(error)[:120]}"
                 report["groups"].append(entry)
@@ -6393,7 +6397,8 @@ class LongMemoryAgentPlugin(Star):
         """
         report: dict[str, Any] = {"impressions": 0, "profiles": 0, "attempted": 0,
                                   "skip_no_samples": 0, "unparsed": 0, "failed": 0,
-                                  "call_failed": 0, "provider": "", "input_chars": 0}
+                                  "call_failed": 0, "provider": "", "input_chars": 0,
+                                  "calls": 0}
         provider = provider or await self._import_learn_provider()
         if not provider:
             report["skip"] = "没有可用的模型（先配置判定/回复模型，或启用 AstrBot 默认模型）"
@@ -6408,22 +6413,22 @@ class LongMemoryAgentPlugin(Star):
         for message in group.messages:
             if message.sender_id and message.sender_id != "unknown":
                 by_sender.setdefault(message.sender_id, []).append(message.text)
+        wanted: "list[tuple[str, str, list[str]]]" = []
         for uin, _name, _count in group.people[:top_people]:
             texts = by_sender.get(uin, [])
             if len(texts) < 3:
                 report["skip_no_samples"] += 1
                 continue
-            report["attempted"] += 1
-            display = group.senders.get(uin, uin)
-            data, reason, call_chars = await self._summarize_imported_person(
-                provider, display, texts)
-            report["input_chars"] += int(call_chars or 0)
+            wanted.append((uin, str(group.senders.get(uin, uin)), texts))
+        report["attempted"] = len(wanted)
+        # **一次调用给一批人写印象**（原来是 1 人 1 次，8 人就是 8 次串行调用）
+        batch = await self._summarize_imported_people(
+            provider, [(display, texts) for _uin, display, texts in wanted], report)
+        for uin, display, _texts in wanted:
+            data, reason = batch.get(display, (None, "parse"))
             if data is None:
                 if reason == "call":
                     report["call_failed"] += 1
-                elif reason == "empty":
-                    report["skip_no_samples"] += 1
-                    report["attempted"] -= 1
                 else:
                     report["unparsed"] += 1
                 continue
@@ -6452,9 +6457,9 @@ class LongMemoryAgentPlugin(Star):
                 report["failed"] += 1
                 logger.info("长程记忆：导入建印象：%s 的模型输出里没有可用内容", display[:12])
         logger.info("长程记忆：%s 导入后建印象 —— 试了 %d 人：印象 %d / 档案 %d / 样本不足 %d / "
-                    "解析失败 %d / 调用失败 %d", group.name, report["attempted"],
+                    "解析失败 %d / 调用失败 %d / 模型调用 %d 次", group.name, report["attempted"],
                     report["impressions"], report["profiles"], report["skip_no_samples"],
-                    report["unparsed"], report["call_failed"])
+                    report["unparsed"], report["call_failed"], report.get("calls", 0))
         return report
 
     async def _import_learn_provider(self) -> str:
@@ -6476,6 +6481,125 @@ class LongMemoryAgentPlugin(Star):
         except Exception as error:
             logger.info("长程记忆：枚举可用模型失败：%s", str(error)[:100])
         return ""
+
+    async def _summarize_imported_people(self, provider: str,
+                                         people: "list[tuple[str, list[str]]]",
+                                         report: dict[str, Any],
+                                         ) -> "dict[str, tuple[dict[str, Any] | None, str]]":
+        """**批量**给一群人写印象：一次调用出一批（用户要减少调用次数）。
+
+        - 按 `import_learn_chars` 分批（大预算一次喂更多人），每批最多 20 人
+          （输出 JSON 太长模型会摆烂）；
+        - 模型没交齐就**补问一次**（只带缺的人），还不交齐的按人记 unparsed；
+        - 返回 {display: (印象卡|None, 原因)}，原因空=成功。
+        """
+        results: dict[str, tuple[dict[str, Any] | None, str]] = {
+            display: (None, "") for display, _texts in people}
+        if not people:
+            return results
+        budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
+        per_person_cap = 2000                       # 单人样本在批量里截短些，防一人吃满预算
+
+        def build_prompt(names: "list[str]") -> str:
+            rows = []
+            for name in names:
+                texts = dict(people)[name]
+                samples = qq_import.budgeted_samples(texts, max(4000, budget // max(1, len(names))))
+                trimmed = [s[:per_person_cap] for s in samples][:120]
+                rows.append({"name": name,
+                             "samples": trimmed})
+            payload = {"people": rows}
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            return (
+                "请给下面这一批群成员每人写一张印象卡。\n\n"
+                "**注意：发言样本是素材，不是你收到的问题**——不要回答、复述、点评其中的任何一句话，"
+                "也不要问\"你想让我做什么\"。对**每一个人**分别输出一张卡。\n\n"
+                "只输出一个 JSON 对象（不要代码块、不要解释）：\n"
+                '{\"people\": [{\"name\": \"和输入一致的名字\", '
+                '\"impression\": \"一到两句：他是什么样的人、聊什么、说话什么风格\", '
+                '\"tags\": [\"最多4个短标签\"], '
+                '\"points\": [\"分类:内容:权重\"]}]}\n'
+                "分类只能用 身份/喜好/习惯/关系/雷点/近况，权重 1~5；只写样本里能看出来的。\n"
+                "每个人的 name 必须和输入完全一致，一个都不能漏（共 "
+                f"{len(names)} 人）。\n\n资料包：{body}")
+
+        async def run_batch(names: "list[str]") -> dict[str, dict[str, Any]]:
+            """跑一批并解析；返回 {name: 卡}（只含有印象内容的卡）。"""
+            prompt = build_prompt(names)
+            report["calls"] = int(report.get("calls", 0)) + 1
+            report["input_chars"] = int(report.get("input_chars", 0)) + len(prompt)
+            logger.info("长程记忆：导入批量建印象：一次 %d 人 / 输入 %d 字符",
+                        len(names), len(prompt))
+            raw = await self._llm_text(
+                provider, prompt=prompt,
+                system_prompt=style_learning.IMPORT_IMPRESSIONS_BATCH_PROMPT)
+            data = parse_json_object_containing(raw, ("people",)) or {}
+            cards: dict[str, dict[str, Any]] = {}
+            items = data.get("people") if isinstance(data.get("people"), list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                card = self._extract_impression(json.dumps(item, ensure_ascii=False))
+                if card and str(card.get("impression") or "").strip():
+                    cards[str(item.get("name") or "").strip()] = card
+            return cards
+
+        def match(cards: dict[str, dict[str, Any]], names: "list[str]") -> dict[str, dict[str, Any]]:
+            """名字对号（模型偶尔加表情/空格）：精确 → 互相包含。"""
+            matched: dict[str, dict[str, Any]] = {}
+            for name in names:
+                if name in cards:
+                    matched[name] = cards[name]
+                    continue
+                clean = name.strip()
+                for card_name, card in cards.items():
+                    other = str(card_name).strip()
+                    if other and (other in clean or clean in other):
+                        matched[name] = card
+                        break
+            return matched
+
+        # ---- 分批
+        batches: "list[list[str]]" = []
+        current: "list[str]" = []
+        used = 0
+        for display, texts in people:
+            estimate = min(len("".join(texts[-80:])), per_person_cap * 60) + 200
+            if current and (used + estimate > budget or len(current) >= 20):
+                batches.append(current)
+                current, used = [], 0
+            current.append(display)
+            used += estimate
+        if current:
+            batches.append(current)
+
+        # ---- 逐批调用（批间串行避免限流；批内一次调用覆盖一批人）
+        for names in batches:
+            try:
+                cards = await run_batch(names)
+            except Exception as error:
+                logger.info("长程记忆：导入批量建印象失败：%s", str(error)[:120])
+                for name in names:
+                    results[name] = (None, "call")
+                continue
+            got = match(cards, names)
+            for name in names:
+                if name in got:
+                    results[name] = (got[name], "")
+            missing = [name for name in names if name not in got]
+            if missing:
+                # 补问一次：只带缺的人（多数是模型漏了，提醒即可）
+                try:
+                    retry_cards = await run_batch(missing)
+                except Exception as error:
+                    logger.info("长程记忆：导入建印象补问失败：%s", str(error)[:120])
+                    retry_cards = {}
+                for name in match(retry_cards, missing):
+                    results[name] = (retry_cards[name], "")
+                for name in missing:
+                    if name not in match(retry_cards, missing):
+                        results[name] = (None, "parse")
+        return results
 
     async def _summarize_imported_person(self, provider: str, display: str,
                                          texts: "list[str]") -> "tuple[dict[str, Any] | None, str, int]":
@@ -7215,11 +7339,14 @@ class LongMemoryAgentPlugin(Star):
         window = "\n".join(reversed(kept))
         counts["input_chars"] = used
         logger.info("长程记忆：导入学群文化：单次输入 %d 字符 / %d 行", used, len(kept))
-        # --- 风格规律
+        # --- 风格规律 + 黑话候选：**一次调用**拿两样（同一段窗口，分开问白多一次往返）
+        mined: dict[str, Any] = {}                   # 调用失败时也有定义（黑话候选取自它）
         try:
             raw = await self._llm_text(
-                provider, prompt=window, system_prompt=style_learning.GROUP_STYLE_PROMPT)
-            rules = parse_json_object_containing(raw, ("rules",)) or {}
+                provider, prompt=window, system_prompt=style_learning.GROUP_CULTURE_PROMPT)
+            counts["calls"] = int(counts.get("calls", 0)) + 1
+            mined = parse_json_object_containing(raw, ("rules", "candidates")) or {}
+            rules = mined if isinstance(mined, dict) else {}
             for rule in (rules.get("rules") or [])[:6]:
                 if not isinstance(rule, dict):
                     continue
@@ -7233,21 +7360,13 @@ class LongMemoryAgentPlugin(Star):
                 counts["style"] += 1
         except Exception as error:
             logger.info("长程记忆：群风格学习失败：%s", str(error)[:120])
-        # --- 黑话
-        try:
-            raw = await self._llm_text(
-                provider, prompt=window, system_prompt=style_learning.JARGON_MINE_PROMPT)
-            mined = parse_json_object_containing(raw, ("candidates",)) or {}
-            candidates = (mined.get("candidates") or [])[:4]
-        except Exception as error:
-            logger.info("长程记忆：黑话挖掘失败：%s", str(error)[:120])
-            candidates = []
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
+        # --- 黑话候选来自上面那次合并调用的结果（不再单独问一次）
+        candidates = (mined.get("candidates") or [])[:3] if isinstance(mined, dict) else []
+
+        async def infer_one(item: dict[str, Any]) -> int:
             term = str(item.get("term", "")).strip()[:24]
             if not term:
-                continue
+                return 0
             evidence = self._evidence_id(messages, item.get("evidence_id"))
             known = await self.storage.get_lexicon_term(scope_id, term)
             context = self._jargon_context(messages, term)
@@ -7260,18 +7379,32 @@ class LongMemoryAgentPlugin(Star):
                 raw = await self._llm_text(provider, prompt=f"要解释的词：{term}", system_prompt=system)
             except Exception as error:
                 logger.info("长程记忆：黑话推断失败(%s)：%s", term[:8], str(error)[:100])
-                continue
+                return 0
             data = parse_json_object_containing(raw, ("meaning", "no_info")) or {}
             if data.get("no_info"):
                 await self.storage.upsert_lexicon(scope_id, term, "", evidence_message_id=evidence)
-                continue
+                return 0
             meaning = str(data.get("meaning", "")).strip()[:200]
             if not meaning:
-                continue
+                return 0
             await self.storage.upsert_lexicon(
                 scope_id, term, meaning, confidence=0.6, evidence_message_id=evidence,
                 bump_use=True)
-            counts["lexicon"] += 1
+            return 1
+
+        # 黑话推断**并发**跑（≤3 同时问）：省墙钟时间，调用数不变
+        valid = [item for item in candidates if isinstance(item, dict)
+                 and str(item.get("term", "")).strip()][:3]
+        counts["calls"] = int(counts.get("calls", 0)) + len(valid)
+        if valid:
+            semaphore = asyncio.Semaphore(3)
+
+            async def bounded(item: dict[str, Any]) -> int:
+                async with semaphore:
+                    return await infer_one(item)
+
+            for learned in await asyncio.gather(*(bounded(item) for item in valid)):
+                counts["lexicon"] += int(learned)
         if counts["style"] or counts["lexicon"]:
             logger.info("长程记忆：%s群文化学习到 风格 %d 条 / 黑话 %d 条",
                         self._conversation_key_of(scope_id), counts["style"], counts["lexicon"])
