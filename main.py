@@ -237,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.10"
+PLUGIN_VERSION = "1.0.11"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -6167,6 +6167,7 @@ class LongMemoryAgentPlugin(Star):
                             messages=await self._import_culture_window(scope_id, group))
                         entry["style"] = culture.get("style", 0)
                         entry["lexicon"] = culture.get("lexicon", 0)
+                        entry["input_chars"] = int(culture.get("input_chars", 0) or 0)
                         report["style"] += int(entry["style"])
                         report["lexicon"] += int(entry["lexicon"])
                     except Exception as error:
@@ -6201,15 +6202,23 @@ class LongMemoryAgentPlugin(Star):
         """
         if self.storage is None:
             return []
+        # 按预算估算需要多少条（每行 ≈ 发送者前缀 + 200 字正文）；
+        # recent_messages 有 200 条硬上限（那是给回复上下文设计的），
+        # 这里走 bulk 版本，最多 20000 条。
+        budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
+        limit = max(300, min(budget // 160, 20000))
         try:
-            limit = min(max(int(len(group.messages) or 0), 300), 600)
-            messages = await self.storage.recent_messages(scope_id, limit)
+            fetch = min(limit * 3, 20000)          # 多取一些（占位消息会被过滤掉）
+            messages = await self.storage.recent_messages_bulk(scope_id, fetch)
         except Exception:
-            return []
-        if len(messages) <= 300:
+            try:
+                messages = await self.storage.recent_messages(scope_id, min(limit, 200))
+            except Exception:
+                return []
+        if len(messages) <= limit:
             return messages
-        step = max(1, len(messages) // 300)
-        return messages[::step][:300]
+        step = max(1, len(messages) // limit)
+        return messages[::step][:limit]
 
     async def import_chatlog_abort(self, upload_id: str) -> dict[str, Any]:
         self._import_part_path(upload_id).unlink(missing_ok=True)
@@ -6384,7 +6393,7 @@ class LongMemoryAgentPlugin(Star):
         """
         report: dict[str, Any] = {"impressions": 0, "profiles": 0, "attempted": 0,
                                   "skip_no_samples": 0, "unparsed": 0, "failed": 0,
-                                  "call_failed": 0, "provider": ""}
+                                  "call_failed": 0, "provider": "", "input_chars": 0}
         provider = provider or await self._import_learn_provider()
         if not provider:
             report["skip"] = "没有可用的模型（先配置判定/回复模型，或启用 AstrBot 默认模型）"
@@ -6406,7 +6415,9 @@ class LongMemoryAgentPlugin(Star):
                 continue
             report["attempted"] += 1
             display = group.senders.get(uin, uin)
-            data, reason = await self._summarize_imported_person(provider, display, texts)
+            data, reason, call_chars = await self._summarize_imported_person(
+                provider, display, texts)
+            report["input_chars"] += int(call_chars or 0)
             if data is None:
                 if reason == "call":
                     report["call_failed"] += 1
@@ -6467,10 +6478,10 @@ class LongMemoryAgentPlugin(Star):
         return ""
 
     async def _summarize_imported_person(self, provider: str, display: str,
-                                         texts: "list[str]") -> "tuple[dict[str, Any] | None, str]":
+                                         texts: "list[str]") -> "tuple[dict[str, Any] | None, str, int]":
         """让模型给导入语料里的某个人写印象。
 
-        返回 (数据, 失败原因)；`原因` 为空表示成功，其余取值：
+        返回 (数据, 失败原因, 单次输入字符数)；`原因` 为空表示成功，其余取值：
         ``call``（模型没调通）、``empty``（样本没信息量）、``parse``（输出不是 JSON）。
 
         实录（用户第一次导入，8/8 全废）：原来的用户消息是一坨裸 JSON，
@@ -6478,12 +6489,17 @@ class LongMemoryAgentPlugin(Star):
         当成"用户发来的东西"去回答（样本里提到德国劳动法，它就讲德国劳动法）。
         现在把任务交代写进用户消息，并挑真正有信息量的样本（见 usable_samples）。
         """
-        samples = qq_import.usable_samples(texts)          # 60~120 条，越多越准
+        # 按预算填充（import_learn_chars，独立于正常回复的上下文预算）：
+        # 用户实测"每次输入只有几千字符"——原来是写死的 60~120 条 × 100 字。
+        budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
+        samples = qq_import.budgeted_samples(texts, budget)
         if not samples:
-            return None, "empty"
+            return None, "empty", 0
         prompt = style_learning.IMPORT_IMPRESSION_TASK.format(
             name=display, count=len(samples),
             samples="\n".join(f"[{index}] {text}" for index, text in enumerate(samples, 1)))
+        logger.info("长程记忆：导入建印象 %s：单次输入 %d 字符 / %d 条样本",
+                    display[:12], len(prompt), len(samples))
         keys = ("impression", "印象", "text", "summary", "data", "result", "person")
         try:
             raw = await self._llm_text(
@@ -6491,7 +6507,7 @@ class LongMemoryAgentPlugin(Star):
                 system_prompt=style_learning.IMPORT_IMPRESSION_PROMPT)
         except Exception as error:
             logger.info("长程记忆：导入建印象的模型调用失败(%s)：%s", display[:12], str(error)[:120])
-            return None, "call"
+            return None, "call", len(prompt)
         data = self._extract_impression(raw)
         if data is None:
             # 模型话多没给 JSON：把它的原话塞回去，明确只要 JSON，再问一次
@@ -6505,13 +6521,13 @@ class LongMemoryAgentPlugin(Star):
                     system_prompt=style_learning.IMPORT_IMPRESSION_PROMPT)
             except Exception as error:
                 logger.info("长程记忆：导入建印象重问失败(%s)：%s", display[:12], str(error)[:120])
-                return None, "call"
+                return None, "call", len(prompt)
             data = self._extract_impression(raw2)
         if data is None:
             logger.info("长程记忆：导入建印象：%s 的模型输出解析不了（原文头：%s）",
                         display[:12], str(raw or "")[:120].replace("\n", " "))
-            return None, "parse"
-        return data, ""
+            return None, "parse", len(prompt)
+        return data, "", len(prompt)
 
     @staticmethod
     def _extract_impression(raw: Any) -> dict[str, Any] | None:
@@ -7184,10 +7200,21 @@ class LongMemoryAgentPlugin(Star):
             if len(qq_import.usable_samples([text], 1)) == 0:
                 continue
             who = "SELF" if str(item.sender_id) == str(getattr(self, "_self_id_hint", "")) else str(item.sender_name or "群友")
-            lines.append(f"[来源:{index}] {who}：{text[:120]}")
+            lines.append(f"[来源:{index}] {who}：{text[:200]}")
         if len(lines) < 8:
             return counts
-        window = "\n".join(lines[-120:])
+        # 按预算截窗口（不再写死 120 行）：预算大就多喂，用户要的是"每次输入很多消息"
+        budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
+        kept: list[str] = []
+        used = 0
+        for line in reversed(lines):                 # 新的在前，超预算就丢更旧的
+            if used + len(line) > budget and kept:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        window = "\n".join(reversed(kept))
+        counts["input_chars"] = used
+        logger.info("长程记忆：导入学群文化：单次输入 %d 字符 / %d 行", used, len(kept))
         # --- 风格规律
         try:
             raw = await self._llm_text(

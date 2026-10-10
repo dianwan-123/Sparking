@@ -1262,12 +1262,17 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         upload_id: uploadId, filename: file.name, learn,
       });
       say("");
+      const biggest = Math.max(0, ...(report.groups || [])
+        .map((g) => Number(g.input_chars || 0)));
       say(`共 ${report.groups.length} 个群、${report.messages} 条消息；` +
           `学到说话风格 ${report.style || 0} 条、黑话 ${report.lexicon || 0} 个；` +
-          `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条`);
+          `新建/更新印象 ${report.impressions} 条、人物档案 ${report.profiles} 条` +
+          (biggest ? `；单次喂给模型最多约 ${(biggest / 1000).toFixed(1)} 千字符`
+                   : "（可在配置里调 import_learn_chars 加大单次输入量）"));
       (report.groups || []).forEach((group) => {
         const tag = group.whitelisted ? "白名单（含印象学习）" : "仅入库";
         const culture = `；风格 ${group.style || 0} 条 / 黑话 ${group.lexicon || 0} 个`
+          + (group.input_chars ? `（单次输入约 ${(group.input_chars / 1000).toFixed(1)} 千字符）` : "")
           + (group.culture_skip ? ` ⚠ ${group.culture_skip}` : "")
           + (group.culture_error ? ` ⚠ ${group.culture_error}` : "");
         const learn = group.whitelisted

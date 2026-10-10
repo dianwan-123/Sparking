@@ -267,10 +267,73 @@ class QzoneService:
         )
         return _json_safe(result)
 
-    # 发说说的去重/冷却状态（跨调用保留；进程重启后从头算，代价可接受）
+    # 发说说的去重/冷却状态（历史落盘：重启也不忘，否则重启后又发一遍同样的）
     _publish_history: "list[tuple[float, str]]" = []
     _PUBLISH_COOLDOWN_SECONDS = 900.0      # 15 分钟内不再发第二条
-    _PUBLISH_SIMILAR_RATIO = 0.72          # 与近 10 条相似度超过这个就不发
+    _PUBLISH_SIMILAR_RATIO = 0.72          # 与近期相似度超过这个就不发
+    _PUBLISH_WINDOW_SECONDS = 48 * 3600.0  # 去重与话题统计都看最近 48 小时
+    _PUBLISH_TOPIC_HITS = 2                # 同一个词在近 8 条里出现 ≥2 次 = 同一话题
+    _PUBLISH_DAILY_CAP = 8                 # 24 小时最多发几条（真人也就这个量级）
+    _history_path: "str | None" = None
+
+    # 常见虚词/时间词的 2-gram：它们重合不代表同话题（"今天""就是"谁都天天说）
+    _STOP_BIGRAMS = frozenset({
+        "今天", "昨天", "明天", "现在", "然后", "但是", "可是", "就是", "还是",
+        "真的", "感觉", "有点", "一下", "自己", "我们", "你们", "他们", "这个",
+        "那个", "什么", "怎么", "可以", "已经", "应该", "不要", "没有", "一个",
+        "时候", "因为", "所以", "如果", "虽然", "而且", "起来", "过来", "出来",
+        "这样", "那样", "再来", "再去", "想去", "要去", "好想", "真是", "突然",
+        "终于", "其实", "只是", "不过", "不如", "不如", "下次", "这次", "这次",
+    })
+
+    @classmethod
+    def set_history_path(cls, path: "str | None") -> None:
+        """把发布历史落盘到文件（main 启动时传入插件数据目录）。"""
+        cls._history_path = str(path) if path else None
+        cls._publish_history = cls._load_history()
+
+    @classmethod
+    def _load_history(cls) -> "list[tuple[float, str]]":
+        import json as _json
+
+        if not cls._history_path:
+            return list(cls._publish_history)
+        try:
+            with open(cls._history_path, "r", encoding="utf-8") as handle:
+                rows = _json.load(handle)
+            out = []
+            for row in rows if isinstance(rows, list) else []:
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    out.append((float(row[0]), str(row[1])))
+            return out[-64:]
+        except Exception:
+            return list(cls._publish_history)
+
+    @classmethod
+    def _save_history(cls) -> None:
+        import json as _json
+
+        if not cls._history_path:
+            return
+        try:
+            with open(cls._history_path, "w", encoding="utf-8") as handle:
+                _json.dump(cls._publish_history[-64:], handle, ensure_ascii=False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _content_bigrams(text: str) -> "set[str]":
+        """说说里的"内容词"碎片（2-gram，去掉虚词/标点/空白/纯字母数字）。
+
+        用来做**话题级**判断："松饼要热的 唱两句再说"和"松饼还没吃够"措辞不同，
+        但"松饼"这个碎片是同一个——同话题换说法就靠它抓。
+        """
+        cleaned = "".join(
+            char for char in str(text or "")
+            if char not in "，。！？、；：~～（）()【】[]「」…—\n\r\t 0123456789"
+            and not ("a" <= char.lower() <= "z"))
+        grams = {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+        return {gram for gram in grams if gram not in QzoneService._STOP_BIGRAMS}
 
     @staticmethod
     def _similarity(left: str, right: str) -> float:
@@ -289,21 +352,46 @@ class QzoneService:
     def _publish_blocker(self, text: str) -> str:
         """该不该拦这条说说？返回空串=可以发，否则一句人话原因。
 
-        实录（用户）："bot 会把一件事反复发几次空间"——同一件事被它当成新灵感反复发。
-        真人不会这样，所以这里拦下来并告诉它为什么（它好换点别的说）。
+        实录（用户）："bot 会把一件事反复发几次空间"——同一件事被它当成新灵感反复发；
+        v1.0.11 又发现"同话题换说法"也躲过了旧守卫（"松饼要热的 唱两句再说" vs
+        "松饼还没吃够"，2-gram 重合率才 0.3，但话题是同一个）。真人不会这样发。
         """
-        now = time.monotonic()
-        QzoneService._publish_history = [
-            item for item in QzoneService._publish_history
-            if now - item[0] < 3600
+        now = time.time()          # 墙钟：历史要落盘跨重启，monotonic 重启后失义
+        history = [
+            (stamp, body) for stamp, body in QzoneService._publish_history
+            if now - stamp < QzoneService._PUBLISH_WINDOW_SECONDS
         ]
-        recent = QzoneService._publish_history
-        for _stamp, previous in recent[-10:]:
+        QzoneService._publish_history = history
+        recent = history[-10:]
+
+        # ① 近似重复（措辞像的）
+        for _stamp, previous in recent:
             if self._similarity(text, previous) >= self._PUBLISH_SIMILAR_RATIO:
                 return ("这件事你刚发过一条很像的说说，别再重复发了——"
                         "想发就换个别的、真的新的内容，或者干脆这次不发。")
-        if recent:
-            waited = now - recent[-1][0]
+
+        # ② 话题级重复（措辞不同但讲的是同一件事）
+        grams = self._content_bigrams(text)
+        if grams:
+            best_word, best_hits = "", 0
+            for gram in grams:
+                hits = sum(1 for _stamp, previous in history[-8:]
+                           if gram in previous)
+                if hits > best_hits:
+                    best_word, best_hits = gram, hits
+            if best_hits >= QzoneService._PUBLISH_TOPIC_HITS:
+                return (f"「{best_word}」这个话题你最近已经发过 {best_hits} 条说说了，"
+                        "别再围着同一件事转——要么聊点别的，要么这次不发。")
+
+        # ③ 每日上限（真人一天也就几条）
+        day_count = sum(1 for stamp, _body in history if now - stamp < 86400)
+        if day_count >= QzoneService._PUBLISH_DAILY_CAP:
+            return (f"你今天已经发过 {day_count} 条说说了，歇歇吧——"
+                    "明天再发也一样，别刷屏。")
+
+        # ④ 冷却
+        if history:
+            waited = now - history[-1][0]
             left = self._PUBLISH_COOLDOWN_SECONDS - waited
             if left > 0:
                 return (f"你 {int(waited // 60)} 分钟前刚发过说说，"
@@ -322,7 +410,9 @@ class QzoneService:
             if images:
                 params["images"] = [str(x)[:500] for x in images[:9]]
             result = await self.gateway.execute("send_qzone_msg", **params)
-            QzoneService._publish_history.append((time.monotonic(), text))
+            QzoneService._publish_history.append((time.time(), text))
+            QzoneService._publish_history = QzoneService._publish_history[-64:]
+            QzoneService._save_history()
             tid = ""
             if isinstance(result, dict):
                 tid = str(result.get("tid") or (result.get("data") or {}).get("tid", ""))

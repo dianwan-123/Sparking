@@ -275,20 +275,15 @@ def parse_export_folder(folder: Path, *, max_messages: int = 0) -> ImportedGroup
 _PLACEHOLDER_TEXT = frozenset(_ELEMENT_PLACEHOLDER.values())
 
 
-# 给模型看一个人：样本越多越准（用户明确要求 60~120 条，不怕耗上下文）
+# 给模型看一个人：样本越多越准（不怕耗上下文——预算由 import_learn_chars 控制）
 SAMPLE_MIN = 60
 SAMPLE_MAX = 120
+# 导入学习单条样本的长度上限（太长的话大多是刷屏/长文，信息密度低）
+SAMPLE_PER_MESSAGE = 200
 
 
-def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
-                   *, min_count: int = SAMPLE_MIN) -> list[str]:
-    """挑出真正能看出「这个人是什么样」的发言样本。
-
-    实录：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
-    模型只能回一句"你发的是聊天记录片段，想让我做什么？"——样本本身没信息量。
-    这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾），
-    数量尽量落在 60~120 条之间；可用样本不足时有多少用多少。
-    """
+def _usable_texts(texts: Iterable[str], per_message: int) -> list[str]:
+    """丢掉纯占位与太短的，剩下的按 per_message 截短。"""
     usable: list[str] = []
     for raw in texts:
         text = " ".join(str(raw or "").split())
@@ -299,16 +294,45 @@ def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
             stripped = stripped.replace(token, "")
         if len(stripped.strip(" ：:，,。.！!？?~～、")) < 4:
             continue
-        usable.append(text[:100])
-    if len(usable) <= limit:
-        return usable
-    # 均匀取样：先按上限抽，若抽出来不足下限，说明步长太大 → 缩小步长重抽
-    step = max(1, len(usable) // limit)
-    picked = usable[::step][:limit]
+        usable.append(text[:per_message])
+    return usable
+
+
+def _spread(items: list[str], limit: int, min_count: int) -> list[str]:
+    """从整段历史里均匀取样（不是只取末尾）。"""
+    if len(items) <= limit:
+        return list(items)
+    step = max(1, len(items) // limit)
+    picked = items[::step][:limit]
     if len(picked) < min_count:
-        step = max(1, len(usable) // min_count)
-        picked = usable[::step][:limit]
+        step = max(1, len(items) // min_count)
+        picked = items[::step][:limit]
     return picked
+
+
+def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
+                   *, min_count: int = SAMPLE_MIN) -> list[str]:
+    """挑出真正能看出「这个人是什么样」的发言样本（按**条数**上限，老接口）。
+
+    实录：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
+    模型只能回一句"你发的是聊天记录片段，想让我做什么？"——样本本身没信息量。
+    这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾）。
+    """
+    return _spread(_usable_texts(texts, 100), limit, min_count)
+
+
+def budgeted_samples(texts: Iterable[str], char_budget: int, *,
+                     min_count: int = SAMPLE_MIN,
+                     max_count: int = 8000) -> list[str]:
+    """按**字符预算**取样：预算大就多喂（用户要的"每次输入很多消息"）。
+
+    条数 = 预算 ÷ 每条上限（SAMPLE_PER_MESSAGE），再夹在 [min_count, max_count]。
+    这样把 `import_learn_chars` 设到模型最大上下文时，一次就能喂几百上千条。
+    """
+    budget = max(4000, int(char_budget or 0))
+    count = budget // SAMPLE_PER_MESSAGE
+    count = max(min_count, min(int(count), int(max_count)))
+    return _spread(_usable_texts(texts, SAMPLE_PER_MESSAGE), count, min_count)
 
 
 def discover_groups(root: Path, *, max_messages: int = 0) -> list[ImportedGroup]:

@@ -329,6 +329,11 @@
     "description": "聊天生动性：话说到一半对方一直不回时，按节奏追问（越等越急、最多追问 4 次、静默时段不发、对方一回来立刻清空）",
     "default": true
   },
+  "import_learn_chars": {
+    "type": "int",
+    "description": "快速学习（导入聊天记录）单次喂给模型的字符上限，**独立于正常回复的上下文预算**——可以设到模型支持的最大上下文（如 100 万 token 的模型可设 50 万～90 万）。设得越大，一次导入学得越多、API 调用次数越少",
+    "default": 96000
+  },
   "browser_auto_install": {
     "type": "bool",
     "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；关闭后仅检测上报",

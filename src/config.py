@@ -87,6 +87,7 @@ class PluginConfig:
     style_learn_hours: int
     system_prompt_folding: str
     enable_silence_followup: bool
+    import_learn_chars: int
     auto_install_deps: bool
     browser_headful: bool
     browser_auto_install: bool
@@ -193,6 +194,8 @@ class PluginConfig:
             style_learn_hours=_int(d.get("style_learn_hours"), 3, 0, 168),
             system_prompt_folding=_mode(d.get("system_prompt_folding")),
             enable_silence_followup=bool(d.get("enable_silence_followup", True)),
+            # 快速学习单次喂给模型的字符预算（独立于正常回复的 context_char_budget）
+            import_learn_chars=_int(d.get("import_learn_chars"), 96000, 4000, 2000000),
             auto_install_deps=bool(d.get("auto_install_deps", True)),
             browser_headful=bool(d.get("browser_headful", False)),
             browser_auto_install=bool(d.get("browser_auto_install", True)),

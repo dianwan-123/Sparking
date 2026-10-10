@@ -494,6 +494,25 @@ class Storage:
         )
         return [_stored(row) for row in reversed(rows)]
 
+    async def recent_messages_bulk(self, scope_id: str, limit: int = 2000) -> list[StoredMessage]:
+        """一次取一大批消息（导入学习用）——`recent_messages` 有 200 条的硬上限，
+        那是给"回复上下文"设计的；快速学习要喂几万字符，得绕开它。"""
+        limit = min(max(int(limit), 1), 20000)
+        clause = (" AND mc.scope_seq<?", []) if False else ("", [])
+        rows = await self._fetchall(
+            "SELECT mi.message_id,mr.revision_id,mi.scope_id,mc.scope_seq,"
+            "mi.upstream_message_id,mr.sender_id,mr.sender_name,mr.text,mr.occurred_at,"
+            "mr.parts_json,mr.reply_to "
+            "FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id "
+            "JOIN message_revisions mr ON mr.revision_id=mc.revision_id "
+            "JOIN event_headers eh ON eh.event_id=mr.event_id "
+            "WHERE mi.scope_id=? AND mc.is_deleted=0 "
+            "AND (eh.event_type NOT LIKE 'notice.%' AND eh.event_type NOT LIKE 'request.%') "
+            + clause[0] + "ORDER BY mc.scope_seq DESC LIMIT ?",
+            (scope_id, *clause[1], limit),
+        )
+        return [_stored(row) for row in reversed(rows)]
+
     async def recent_events(self, scope_ids: str | Sequence[str], limit: int = 20) -> list[StoredMessage]:
         """Latest notice/request records; these are query-only, never auto-injected."""
         scopes = [scope_ids] if isinstance(scope_ids, str) else [s for s in scope_ids if s]
