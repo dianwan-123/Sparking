@@ -237,7 +237,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.9"
+PLUGIN_VERSION = "1.0.10"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -6934,16 +6934,84 @@ class LongMemoryAgentPlugin(Star):
     async def _script_memory_note(self, text: str) -> None:
         await self._studio_note(text, "script")
 
+    async def _note_own_message(self, conversation: str, text: str,
+                                *, account: str = "") -> None:
+        """把**我们自己主动发出去**的话记进记忆（`self:` 前缀）。
+
+        实录（用户截图）：bot 说"刚还在潜水呢 冒个泡"，紧接着又评论
+        "刚说冒泡 这泡冒得有点慢 是不是又沉下去了"——它在评论自己刚说的话。
+        真因是所有主动发送路径（工具/自主循环/日程/拓展/追问）都没记自己的话，
+        于是下一轮看到 QQ 回显的那条，就当成"别人说的"了。
+
+        这里做的是"发送即记账"：发出去什么就记什么，下一轮它自己就能看见。
+        """
+        body = " ".join(str(text or "").split())[:2000]
+        if not body or self.ingest is None or self.storage is None:
+            return
+        conversation = str(conversation or "").strip()
+        if not conversation:
+            return
+        try:
+            from .src.models import NormalizedMessage
+
+            self_id = str(self._self_id() or "")
+            # **账号要跟这个会话原本的账号一致**，否则会新建一个 account_id='self'
+            # 的平行会话：自己发的话记到另一个 scope 里，等于没记（实录踩过）。
+            account_id = str(account or "").strip()
+            if not account_id:
+                account_id = await self._account_for_conversation(conversation)
+            scope_id = await self.storage.resolve_scope("aiocqhttp", account_id, conversation)
+            if not scope_id:
+                scope_id = await self.storage.get_or_create_scope(
+                    "aiocqhttp", account_id, conversation)
+            stamp = datetime.now(timezone.utc).isoformat()
+            # 幂等键带时间戳：同一句话在不同时间说是两条（同一时刻重复记账才算重复）
+            await self.ingest.ingest(NormalizedMessage(
+                platform="aiocqhttp", account_id=account_id,
+                conversation_id=conversation,
+                upstream_message_id=f"self:out:{int(time.time() * 1000)}",
+                sender_id=self_id or "self", sender_name="我",
+                text=body, occurred_at=stamp,
+                raw_event={"self": True, "outbound": True},
+                parts=[], event_type="message.created",
+            ), f"self-out:{scope_id}:{int(time.time() * 1000)}")
+            self._known_scopes.setdefault(conversation, scope_id)
+        except Exception as error:
+            logger.info("长程记忆：记录自己发出的消息失败（不影响发送）：%s",
+                        str(error)[:120])
+
+    async def _account_for_conversation(self, conversation: str) -> str:
+        """按会话号反查它属于哪个账号（bot 自己的号）——写记忆时必须用同一个。
+
+        实录：曾经直接用 `_self_id()`（拿不到就是空/self）当账号，结果给自己发的话
+        建了一个平行会话，等于没记。这里优先用插件已知的会话，再退回 self_id。
+        """
+        conversation = str(conversation or "").strip()
+        if not conversation:
+            return str(self._self_id() or "self")
+        if self.storage is not None:
+            try:
+                for row in await self.storage.all_scopes("aiocqhttp"):
+                    if str(row.get("conversation_id") or "") == conversation:
+                        found = str(row.get("account_id") or "")
+                        if found:
+                            return found
+            except Exception:
+                pass
+        return str(self._self_id() or "self")
+
     async def _script_send_group(self, group_id: str, text: str) -> None:
         if not self.settings.allows_group(group_id):
             raise ScriptExtensionError(f"群 {group_id} 不在白名单，拒绝发送")
         if self.gateway is None:
             raise ScriptExtensionError("QQ 通道未就绪")
         self._bind_gateway_client()
+        clean = _bubble_text(self._sanitize_outgoing(text))
         await self.gateway.execute(
             "send_group_msg", group_id=int(group_id),
-            message=[{"type": "text", "data": {"text": _bubble_text(
-                self._sanitize_outgoing(text))}}])
+            message=[{"type": "text", "data": {"text": clean}}])
+        # 发出去的话要记进记忆，否则它下一轮会把自己的话当成别人说的
+        await self._note_own_message(str(group_id), clean)
 
     async def _script_run_program(self, program_id: str, code: str,
                                   title: str, description: str) -> dict[str, Any]:
@@ -6981,13 +7049,15 @@ class LongMemoryAgentPlugin(Star):
         return str(result["media_id"])
 
     async def _script_send_private(self, user_id: str, text: str) -> None:
+        # 私聊主动发言也记账（与 _script_send_group 同理）
         if self.gateway is None:
             raise ScriptExtensionError("QQ 通道未就绪")
         self._bind_gateway_client()
+        clean = _bubble_text(self._sanitize_outgoing(text))
         await self.gateway.execute(
             "send_private_msg", user_id=int(user_id),
-            message=[{"type": "text", "data": {"text": _bubble_text(
-                self._sanitize_outgoing(text))}}])
+            message=[{"type": "text", "data": {"text": clean}}])
+        await self._note_own_message(f"private:{user_id}", clean)
 
     def _standing_orders_block(self) -> str:
         """常备指令（OpenClaw standing orders）：每轮注入的持久行动授权。"""
@@ -8761,8 +8831,12 @@ class LongMemoryAgentPlugin(Star):
         current_group = str(event.get_group_id() or "")
         if current_group:
             group_id = current_group
-        return (compact_json(await self.qq.send_group(
-            group_id, [{"type": "text", "data": {"text": _bubble_text(text)}}]), 4000))
+        bubble = _bubble_text(self._sanitize_outgoing(text))
+        result = await self.qq.send_group(
+            group_id, [{"type": "text", "data": {"text": bubble}}])
+        # 发出去的话要记进记忆（否则下一轮它把自己的话当成别人说的）
+        await self._note_own_message(str(group_id), bubble)
+        return compact_json(result, 4000)
 
     @filter.llm_tool(name="qq_send_private")
     async def qq_send_private_tool(self, event: AstrMessageEvent, user_id: str, text: str):
@@ -8773,8 +8847,11 @@ class LongMemoryAgentPlugin(Star):
             text(string): 消息文本，最长1200字。
         """
         self._require_qq(event)
-        return (compact_json(await self.qq.send_private(
-            user_id, [{"type": "text", "data": {"text": _bubble_text(text)}}]), 4000))
+        bubble = _bubble_text(self._sanitize_outgoing(text))
+        result = await self.qq.send_private(
+            user_id, [{"type": "text", "data": {"text": bubble}}])
+        await self._note_own_message(f"private:{user_id}", bubble)
+        return compact_json(result, 4000)
 
     @filter.llm_tool(name="qq_handle_friend_request")
     async def qq_friend_request_tool(self, event: AstrMessageEvent, flag: str, approve: bool = True, remark: str = ""):
@@ -9537,6 +9614,8 @@ class LongMemoryAgentPlugin(Star):
             await self._send_segment(event, {"action": "text", "text": bubble})
         except Exception as error:
             return f"发送失败：{str(error)[:120]}"
+        # 过程消息也是"我说的话"，记进记忆（否则下一轮它不认）
+        await self._note_own_message(self._conversation_key(event), bubble)
         return "已发送一条过程消息"
 
     @filter.llm_tool(name="ask_user")

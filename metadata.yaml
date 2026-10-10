@@ -6,7 +6,7 @@ desc: |
   它会像人一样短句连发地聊天、记得你说过的每句话、情绪随聊天起落，
   自己发表情包、看得懂合并聊天记录，也会不等你 @ 就主动接话、挂人、打理心情；
   记忆跨群共享——同一个人在各个群只有一份印象，A 群的老梗在私聊里也接得上。
-version: v1.0.9
+version: v1.0.10
 author: Rikka0612
 repo: https://github.com/dianwan-123/Sparking
 astrbot_version: ">=4.27,<5"
