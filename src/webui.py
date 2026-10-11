@@ -98,8 +98,11 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("extension_reload", "重载拓展"),
     ("extension_config_save", "保存拓展配置"),
     ("scope_tag_save", "保存群标签"),
+    ("group_config_save", "保存群配置"),
     ("memory_edit_by_bot", "让 bot 改一条记忆"),
     ("extension_config_reset", "恢复拓展默认配置"),
+    ("extension_upload", "上传自定义拓展（zip）"),
+    ("extension_delete", "删除用户上传的拓展"),
     ("compress", "压缩记忆"),
     ("reflect", "让 bot 自我总结"),
     ("backup", "备份"),
@@ -161,6 +164,24 @@ class PageAPI:
             raise WebUIError("存储未就绪")
         return storage
 
+    def _script_manager(self):
+        """取 scripts 拓展管理器。
+
+        管理器是**惰性创建**的（host._script_manager() 里 new），直接读
+        host._scripts 在没有别的代码路径碰过它时是 None——控制台会误报
+        "脚本拓展未启用"，上传/删除/配置全都做不了。这里统一走工厂方法。
+        """
+        factory = getattr(self.host, "_script_manager", None)
+        if callable(factory):
+            try:
+                manager = factory()
+            except Exception as error:
+                raise WebUIError(f"拓展管理器不可用：{error}") from error
+            if manager is not None:
+                return manager
+        manager = self._script_manager()
+        return manager
+
     def _known_scopes(self) -> dict[str, str]:
         return dict(getattr(self.host, "_known_scopes", {}) or {})
 
@@ -201,7 +222,10 @@ class PageAPI:
         mood = getattr(getattr(self.host, "mood", None), "get", lambda: None)()
         plans = await storage.pending_plans(10)
         scripts = None
-        manager = getattr(self.host, "_scripts", None)
+        try:
+            manager = self._script_manager()
+        except WebUIError:
+            manager = None
         if manager is not None:
             try:
                 scripts = {
@@ -248,11 +272,18 @@ class PageAPI:
                 continue
             stats = await self.storage.stats(scope)
             tail = await self.storage.recent_messages(scope, 1)
+            config = await self.storage.get_group_config(scope)
             out.append({
                 "group_id": conversation,
                 "scope_id": scope,
                 "display_name": str(row.get("display_name") or ""),
                 "tag": str(row.get("tag") or ""),
+                "activity": config.get("activity", -1),
+                "reply_rate": config.get("reply_rate", -1),
+                "cooldown_scale": config.get("cooldown_scale", -1),
+                "quiet_hours": config.get("quiet_hours", ""),
+                "max_actions_per_hour": config.get("max_actions_per_hour", -1),
+                "note": config.get("note", ""),
                 "messages": stats.get("message_identities", 0),
                 "summaries": stats.get("summary_nodes", 0),
                 "memories": stats.get("memory_items", 0),
@@ -633,7 +664,10 @@ class PageAPI:
         return {"count": total, "items": out}
 
     async def _read_extensions(self, query: Mapping[str, Any]) -> dict[str, Any]:
-        manager = getattr(self.host, "_scripts", None)
+        try:
+            manager = self._script_manager()
+        except WebUIError:
+            manager = None
         registry = getattr(self.host, "_extensions", None)
         bundles = []
         if registry is not None:
@@ -648,6 +682,11 @@ class PageAPI:
                 scripts = list(manager.list())
             except Exception:
                 scripts = []
+        for row in scripts:
+            origin = str(row.get("origin") or "builtin")
+            row["deletable"] = origin == "uploaded"
+            row["origin_label"] = {"builtin": "插件自带", "learned": "自学习技能",
+                                   "uploaded": "用户上传"}.get(origin, origin)
         return {"bundles": bundles, "scripts": scripts}
 
     async def _read_capabilities(self, query: Mapping[str, Any]) -> dict[str, Any]:
@@ -1398,7 +1437,10 @@ class PageAPI:
         if not extension_id:
             raise WebUIError("缺少 id")
         want_enabled = bool(body.get("enabled", True))
-        manager = getattr(self.host, "_scripts", None)
+        try:
+            manager = self._script_manager()
+        except WebUIError:
+            manager = None
         # 先看 scripts 拓展（它们有自己的启用状态，能声明默认关闭）
         if manager is not None and manager.get(extension_id) is not None:
             manager.set_enabled(extension_id, want_enabled)
@@ -1469,6 +1511,39 @@ class PageAPI:
         return {"ok": True, "reply": reply, "changed": bool(changed),
                 "action": act}
 
+    async def _do_group_config_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """保存一个群的专属配置（标签/活跃度/回复概率/冷却倍率/静默时段/上限/备注）。"""
+        scope = str(body.get("scope_id") or "").strip()
+        if not scope:
+            _group, scope = self._scope_of(body)
+        if not scope:
+            raise WebUIError("缺少 scope_id 或 group_id")
+        values: dict[str, Any] = {}
+        for key in ("tag", "quiet_hours", "note"):
+            if key in body and body.get(key) is not None:
+                values[key] = str(body.get(key) or "")
+        for key in ("activity", "reply_rate", "cooldown_scale"):
+            if key in body and str(body.get(key, "")).strip() not in ("", "None"):
+                try:
+                    values[key] = float(body.get(key))
+                except (TypeError, ValueError):
+                    raise WebUIError(f"{key} 要是数字")
+        if "max_actions_per_hour" in body and str(body.get("max_actions_per_hour", "")).strip() not in ("", "None"):
+            try:
+                values["max_actions_per_hour"] = int(float(body.get("max_actions_per_hour")))
+            except (TypeError, ValueError):
+                raise WebUIError("max_actions_per_hour 要是整数")
+        if not values:
+            raise WebUIError("没有要改的项")
+        try:
+            saved = await self.storage.set_group_config(scope, **values)
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200]) from error
+        invalidate = getattr(self.host, "_invalidate_group_config", None)
+        if callable(invalidate):
+            invalidate(scope)
+        return {"ok": True, "scope_id": scope, "config": saved}
+
     async def _do_scope_tag_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """给会话写一个标签（这个群是干什么的）——防串群的提示词工程。"""
         scope = str(body.get("scope_id") or "").strip()
@@ -1482,10 +1557,47 @@ class PageAPI:
             raise WebUIError("没找到这个会话")
         return {"ok": True, "scope_id": scope, "tag": tag}
 
+    async def _do_extension_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """上传一个拓展 zip（base64 分片由前端拼好后整包发来）。
+
+        只有**用户上传的**拓展能被删除；内置与自学习技能这里一律拒绝覆盖。
+        """
+        manager = self._script_manager()
+        raw = str(body.get("data") or "")
+        if not raw:
+            raise WebUIError("没有收到文件内容")
+        import base64 as _b64
+
+        try:
+            payload = _b64.b64decode(raw.split(",", 1)[-1])
+        except Exception as error:
+            raise WebUIError(f"文件解码失败：{error}") from error
+        if len(payload) > 8 * 1024 * 1024:
+            raise WebUIError("zip 超过 8MB，太大了")
+        try:
+            result = await manager.install_from_zip(
+                payload, filename=str(body.get("filename") or ""))
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200]) from error
+        if not result.get("ok"):
+            raise WebUIError(str(result.get("error") or "安装失败")[:200])
+        return result
+
+    async def _do_extension_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        manager = self._script_manager()
+        ext_id = str(body.get("id") or "").strip()
+        if not ext_id:
+            raise WebUIError("缺少 id")
+        try:
+            result = await manager.delete_uploaded(ext_id)
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200]) from error
+        if not result.get("ok"):
+            raise WebUIError(str(result.get("error") or "删除失败")[:200])
+        return result
+
     async def _do_extension_config_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        manager = getattr(self.host, "_scripts", None)
-        if manager is None:
-            raise WebUIError("脚本拓展未启用")
+        manager = self._script_manager()
         ext_id = str(body.get("id") or "").strip()
         if not ext_id:
             raise WebUIError("缺少 id")
@@ -1499,9 +1611,7 @@ class PageAPI:
         return {"ok": True, "id": ext_id, "config": saved}
 
     async def _do_extension_config_reset(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        manager = getattr(self.host, "_scripts", None)
-        if manager is None:
-            raise WebUIError("脚本拓展未启用")
+        manager = self._script_manager()
         ext_id = str(body.get("id") or "").strip()
         if not ext_id:
             raise WebUIError("缺少 id")
@@ -1512,9 +1622,7 @@ class PageAPI:
         return {"ok": True, "id": ext_id, "config": manager.effective_config(ext_id)}
 
     async def _do_extension_reload(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        manager = getattr(self.host, "_scripts", None)
-        if manager is None:
-            raise WebUIError("脚本拓展未启用")
+        manager = self._script_manager()
         problems = await manager.reload(str(body.get("id") or "").strip() or None)
         return {"ok": True, "problems": list(problems or [])}
 

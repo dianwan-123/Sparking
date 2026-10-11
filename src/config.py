@@ -40,6 +40,7 @@ class PluginConfig:
     evidence_limit: int
     context_char_budget: int
     compression_batch_size: int
+    memory_sync_minutes: int
     autonomous_sample_rate: float
     batch_window_min_seconds: int
     batch_window_max_seconds: int
@@ -147,6 +148,7 @@ class PluginConfig:
             evidence_limit=_int(d.get("evidence_limit"), 12, 1, 50),
             context_char_budget=_int(d.get("context_char_budget"), 16000, 4000, 120000),
             compression_batch_size=_int(d.get("compression_batch_size"), 40, 10, 200),
+            memory_sync_minutes=_int(d.get("memory_sync_minutes"), 5, 0, 240),
             autonomous_sample_rate=_float(d.get("autonomous_sample_rate"), 0.35, 0, 1),
             batch_window_min_seconds=bw_min,
             batch_window_max_seconds=bw_max,

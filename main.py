@@ -88,6 +88,7 @@ from .src.task_queue import (
     TaskRunner as TaskQueueRunner,
 )
 from .src.qq_gateway import (
+    BLOCKED_ACTIONS,
     GatewayFacade,
     QQGateway,
     QQGatewayError,
@@ -329,6 +330,9 @@ class LongMemoryAgentPlugin(Star):
         self._known_scopes: dict[str, str] = {}
         self._send_locks: dict[str, asyncio.Lock] = {}
         self._pending_counts: dict[str, int] = {}
+        # 每会话最近一次压缩的墙钟时间：新消息积压够久就立刻压，
+        # 不必等攒满 compression_batch_size（跨会话的记忆要及时）。
+        self._last_compress_at: dict[str, float] = {}
         self._handled_event_ids: set[str] = set()
         self._handled_event_keys: set[str] = set()
         self._handled_since: str = ""
@@ -1059,6 +1063,77 @@ class LongMemoryAgentPlugin(Star):
             finally:
                 queue.task_done()
 
+    # ---------------------------------------------------------- 群配置（每群一套参数）
+    async def _group_config(self, scope_id: str) -> dict[str, Any]:
+        """读群配置（60 秒缓存；控制台/工具改动会立即失效）。
+
+        缓存挂在实例上而不是类上：类属性是全进程共享的，热重载或第二个实例
+        会读到上一个实例留下的旧配置，改完不生效还很难查。
+        """
+        if self.storage is None or not scope_id:
+            return {}
+        cache = getattr(self, "_group_config_cache", None)
+        if cache is None:
+            cache = self._group_config_cache = {}
+        now = time.monotonic()
+        cached = cache.get(scope_id)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        try:
+            data = await self.storage.get_group_config(scope_id)
+        except Exception:
+            data = {}
+        cache[scope_id] = (now, data)
+        return data
+
+    def _invalidate_group_config(self, scope_id: str = "") -> None:
+        """改完群配置立刻生效（不靠缓存过期）。"""
+        cache = getattr(self, "_group_config_cache", None)
+        if not cache:
+            return
+        if scope_id:
+            cache.pop(scope_id, None)
+        else:
+            cache.clear()
+
+    def _pick(self, group_value: Any, fallback: Any, *, minimum: float = 0.0) -> Any:
+        """群配置优先：值 >= minimum 就用它，否则用全局。"""
+        try:
+            value = float(group_value)
+        except (TypeError, ValueError):
+            return fallback
+        return value if value >= minimum else fallback
+
+    async def _effective_rates(self, scope_id: str) -> dict[str, float]:
+        """这个群实际生效的活跃度/回复概率/冷却倍率/每小时上限。"""
+        config = await self._group_config(scope_id)
+        return {
+            "sample_rate": self._pick(config.get("reply_rate"),
+                                      self.settings.autonomous_sample_rate),
+            "cooldown_scale": self._pick(config.get("cooldown_scale"), 1.0),
+            "activity": self._pick(config.get("activity"), 1.0),
+            "max_actions": self._pick(config.get("max_actions_per_hour"),
+                                      self.settings.max_actions_per_hour, minimum=1),
+            "quiet_hours": str(config.get("quiet_hours") or "").strip(),
+        }
+
+    def _quiet_hours_active(self, spec: str) -> bool:
+        """群自定义静默时段：形如 "1-7" 或 "23-7"（本地时间，跨零点也认）。"""
+        text = str(spec or "").strip()
+        if "-" not in text:
+            return False
+        start_text, end_text = text.split("-", 1)
+        try:
+            start, end = int(start_text), int(end_text)
+        except ValueError:
+            return False
+        hour = timeutil.now().hour
+        if start == end:
+            return False
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end          # 跨零点（如 23-7）
+
     def _shared_scope_ids(self, current: str | None = None) -> tuple[str, ...]:
         """Memory-sharing set: whitelisted-group and private scopes share one
         memory space (摘要/账本/印象跨群，每条带 origin 出处标注). Raw chat
@@ -1572,10 +1647,18 @@ class LongMemoryAgentPlugin(Star):
             return
         if not text:
             return
-        if random.random() > self.settings.autonomous_sample_rate:
+        rates = await self._effective_rates(stored.scope_id)
+        if self._quiet_hours_active(rates["quiet_hours"]):
+            logger.info("长程记忆：%s处于群自定义静默时段（%s），跳过",
+                        self._conversation_key(event), rates["quiet_hours"])
+            return
+        # 采样概率 = 群里的回复概率 × 群活跃度（活跃度越低越安静）
+        sample_rate = max(0.0, min(1.0, rates["sample_rate"] * rates["activity"]))
+        if random.random() > sample_rate:
             logger.info(
-                "长程记忆：%s消息未采样进入判定（autonomous_sample_rate=%.2f）",
-                self._conversation_key(event), self.settings.autonomous_sample_rate,
+                "长程记忆：%s消息未采样进入判定（群生效概率=%.2f，回复概率%.2f×活跃度%.2f）",
+                self._conversation_key(event), sample_rate,
+                rates["sample_rate"], rates["activity"],
             )
             return
         logger.info("长程记忆：%s消息进入攒批判定缓冲", self._conversation_key(event))
@@ -1648,9 +1731,19 @@ class LongMemoryAgentPlugin(Star):
         if not self.compression or not self.storage:
             return
         self._pending_counts[scope_id] = self._pending_counts.get(scope_id, 0) + 1
-        if self._pending_counts[scope_id] < self.settings.compression_batch_size:
+        sync_minutes = int(getattr(self.settings, "memory_sync_minutes", 0) or 0)
+        now = time.time()
+        # 第一次见到这个会话只记时间戳、不压缩：否则"还没压过"（缺省 0）会被当成
+        # "已经超期"，会话的第一条消息就触发一次压缩。
+        if scope_id not in self._last_compress_at:
+            self._last_compress_at[scope_id] = now
+        due_by_time = bool(sync_minutes) and (
+            now - self._last_compress_at[scope_id]) >= sync_minutes * 60
+        if (self._pending_counts[scope_id] < self.settings.compression_batch_size
+                and not due_by_time):
             return
         self._pending_counts[scope_id] = 0
+        self._last_compress_at[scope_id] = now
         await self._compress_scope(scope_id)
 
     async def _compress_scope(self, scope_id: str, rounds: int = 3) -> int:
@@ -1742,6 +1835,19 @@ class LongMemoryAgentPlugin(Star):
             if wake:
                 event.stop_event()
             return None
+        # 群配置：冷却倍率（越大越安静）与每小时动作上限。
+        # 按**群**设，不能改控制器上的全局值——那是单例，最后说话的那个群的
+        # 设置会套到所有群上（A 群调安静，B 群跟着变哑巴）。
+        rates = await self._effective_rates(scope_id)
+        if self._quiet_hours_active(rates["quiet_hours"]) and not wake:
+            logger.info("长程记忆：%s处于群自定义静默时段，跳过本次",
+                        self._conversation_key(event))
+            return None
+        self.interactions.set_group_limits(
+            str(event.get_group_id() or scope_id),
+            cooldown_seconds=self.settings.group_cooldown_seconds * rates["cooldown_scale"],
+            max_actions_per_hour=max(1, int(rates["max_actions"])),
+        )
         permit = await self.interactions.begin(
             scope_id, str(event.get_group_id()), str(event.get_sender_id()),
             bypass_quiet=wake, supersede=False,
@@ -6015,6 +6121,14 @@ class LongMemoryAgentPlugin(Star):
         if not self._ready() or self.interactions.is_quiet():
             return
         self._bind_gateway_client()
+        # 0) 记忆维护先做：压缩原来排在计划/消遣/潜水之后，而前面每个分支都会
+        # return——计划一到期或随手消遣一次，这一轮就轮不到压缩，积压的消息
+        # 迟迟不成摘要（跨会话问起来"它不知道刚才聊过什么"）。记忆是每轮都要
+        # 保鲜的东西，所以提到最前面，且与后续动作互不挤占。
+        try:
+            await self._compress_all_scopes()
+        except Exception as error:
+            logger.warning("长程记忆：心跳压缩异常：%s", str(error)[:150])
         # 1) 自我规划到期：把未来几小时排成日程
         if time.monotonic() >= self._next_plan_at:
             self._next_plan_at = time.monotonic() + max(1, self.settings.plan_interval_hours) * 3600
@@ -6048,9 +6162,7 @@ class LongMemoryAgentPlugin(Star):
             self._idle_budget = (now.hour, used + 1)
             await self._run_idle_action(kind)
             return
-        # 4) 记忆维护：把新消息压成 L1/L2/L3（不依赖攒满一整批）
-        await self._compress_all_scopes()
-        # 5) 默认安静潜水：看一眼群里在聊什么，不说话
+        # 4) 默认安静潜水：看一眼群里在聊什么，不说话
         await self._lurk_round()
 
     async def _planning_round(self) -> None:
@@ -7119,6 +7231,7 @@ class LongMemoryAgentPlugin(Star):
             data_root = base / "script_data"
             self._scripts = ScriptExtensionManager(
                 root, data_root, learned_root=base / "learned_skills",
+                uploaded_root=base / "uploaded_extensions",
                 llm=self._script_llm,
                 memory_note=self._script_memory_note,
                 qq_send_group=self._script_send_group,
@@ -8779,6 +8892,17 @@ class LongMemoryAgentPlugin(Star):
                 continue
             if time.monotonic() < self._send_blockade.get(scope_id, 0.0):
                 continue
+            # 群配置同样管主动参与：静默时段不打扰，活跃度低的群少开口
+            rates = await self._effective_rates(scope_id)
+            if self._quiet_hours_active(rates["quiet_hours"]):
+                continue
+            if random.random() > max(0.0, min(1.0, rates["activity"])):
+                continue
+            self.interactions.set_group_limits(
+                str(key),
+                cooldown_seconds=self.settings.group_cooldown_seconds * rates["cooldown_scale"],
+                max_actions_per_hour=max(1, int(rates["max_actions"])),
+            )
             permit = await self.interactions.begin(
                 scope_id, key, "proactive", supersede=False,
             )
@@ -9379,6 +9503,9 @@ class LongMemoryAgentPlugin(Star):
                 spec = self.gateway.resolve_action(wanted)
             except QQGatewayError as error:
                 return str(error)
+            if spec.name in BLOCKED_ACTIONS:
+                return (f"{spec.name} 会终止或重启机器人进程，已禁用；"
+                        "需要重启请让主人在服务器上操作。")
             return compact_json({
                 "action": spec.name,
                 "category": spec.category,
@@ -9433,6 +9560,131 @@ class LongMemoryAgentPlugin(Star):
         except QQGatewayError as error:
             return f"动作失败：{error}"
         return (compact_json(result, 12000))
+
+    # -------------------------------------------- QQ 分类动作工具（群管/群文件/扩展）
+    async def _action_family_call(
+        self, event: AstrMessageEvent, action: str, params_json: str,
+    ) -> str:
+        """分类动作的统一入口：解析参数、补当前群号、走网关、把错误原文回给模型。
+
+        参数名没写对时网关会把该动作的完整参数表列在错误里，模型照着改一次即可，
+        不用先查目录。写操作照样走网关的每小时配额与最小间隔。
+        """
+        self._require_qq(event)
+        name = str(action or "").strip()
+        if not name:
+            return ("需要 action（动作名）。本工具说明里有动作清单；"
+                    "完整参数表用 napcat_catalog(action=\"动作名\") 查。")
+        params = parse_json_value(params_json or "{}")
+        if params is None:
+            return (f"params_json 无法解析为 JSON（原文 {params_json[:80]!r}）。"
+                    "请用双引号重新构造参数 JSON 再调用一次。")
+        if not isinstance(params, dict):
+            params = {"params": params}
+        clean = {str(key): value for key, value in params.items()}
+        try:
+            spec = self.gateway.resolve_action(name)
+        except QQGatewayError as error:
+            return f"动作失败：{error}"
+        # 群号省略时用当前会话的群：在群里说话时目标几乎总是这个群，
+        # 每次都让模型抄一遍群号只会抄错（别的群仍可显式传 group_id）。
+        if not clean.get("group_id") and spec.param("group_id") is not None:
+            current = str(event.get_group_id() or "").strip()
+            if current:
+                clean["group_id"] = current
+        facade = GatewayFacade(self.gateway)
+        try:
+            result = await facade.call(name, **clean)
+        except QQGatewayError as error:
+            return f"动作失败：{error}"
+        return compact_json(result, 12000)
+
+    @filter.llm_tool(name="group_admin")
+    async def group_admin_tool(self, event: AstrMessageEvent, action: str = "",
+                               params_json: str = "{}"):
+        """群管理：对群做管理操作（改群名/群头像、禁言、踢人、设管理员、群名片、
+        头衔、全员禁言、加群与搜索设置、成员权限、分类资料标签、退群、看管理设置）。
+        需要你是群管理员或群主，权限不够时上游会拒绝并说明。
+
+        成员类：set_group_ban(禁言，duration=0 解除)、set_group_kick(踢一人)、
+          set_group_kick_members(批量踢)、set_group_card(群名片，空串清除)、
+          set_group_special_title(专属头衔)、set_group_admin(设/撤管理员)
+        群设置：set_group_name(群名)、set_group_portrait(群头像)、set_group_whole_ban(全员禁言)、
+          set_group_anonymous / set_group_anonymous_ban、set_group_add_option(加群方式)、
+          set_group_search(能否被搜到)、set_group_member_invite_policy(邀请策略)、
+          set_group_member_permissions(成员权限)、set_group_new_member_history_visibility(新人看历史)、
+          set_group_leave(退群，谨慎)
+        资料标签：get_group_tags(看某分类下的标签)、add_group_tag、delete_group_tag
+        只读：get_group_admin_settings(看当前各项管理设置)
+
+        【先想清楚再做】禁言/踢人/全员禁言/退群是不可逆或影响很多人的操作：
+        先确认对象与理由都明确，拿不准就用 ask_user 问一句再做。
+
+        Args:
+            action(string): 动作名（见上）。
+            params_json(string): 参数对象 JSON，如 {"user_id": 123, "duration": 600}。
+                群号省略时默认当前群。
+        """
+        return await self._action_family_call(event, action, params_json)
+
+    @filter.llm_tool(name="group_files")
+    async def group_files_tool(self, event: AstrMessageEvent, action: str = "",
+                               params_json: str = "{}"):
+        """群文件：看群文件与文件夹、拿下载直链、上传、改名、移动、删除、建/删文件夹，
+        以及私聊文件的收送。
+
+        查看：get_group_root_files(根目录列表)、get_group_files_by_folder(子目录)、
+          get_group_file_url(单个文件的下载直链，file_id 从列表里拿)、
+          get_private_file_url(私聊文件直链)
+        上传：upload_group_file(群文件，传本地路径)、upload_private_file(发给好友)
+        整理：rename_group_file、move_group_file、rename_group_file_folder、
+          create_group_file_folder、delete_group_file_folder
+        删除：delete_group_file(谨慎，删掉就没了)
+
+        Args:
+            action(string): 动作名（见上）。
+            params_json(string): 参数对象 JSON，如 {"file_id": "xxx"}。群号省略时默认当前群。
+        """
+        return await self._action_family_call(event, action, params_json)
+
+    @filter.llm_tool(name="qq_extended")
+    async def qq_extended_tool(self, event: AstrMessageEvent, action: str = "",
+                               params_json: str = "{}"):
+        """QQ 扩展能力：收藏表情、消息表情回应、群内扩展（精华/待办/打卡/群资料/历史）、
+        好友扩展、文件闪传、在线状态与资料、卡片分享、转发、OCR 与语音转文字。
+
+        收藏表情：fetch_custom_face(看库存)、add_custom_face(加)、delete_custom_face(删)、
+          modify_custom_face(改备注)、move_custom_face_to_front、send_custom_face(发出去)
+        表情回应：get_msg_emoji_likes、set_msg_emoji_like、fetch_emoji_like
+        群内扩展：get_group_detail_info、get_group_msg_history、get_group_shut_list(禁言名单)、
+          get_group_signed_list(打卡名单)、set_essence_msg / delete_essence_msg /
+          get_essence_msg_list(精华消息)、set_group_todo / get_group_todo_list /
+          complete_group_todo / cancel_group_todo(群待办)、set_group_reaction、
+          set_group_remark(群备注)、set_group_sign(打卡)、group_poke、
+          send_group_ai_record(群 AI 语音)、get_group_ignore_add_request
+        好友扩展：get_friends_with_category(分组好友)、get_friend_msg_history、
+          get_unidirectional_friend_list、set_friend_remark(备注)、set_friends_category、
+          send_like(点赞)、friend_poke、get_doubt_friends_add_request
+        文件闪传：get_file、download_file、list_filesets、get_fileset_info、
+          get_flash_file_list、get_flash_file_url、download_fileset、create_flash_task、
+          rename_flash_file、delete_flash_file、send_flash_msg、trans_group_file(转存群文件)
+        状态与资料：set_online_status、set_diy_online_status、set_self_longnick(个性签名)、
+          set_qq_avatar、get_online_clients、get_recent_contact
+        卡片分享：send_ark_share、send_group_ark_share、send_tuwen_ark、share_peer
+        转发：get_forward_msg、send_forward_msg、upload_forward_msg
+        工具：ocr_image(服务端 OCR)、fetch_ptt_text(语音转文字)、get_ai_record(生成 AI 语音)、
+          translate_en2zh、check_url_safely、mark_msg_as_read、clean_cache、
+          click_inline_keyboard_button、_get_group_notice、_send_group_notice、_del_group_notice
+
+        这里只列了常用的；完整清单（含参数表）用 napcat_catalog(category="扩展") 查。
+        凭证类动作（get_cookies / get_credentials / get_csrf_token / get_rkey 等）
+        只供插件内部使用，从工具调用会被拒绝。
+
+        Args:
+            action(string): 动作名（见上）。
+            params_json(string): 参数对象 JSON，如 {"group_id": 123, "message_id": 456}。
+        """
+        return await self._action_family_call(event, action, params_json)
 
     @filter.llm_tool(name="group_topics")
     async def group_topics_tool(self, event: AstrMessageEvent, group_id: str = "", limit: int = 10):
@@ -10329,6 +10581,92 @@ class LongMemoryAgentPlugin(Star):
         return compact_json({"terms": [{"term": r["term"],
                                         "meaning": r["meaning"] or "（还没搞懂）"}
                                        for r in rows]}, 4000)
+
+    @filter.llm_tool(name="group_config")
+    async def group_config_tool(self, event: AstrMessageEvent, action: str = "get",
+                                group_id: str = "", tag: str = "",
+                                activity: float = -1, reply_rate: float = -1,
+                                cooldown_scale: float = -1, quiet_hours: str = "",
+                                max_actions_per_hour: int = -1, note: str = ""):
+        """看/改**某个群**的专属配置（不填的项跟随全局）。
+
+        可调项（`-1`/空 = 不改、跟随全局）：
+        - `tag`：这个群是干什么的（如"工作群"/"游戏群"）——影响你在群里说话的分寸；
+        - `activity`：0~1 活跃度，**越低你在群里越安静**（0=几乎不主动说话）；
+        - `reply_rate`：0~1，普通消息进入判定的概率（越高越爱接话）；
+        - `cooldown_scale`：冷却倍率，1=全局，2=冷却翻倍（更安静），0.5=更活跃；
+        - `quiet_hours`：这个群自己的静默时段，如 "23-7"（跨零点也认）；
+        - `max_actions_per_hour`：每小时最多主动几次；
+        - `note`：给自己看的备注（不会发出去）。
+
+        Args:
+            action(string): get（默认，看当前值）/ set（改）/ list（列所有配置过的群）。
+            group_id(string): 群号或群名，留空=当前会话。
+            tag(string): 这个群是干什么的。
+            activity(number): 0~1 活跃度（-1=不改）。
+            reply_rate(number): 0~1 回复概率（-1=不改）。
+            cooldown_scale(number): 冷却倍率（-1=不改）。
+            quiet_hours(string): 本群静默时段，如 "23-7"。
+            max_actions_per_hour(number): 每小时动作上限（-1=不改）。
+            note(string): 备注。
+        """
+        if self.storage is None:
+            return "记忆系统未就绪"
+        act = str(action or "get").strip().lower()
+        if act == "list":
+            configs = await self.storage.all_group_configs()
+            labels = await self._scope_labels()
+            rows = []
+            for scope_id, config in configs.items():
+                rows.append({
+                    "group": str(labels.get(scope_id) or scope_id[:8]),
+                    "tag": config.get("tag", ""), "activity": config.get("activity"),
+                    "reply_rate": config.get("reply_rate"),
+                    "cooldown_scale": config.get("cooldown_scale"),
+                    "quiet_hours": config.get("quiet_hours"),
+                    "max_actions_per_hour": config.get("max_actions_per_hour"),
+                    "note": config.get("note", ""),
+                })
+            return compact_json({"configured": rows}, 6000)
+        scope = await self._scope_for_event(event) if event is not None else None
+        if str(group_id or "").strip():
+            resolved, _key, hint = await self._resolve_scope_ref(group_id)
+            if not resolved:
+                return f"没能定位这个会话：{hint}"
+            scope = resolved
+        if not scope:
+            return "还没记录这个会话"
+        if act == "get":
+            config = await self._group_config(scope)
+            rates = await self._effective_rates(scope)
+            return compact_json({
+                "config": config,
+                "effective": rates,
+                "note": "effective 是这个群**实际生效**的值（未配置的项回落到全局）",
+            }, 3000)
+        if act != "set":
+            return f"不认识的 action：{act}（用 get/set/list）"
+        values: dict[str, Any] = {}
+        if str(tag or "").strip():
+            values["tag"] = str(tag).strip()[:200]
+        if float(activity) >= 0:
+            values["activity"] = max(0.0, min(float(activity), 1.0))
+        if float(reply_rate) >= 0:
+            values["reply_rate"] = max(0.0, min(float(reply_rate), 1.0))
+        if float(cooldown_scale) >= 0:
+            values["cooldown_scale"] = max(0.0, min(float(cooldown_scale), 10.0))
+        if str(quiet_hours or "").strip():
+            values["quiet_hours"] = str(quiet_hours).strip()[:40]
+        if int(max_actions_per_hour) > 0:
+            values["max_actions_per_hour"] = max(1, min(int(max_actions_per_hour), 200))
+        if str(note or "").strip():
+            values["note"] = str(note).strip()[:400]
+        if not values:
+            return "没给要改的项（tag/activity/reply_rate/cooldown_scale/quiet_hours/max_actions_per_hour/note）"
+        saved = await self.storage.set_group_config(scope, **values)
+        self._invalidate_group_config(scope)
+        return compact_json({"ok": True, "config": saved,
+                             "note": "改完立即生效"}, 2500)
 
     @filter.llm_tool(name="list_group_style")
     async def list_group_style_tool(self, event: AstrMessageEvent, group_id: str = ""):
@@ -12772,6 +13110,7 @@ _ANALYZER_BLOCKED_TOOLS = _SUBAGENT_BLOCKED_TOOLS | {
     "send_image", "send_local_file", "send_sticker", "say_now", "ask_user",
     "forward_messages", "screenshot_messages",  # read_forward 是只读，放行
     "qq_send_group", "qq_send_private", "qzone_publish", "napcat_call",
+    "group_admin", "group_files", "qq_extended",
     "ssh_exec", "ssh_fetch", "ssh_screenshot", "ssh_agent_dispatch",
     "ssh_agent_control", "python_exec", "read_tabular", "run_script",
     "fs_write", "fs_delete", "fs_move", "learn_skill", "update_skill",

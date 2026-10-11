@@ -21,6 +21,8 @@ import inspect
 import json
 import time
 from collections import deque
+
+from astrbot.api import logger
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -57,6 +59,10 @@ MIN_INTERVAL = {
     RISK_MODERATION: 2.0,
     RISK_CREDENTIAL: 0.5,
 }
+# 绝不给 LLM 的动作：退出机器人会把进程带走、重启上游明确不支持。
+# 这两个动作仍在动作表里（目录与参数查询可见），但执行入口一律拒绝。
+BLOCKED_ACTIONS = {"bot_exit", "set_restart"}
+
 SLOW_ACTIONS = {"send_group_msg", "send_private_msg", "send_msg",
                 "send_forward_msg", "send_group_forward_msg",
                 "send_private_forward_msg", "set_qq_avatar",
@@ -99,7 +105,7 @@ class QQGateway:
         out: list[dict[str, Any]] = []
         wanted = str(category or "").strip()
         for action in ACTIONS.values():
-            if action.risk == RISK_CREDENTIAL:
+            if action.risk == RISK_CREDENTIAL or action.name in BLOCKED_ACTIONS:
                 continue
             if wanted and action.category != wanted:
                 continue
@@ -119,22 +125,64 @@ class QQGateway:
 
     @staticmethod
     def categories() -> list[dict[str, Any]]:
-        counts = stats()
+        """分类与数量。口径必须与 catalog() 一致：被禁动作与凭证类都不算，
+        否则模型看到"扩展 115"而列出来只有 114，会以为漏了动作。"""
+        counts: dict[str, int] = {}
+        for action in ACTIONS.values():
+            if action.risk == RISK_CREDENTIAL or action.name in BLOCKED_ACTIONS:
+                continue
+            counts[action.category] = counts.get(action.category, 0) + 1
         return [{"category": name, "count": counts.get(name, 0)}
                 for name in CATEGORIES if counts.get(name)]
 
+    @staticmethod
+    def _close_names(name: str, limit: int = 4) -> list[str]:
+        """相近动作名（用于把"名字打错了"和"网关加了新动作"分开）。"""
+        try:
+            import difflib
+
+            return difflib.get_close_matches(name, list(ACTIONS), n=limit, cutoff=0.8)
+        except Exception:
+            return []
+
     def resolve_action(self, action: str) -> QQAction:
+        """取动作描述。
+
+        本地动作表可能比网关版本旧（网关加了新动作而表还没同步），所以
+        **格式合法的未知动作一律放行**：只读 = False（当写操作对待，走配额）、
+        风险 = send、必填不校验（交给上游报错）。这样网关加了新动作不用等插件更新。
+
+        放行的代价是"名字打错"也会被送上去——所以上游拒绝时由 `_unknown_hint`
+        补一句相近动作名，模型照着改一次就能纠正。
+        """
         spec = resolve(action)
-        if spec is None:
-            close = [name for name in ACTIONS if str(action or "")[:4] and
-                     str(action or "").lower()[:4] in name.lower()][:6]
+        if spec is not None:
+            return spec
+        name = str(action or "").strip()
+        if not name or not all(char.isalnum() or char in "._-" for char in name):
+            close = self._close_names(name)
             hint = f"；相近动作：{', '.join(close)}" if close else ""
-            raise QQGatewayError(str(action or ""), f"未注册的动作名{hint}")
-        return spec
+            raise QQGatewayError(name, f"未注册的动作名{hint}")
+        return QQAction(name=name, summary="（本地表未收录的新动作，透传）",
+                        category="未收录", read_only=False, risk=RISK_SEND,
+                        params=(), accepts_extra=True)
+
+    def _unknown_hint(self, action: str) -> str:
+        """上游拒绝了本地表没有的动作时，附上相近的名字（多数是打错字）。"""
+        if resolve(action) is not None:
+            return ""
+        close = self._close_names(action)
+        if not close:
+            return ""
+        return "；相近动作：" + "、".join(close)
 
     # ------------------------------------------------------------ 执行
     async def execute(self, action: str, **params: Any) -> Any:
         spec = self.resolve_action(action)
+        if spec.name in BLOCKED_ACTIONS:
+            raise QQGatewayError(
+                spec.name, "这个动作会终止或重启机器人进程，已禁用；"
+                "需要重启请让主人在服务器上操作")
         clean, missing = normalize_params(spec, params)
         if missing:
             raise QQGatewayError(
@@ -173,6 +221,8 @@ class QQGateway:
     async def execute_internal(self, action: str, **params: Any) -> Any:
         """内部通道：允许凭证类动作（取 cookies/rkey 等），不经 LLM 门。"""
         spec = self.resolve_action(action)
+        if spec.name in BLOCKED_ACTIONS:
+            raise QQGatewayError(spec.name, "这个动作会终止或重启机器人进程，已禁用")
         clean, missing = normalize_params(spec, params, strip_unknown=False)
         if missing:
             raise QQGatewayError(spec.name, f"缺少必填参数 {missing}")
@@ -210,7 +260,8 @@ class QQGateway:
                 raise QQGatewayError(
                     action,
                     f"上游返回失败 retcode={retcode} "
-                    f"{str(response.get('message') or response.get('wording') or '')[:120]}",
+                    f"{str(response.get('message') or response.get('wording') or '')[:120]}"
+                    + self._unknown_hint(action),
                     response)
         return response
 
@@ -268,6 +319,10 @@ class GatewayFacade:
         spec = self.gateway.resolve_action(action)
         if spec.risk == RISK_CREDENTIAL:
             raise QQGatewayError(spec.name, "凭证类动作仅供插件内部使用")
+        if spec.name in BLOCKED_ACTIONS:
+            raise QQGatewayError(
+                spec.name, "这个动作会终止或重启机器人进程，已禁用；"
+                "需要重启请让主人在服务器上操作")
         result = await self.gateway.execute(action, **params)
         return _json_safe(result)
 

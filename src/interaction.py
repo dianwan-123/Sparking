@@ -56,10 +56,52 @@ class InteractionController:
         self._last_group: dict[str, float] = {}
         self._last_user: dict[str, float] = {}
         self._hourly: deque[float] = deque()
+        # 每群独立的小时配额与冷却（控制器是全局单例；只留一份全局的话，
+        # 最后说话的那个群的设置会套到所有群上——"A 群安静"会连累 B 群）
+        self._hourly_by_group: dict[str, deque[float]] = defaultdict(deque)
+        self._group_limit: dict[str, int] = {}
+        self._group_cooldown: dict[str, float] = {}
+        self._user_cooldown: dict[str, float] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._scope_tasks: dict[Hashable, asyncio.Task[Any]] = {}
         self._terminated = False
         self._lock = asyncio.Lock()
+
+    def set_group_limits(self, group_id: str, *,
+                         cooldown_seconds: float | None = None,
+                         max_actions_per_hour: int | None = None,
+                         user_cooldown_seconds: float | None = None) -> None:
+        """给某个群单独设限（群配置生效点）。None = 该群用全局默认。"""
+        key = str(group_id)
+        if cooldown_seconds is None:
+            self._group_cooldown.pop(key, None)
+        else:
+            self._group_cooldown[key] = max(0.0, float(cooldown_seconds))
+        if user_cooldown_seconds is None:
+            self._user_cooldown.pop(key, None)
+        else:
+            self._user_cooldown[key] = max(0.0, float(user_cooldown_seconds))
+        if max_actions_per_hour is None:
+            self._group_limit.pop(key, None)
+        else:
+            self._group_limit[key] = max(1, int(max_actions_per_hour))
+
+    def _limit_for(self, group: str) -> int:
+        return int(self._group_limit.get(group, self.max_actions_per_hour))
+
+    def _over_hourly(self, group: str) -> bool:
+        """超配额？全局上限是总闸（防刷屏），群上限只能再收紧。
+
+        全局这一层必须留着：控制器管的是"这个 bot 一小时内总共说几次"，
+        没有它，群一多就等于没有上限。群配置给的是"这个群单独少说点"。
+        """
+        if len(self._hourly) >= int(self.max_actions_per_hour):
+            return True
+        return len(self._hourly_by_group[group]) >= self._limit_for(group)
+
+    def _cooldown_for(self, group: str) -> tuple[float, float]:
+        return (float(self._group_cooldown.get(group, self.group_cooldown_seconds)),
+                float(self._user_cooldown.get(group, self.user_cooldown_seconds)))
 
     def is_quiet(self, at: datetime | None = None) -> bool:
         hour = (at or self._wall_clock()).hour
@@ -84,7 +126,7 @@ class InteractionController:
         async with self._lock:
             now = self._clock()
             self._prune(now)
-            if self._on_cooldown(group, user, now) or len(self._hourly) >= self.max_actions_per_hour:
+            if self._on_cooldown(group, user, now) or self._over_hourly(group):
                 return None
             if supersede:
                 self._generation[scope] += 1
@@ -114,10 +156,11 @@ class InteractionController:
             self._prune(now)
             if self._on_cooldown(permit.group_id, permit.user_id, now):
                 return False
-            if len(self._hourly) >= self.max_actions_per_hour:
+            if self._over_hourly(permit.group_id):
                 return False
             self._last_group[permit.group_id] = now
             self._last_user[permit.user_id] = now
+            self._hourly_by_group[permit.group_id].append(now)
             self._hourly.append(now)
             return True
 
@@ -202,13 +245,17 @@ class InteractionController:
     def _on_cooldown(self, group: str, user: str, now: float) -> bool:
         group_last = self._last_group.get(group, float("-inf"))
         user_last = self._last_user.get(user, float("-inf"))
-        return (now - group_last < self.group_cooldown_seconds
-                or now - user_last < self.user_cooldown_seconds)
+        group_cooldown, user_cooldown = self._cooldown_for(group)
+        return (now - group_last < group_cooldown
+                or now - user_last < user_cooldown)
 
     def _prune(self, now: float) -> None:
         cutoff = now - 3600
         while self._hourly and self._hourly[0] <= cutoff:
             self._hourly.popleft()
+        for bucket in self._hourly_by_group.values():
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
 
     async def terminate(self) -> None:
         self._terminated = True

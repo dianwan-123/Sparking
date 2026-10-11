@@ -121,7 +121,9 @@ BUILTIN_PACKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
     "social": (
         "QQ 社交",
-        "好友/群列表、发消息、处理申请、戳一戳、改群名片、改自己的资料与头像、下载头像",
+        "好友/群列表、发消息、处理申请、戳一戳、改群名片、改自己的资料与头像、下载头像；"
+        "群管理（禁言/踢人/管理员/群设置/资料标签）、群文件（列表/直链/上传/整理）、"
+        "以及收藏表情、表情回应、群精华待办打卡、好友扩展、文件闪传、OCR 与语音转文字等扩展能力",
         (
             "qq_friend_list", "qq_group_list", "qq_group_members",
             "qq_stranger_info", "qq_recent_history", "qq_send_group",
@@ -132,6 +134,7 @@ BUILTIN_PACKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
             "qq_set_profile", "qq_my_profile", "qq_download_profile",
             "qq_set_status", "qq_set_avatar", "qq_recall",
             "qq_poke", "napcat_catalog", "napcat_call",
+            "group_admin", "group_files", "qq_extended",
         ),
     ),
     "qzone": (

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""SnowLuma / OneBot v11 全量动作表（与网关文档保持同步）。
+"""SnowLuma / OneBot v11 全量动作表（由 tools/gen_qq_actions.py 生成，勿手改）。
 
-来源：SnowLuma 文档站 catalog.json，共 193 个动作。
+来源：SnowLuma 文档站 catalog.json，共 198 个动作。
 每个动作带：分类、中文说明、只读标记、风险级别、参数表（含类型/必填/默认/说明）。
 """
 from __future__ import annotations
@@ -1525,6 +1525,20 @@ _register(QQAction(
     returns='消息事件对象（首次收到时存储的副本，已去除 post_type/self_id、附带 real_id 字段并刷新图片 URL）。',
 ))
 _register(QQAction(
+    name='send_custom_face',
+    summary='发送账号收藏表情（emoji_id 或 MD5），保留表情显示样式',
+    category='消息',
+    read_only=False,
+    risk='social',
+    params=(
+        QQParam(name='emoji_id', type='string', required=True, desc='收藏表情的完整 ID 或 32 位 MD5', default=None, role=''),
+        QQParam(name='group_id', type='uint', required=False, desc='目标群号；与 user_id 二选一', default=None, role='group_id'),
+        QQParam(name='user_id', type='uint', required=False, desc='目标 QQ 号；与 group_id 二选一', default=None, role='member_id'),
+        QQParam(name='reply_to', type='messageId', required=False, desc='可选回复消息 ID', default=None, role=''),
+    ),
+    returns='{ message_id }',
+))
+_register(QQAction(
     name='send_group_msg',
     summary='发送群消息',
     category='消息',
@@ -2050,6 +2064,42 @@ _register(QQAction(
     ),
 ))
 _register(QQAction(
+    name='upload_video_to_qun_album',
+    summary='上传视频到群相册',
+    category='群相册',
+    read_only=False,
+    risk='social',
+    params=(
+        QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
+        QQParam(name='album_id', type='string', required=True, desc='相册 id', default=None, role=''),
+        QQParam(name='album_name', type='string', required=True, desc='相册名称', default=None, role=''),
+        QQParam(name='file', type='string', required=True, desc='视频文件', default=None, role=''),
+    ),
+    returns='{ id }',
+))
+_register(QQAction(
+    name='add_group_tag',
+    summary='向某个群分类添加资料标签',
+    category='群管理',
+    read_only=False,
+    risk='send',
+    params=(
+        QQParam(name='group_class', type='int', required=True, desc='群分类编号', default=None, role=''),
+        QQParam(name='name', type='string', required=True, desc='标签名', default=None, role=''),
+    ),
+))
+_register(QQAction(
+    name='delete_group_tag',
+    summary='从某个群分类移除资料标签',
+    category='群管理',
+    read_only=False,
+    risk='destructive',
+    params=(
+        QQParam(name='group_class', type='int', required=True, desc='群分类编号', default=None, role=''),
+        QQParam(name='name', type='string', required=True, desc='标签名', default=None, role=''),
+    ),
+))
+_register(QQAction(
     name='get_group_admin_settings',
     summary='获取群管理设置的当前值',
     category='群管理',
@@ -2059,6 +2109,17 @@ _register(QQAction(
         QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
     ),
     returns='与对应设置接口字段对齐的当前群管理设置。',
+))
+_register(QQAction(
+    name='get_group_tags',
+    summary='读取某个群分类下的资料标签',
+    category='群管理',
+    read_only=True,
+    risk='read',
+    params=(
+        QQParam(name='group_class', type='int', required=True, desc='群分类编号', default=None, role=''),
+    ),
+    returns='该分类下的资料标签列表。',
 ))
 _register(QQAction(
     name='set_group_add_option',

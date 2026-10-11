@@ -533,6 +533,7 @@ class ScriptExtensionManager:
         data_root: str | Path,
         *,
         learned_root: str | Path | None = None,
+        uploaded_root: str | Path | None = None,
         llm: Callable[..., Awaitable[str]] | None = None,
         memory_note: Callable[[str], Awaitable[None]] | None = None,
         qq_send_group: Callable[[str, str], Awaitable[None]] | None = None,
@@ -548,6 +549,8 @@ class ScriptExtensionManager:
         # 自学习技能的独立加载根（插件数据目录）——插件升级重装不会丢，
         # 也不与手写 scripts/ 混淆：builtin 优先，重名时 learned 被跳过。
         self.learned_root = Path(learned_root) if learned_root else None
+        # 用户上传的拓展（控制台 zip 上传）：与内置/自学习分开，**只有这一根允许删除**
+        self.uploaded_root = Path(uploaded_root) if uploaded_root else None
         self._llm = llm
         self._memory_note = memory_note
         self._qq_send_group = qq_send_group
@@ -703,6 +706,8 @@ class ScriptExtensionManager:
         roots: list[tuple[Path, str]] = [(self.scripts_root, "builtin")]
         if self.learned_root is not None:
             roots.append((self.learned_root, "learned"))
+        if self.uploaded_root is not None:
+            roots.append((self.uploaded_root, "uploaded"))
         return roots
 
     async def load_all(self) -> list[str]:
@@ -783,6 +788,130 @@ class ScriptExtensionManager:
         return {"ok": True, "id": clean_id, "tools": tools,
                 "prompts": len(ext.prompts()), "display_name":
                 ext.manifest.get("display_name", clean_id)}
+
+    # ---------------------------------------------------------- 用户上传的拓展
+    def _safe_member(self, name: str) -> bool:
+        """zip 成员是否安全（拒绝绝对路径与 ../ 逃逸）。"""
+        cleaned = str(name or "").replace("\\", "/")
+        if not cleaned or cleaned.startswith("/") or ":" in cleaned.split("/")[0]:
+            return False
+        parts = [part for part in cleaned.split("/") if part not in ("", ".")]
+        return bool(parts) and ".." not in parts
+
+    async def install_from_zip(self, payload: bytes, *, filename: str = "") -> dict[str, Any]:
+        """把用户上传的 zip 装成一个拓展（放在 uploaded_root 下并热加载）。
+
+        zip 里必须有一个 `extension.json`（可以在根目录，也可以在一层子目录里）——
+        按它所在的那一层作为拓展目录。同名拓展若来自内置/自学习，**拒绝覆盖**。
+        """
+        if self.uploaded_root is None:
+            return {"ok": False, "error": "未配置上传目录"}
+        import io as _io
+        import json as _json
+        import zipfile as _zip
+
+        try:
+            bundle = _zip.ZipFile(_io.BytesIO(payload))
+        except _zip.BadZipFile:
+            return {"ok": False, "error": "这不是一个 zip 文件（或者文件坏了）"}
+        names = [name for name in bundle.namelist() if self._safe_member(name)]
+        if len(names) != len(bundle.namelist()):
+            return {"ok": False, "error": "zip 里有不安全的路径（绝对路径或 ../），已拒绝"}
+        manifest_members = [name for name in names
+                            if name.replace("\\", "/").endswith("extension.json")]
+        if not manifest_members:
+            return {"ok": False,
+                    "error": "zip 里没找到 extension.json（拓展的 manifest）"}
+        if len(manifest_members) > 1:
+            return {"ok": False,
+                    "error": f"zip 里有 {len(manifest_members)} 个 extension.json；"
+                             "一个 zip 只能装一个拓展（请分开打包）"}
+        member = manifest_members[0].replace("\\", "/")
+        prefix = member[: -len("extension.json")]          # 可能为空串（根目录）
+        try:
+            raw_manifest = _json.loads(bundle.read(member).decode("utf-8", "replace"))
+        except Exception as error:
+            return {"ok": False, "error": f"extension.json 读取失败：{error}"}
+        manifest_name = str((raw_manifest or {}).get("name") or "").strip()
+        # name 是拓展 ID（小写/数字/中划线）；用户常把中文显示名写进 name。
+        # 这种情况不直接拒绝，而是用它当显示名、ID 退回到压缩包文件名，
+        # 装好后把 manifest 的 name 改写成真正的 ID（否则加载时会再报错）。
+        clean_id = _slug(manifest_name) or _slug(Path(filename).stem) or ""
+        if not clean_id:
+            return {"ok": False,
+                    "error": "没能定出拓展 ID：manifest 的 name 与压缩包文件名都不是"
+                             "小写字母/数字/中划线（至少 2 位）"}
+        display_name = str((raw_manifest or {}).get("display_name") or "").strip()
+        if not display_name and manifest_name and manifest_name != clean_id:
+            display_name = manifest_name
+        existing = self.get(clean_id)
+        if existing is not None and getattr(existing, "origin", "builtin") != "uploaded":
+            return {"ok": False, "id": clean_id,
+                    "error": f"{clean_id} 与已有拓展重名（{existing.origin}），不能覆盖"}
+        folder = self.uploaded_root / clean_id
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                if name.endswith("/"):
+                    continue
+                relative = name.replace("\\", "/")
+                if prefix and relative.startswith(prefix):
+                    relative = relative[len(prefix):]
+                if not relative or not self._safe_member(relative):
+                    continue
+                target = folder / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if relative == "extension.json":
+                    patched = dict(raw_manifest or {})
+                    patched["name"] = clean_id
+                    if display_name:
+                        patched.setdefault("display_name", display_name)
+                    target.write_text(
+                        _json.dumps(patched, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8")
+                    continue
+                target.write_bytes(bundle.read(name))
+        except OSError as error:
+            return {"ok": False, "id": clean_id, "error": f"写入失败：{error}"}
+        await self.reload()
+        ext = self.get(clean_id)
+        if ext is None or ext.error:
+            return {"ok": False, "id": clean_id,
+                    "error": (ext.error if ext is not None else "加载后未找到该拓展")}
+        self.log(clean_id, "用户上传的拓展已安装并热加载")
+        return {"ok": True, "id": clean_id,
+                "display_name": ext.manifest.get("display_name", clean_id),
+                "tools": [tool.get("name", "") for tool in ext.manifest.get("tools", [])],
+                "deletable": True}
+
+    async def delete_uploaded(self, ext_id: str) -> dict[str, Any]:
+        """删除一个**用户上传的**拓展（内置/自学习一律拒绝）。"""
+        ext = self.get(str(ext_id or "").strip())
+        if ext is None:
+            return {"ok": False, "error": "没有这个拓展"}
+        if getattr(ext, "origin", "builtin") != "uploaded":
+            origin_label = {"builtin": "插件自带", "learned": "自学习技能"}.get(
+                ext.origin, ext.origin)
+            return {"ok": False, "id": ext.id,
+                    "error": f"{ext.id} 是{origin_label}，不允许删除"
+                             "（只有用户上传的拓展可以删）"}
+        folder = Path(ext.folder)
+        root = self.uploaded_root
+        try:
+            if root is None or not folder.resolve().is_relative_to(root.resolve()):
+                return {"ok": False, "error": "这个拓展不在上传目录里，拒绝删除"}
+        except OSError:
+            return {"ok": False, "error": "路径校验失败，拒绝删除"}
+        await ext.unload()
+        self.extensions.pop(ext.id, None)
+        import shutil as _shutil
+
+        try:
+            await asyncio.to_thread(_shutil.rmtree, folder, True)
+        except OSError as error:
+            return {"ok": False, "id": ext.id, "error": f"删除文件失败：{error}"}
+        self.log(ext.id, "用户上传的拓展已删除")
+        return {"ok": True, "id": ext.id}
 
     async def reload(self, ext_id: str | None = None) -> list[str]:
         """重载全部拓展（廉价：目录扫描+模块导入）。ext_id 仅用于日志语义。"""

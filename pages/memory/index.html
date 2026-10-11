@@ -196,7 +196,15 @@
         </div>
         <div class="card">
           <h2>拓展与技能</h2>
-          <p class="muted">手写拓展（scripts/）仍是实验性功能：接口可能随版本调整，不建议依赖它做关键流程。</p>
+          <p class="muted">手写拓展（scripts/）仍是实验性功能：接口可能随版本调整，不建议依赖它做关键流程。
+            <b>上传自定义拓展</b>：选一个 zip（里面要有 <code>extension.json</code>，可在一层子目录里）。
+            上传的拓展可以在这里删除；插件自带与 bot 自学习的技能<b>不允许删除</b>。</p>
+          <div class="row wrap" style="margin-bottom:8px">
+            <input type="file" id="ext-file" accept=".zip">
+            <button class="btn primary" id="btn-ext-upload">上传拓展</button>
+            <button class="btn ghost" id="btn-ext-refresh">刷新列表</button>
+          </div>
+          <pre class="output" id="ext-log" hidden></pre>
           <div id="extensions" class="list"></div>
         </div>
       </section>

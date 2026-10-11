@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS person_profiles(person_id TEXT PRIMARY KEY,user_id TE
 CREATE TABLE IF NOT EXISTS mood_events(event_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL,user_id TEXT NOT NULL DEFAULT '',valence REAL NOT NULL DEFAULT 0,arousal REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',message_id TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS prompt_injections(injection_id TEXT PRIMARY KEY,name TEXT NOT NULL,content TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,builtin INTEGER NOT NULL DEFAULT 0,sort_order INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS user_affinity(scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,user_id TEXT NOT NULL,warmth REAL NOT NULL DEFAULT 50,note TEXT NOT NULL DEFAULT '',interactions INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(scope_id,user_id));
+CREATE TABLE IF NOT EXISTS scope_groups(scope_id TEXT PRIMARY KEY REFERENCES scopes(scope_id) ON DELETE CASCADE,tag TEXT NOT NULL DEFAULT '',activity REAL NOT NULL DEFAULT -1,reply_rate REAL NOT NULL DEFAULT -1,cooldown_scale REAL NOT NULL DEFAULT -1,quiet_hours TEXT NOT NULL DEFAULT '',max_actions_per_hour INTEGER NOT NULL DEFAULT -1,note TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_topics(topic_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,title TEXT NOT NULL,hits INTEGER NOT NULL DEFAULT 1,last_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(scope_id,title));
 CREATE INDEX IF NOT EXISTS idx_current_scope_seq ON message_current(scope_seq);
 CREATE TABLE IF NOT EXISTS agent_plans(plan_id TEXT PRIMARY KEY,due_at TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'custom',detail TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,executed_at TEXT NOT NULL DEFAULT '',note TEXT NOT NULL DEFAULT '');
@@ -192,7 +193,10 @@ class Storage:
         return [
             {"scope_id": str(row["scope_id"]), "platform": str(row["platform"]),
              "account_id": str(row["account_id"]), "conversation_id": str(row["conversation_id"]),
-             "display_name": str(row["display_name"])}
+             "display_name": str(row["display_name"]),
+             # tag 查出来了却没往外带：控制台会话列表与上下文注入都读这个字段，
+             # 结果群标签写了等于没写（已知问题：群配置里设的标签看不到）。
+             "tag": str(row["tag"] or "")}
             for row in rows
         ]
 
@@ -2146,6 +2150,82 @@ class Storage:
             await self._conn().commit()
         except Exception:
             pass
+
+    # ---------------------------------------------------------- 群配置（每群一套参数）
+    _GROUP_FIELDS = ("tag", "activity", "reply_rate", "cooldown_scale",
+                     "quiet_hours", "max_actions_per_hour", "note")
+
+    async def get_group_config(self, scope_id: str) -> dict[str, Any]:
+        """读一个群的配置（没有就返回全默认：各项 -1/空 = 跟随全局）。"""
+        row = await self._fetchone(
+            "SELECT * FROM scope_groups WHERE scope_id=?", (str(scope_id or ""),))
+        if row is None:
+            return {"scope_id": str(scope_id or ""), "tag": "",
+                    "activity": -1.0, "reply_rate": -1.0, "cooldown_scale": -1.0,
+                    "quiet_hours": "", "max_actions_per_hour": -1, "note": "",
+                    "updated_at": ""}
+        data = {key: row[key] for key in ("scope_id", *self._GROUP_FIELDS, "updated_at")}
+        data["activity"] = float(data.get("activity", -1) or -1)
+        data["reply_rate"] = float(data.get("reply_rate", -1) or -1)
+        data["cooldown_scale"] = float(data.get("cooldown_scale", -1) or -1)
+        data["max_actions_per_hour"] = int(data.get("max_actions_per_hour", -1) or -1)
+        return data
+
+    async def set_group_config(self, scope_id: str, **values: Any) -> dict[str, Any]:
+        """写群配置（只写给了的字段；`tag` 同步进 scopes 表，控制台两处都看得到）。"""
+        scope_id = str(scope_id or "").strip()
+        if not scope_id:
+            raise ValueError("缺少 scope_id")
+        current = await self.get_group_config(scope_id)
+        merged = {key: current.get(key) for key in self._GROUP_FIELDS}
+        for key, value in values.items():
+            if key in self._GROUP_FIELDS and value is not None:
+                merged[key] = value
+        now = utc_now()
+        db = self._conn()
+        async with self._write_lock:
+            await self._begin_write(db)
+            try:
+                await db.execute(
+                    "INSERT INTO scope_groups(scope_id,tag,activity,reply_rate,"
+                    "cooldown_scale,quiet_hours,max_actions_per_hour,note,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET "
+                    "tag=excluded.tag, activity=excluded.activity, "
+                    "reply_rate=excluded.reply_rate, "
+                    "cooldown_scale=excluded.cooldown_scale, "
+                    "quiet_hours=excluded.quiet_hours, "
+                    "max_actions_per_hour=excluded.max_actions_per_hour, "
+                    "note=excluded.note, updated_at=excluded.updated_at",
+                    (scope_id, str(merged.get("tag") or "")[:200],
+                     float(merged.get("activity", -1) if merged.get("activity") is not None else -1),
+                     float(merged.get("reply_rate", -1) if merged.get("reply_rate") is not None else -1),
+                     float(merged.get("cooldown_scale", -1) if merged.get("cooldown_scale") is not None else -1),
+                     str(merged.get("quiet_hours") or "")[:40],
+                     int(merged.get("max_actions_per_hour", -1) if merged.get("max_actions_per_hour") is not None else -1),
+                     str(merged.get("note") or "")[:400], now))
+                if str(merged.get("tag") or "").strip():
+                    # 标签同时写进 scopes：控制台会话列表与上下文注入都读那一份
+                    await db.execute("UPDATE scopes SET tag=? WHERE scope_id=?",
+                                     (str(merged.get("tag"))[:200], scope_id))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return await self.get_group_config(scope_id)
+
+    async def all_group_configs(self) -> dict[str, dict[str, Any]]:
+        """scope_id → 群配置（只返回配置过的群）。"""
+        rows = await self._fetchall("SELECT * FROM scope_groups")
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            scope_id = str(row["scope_id"])
+            data = {key: row[key] for key in ("scope_id", *self._GROUP_FIELDS, "updated_at")}
+            data["activity"] = float(data.get("activity", -1) or -1)
+            data["reply_rate"] = float(data.get("reply_rate", -1) or -1)
+            data["cooldown_scale"] = float(data.get("cooldown_scale", -1) or -1)
+            data["max_actions_per_hour"] = int(data.get("max_actions_per_hour", -1) or -1)
+            out[scope_id] = data
+        return out
 
     async def set_scope_tag(self, scope_id: str, tag: str) -> bool:
         """写一个会话的标签（控制台用）。"""

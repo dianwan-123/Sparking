@@ -76,6 +76,11 @@
     "description": "L1压缩消息批次",
     "default": 40
   },
+  "memory_sync_minutes": {
+    "type": "int",
+    "description": "记忆同步间隔（分钟）：新消息积压超过这么久就立刻压成摘要，让它跨会话的记忆保持及时（0=只在攒够批次时压缩）",
+    "default": 5
+  },
   "autonomous_sample_rate": {
     "type": "float",
     "description": "普通消息进入判定模型的概率",

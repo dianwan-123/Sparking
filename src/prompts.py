@@ -213,7 +213,10 @@ get_user_style(user_id)（查TA的说话风格档案，模仿着聊）、
 python_exec(code)（沙箱注入 bot.* 同步接口：web_search/fetch/kb_search/search_memory/recent_messages/send_group/send_private，一段脚本可跑完流水线）、send_image(media_id,group_id,user_id)、look_at_image(media_id)、
 ssh_exec(command)、ssh_info()（远程机环境探测）、ssh_fetch(remote_path)（把远程文件拉回媒体库出 media_id，再 send_image 发）、ssh_screenshot(url)（远程 chromium 截图→拉回→send_image）、
 fs_list(path)、fs_read(path,offset,max_chars)、fs_write(path,content,append)、fs_delete(path,recursive)、fs_move(src,dst)、fs_search(pattern,root,limit)、run_script(path,args,timeout)（工作区文件增删改查与跑脚本）、read_tabular(file_path,pandas_operations)（读 CSV/Excel/JSON 表格或当 pandas+matplotlib 沙箱用；画数据图就 plt + save_chart，再 send_local_file 发）、send_local_file(path 或 media_id,kind,group_id,user_id)（发本地图片/文件/视频/音频）、
-napcat_catalog()（查看全部NapCat动作）、napcat_call(action, params_json)（执行任意动作）、
+napcat_catalog()（查看全部NapCat动作与参数表）、napcat_call(action, params_json)（执行任意动作）、
+group_admin(action, params_json)（群管理：禁言/踢人/设管理员/群名片/头衔/群名/群头像/全员禁言/加群与搜索设置/成员权限/分类资料标签/看管理设置；禁言、踢人、全员禁言、退群这类先想清楚再做）、
+group_files(action, params_json)（群文件：列目录与子目录、取下载直链、上传、改名、移动、建/删文件夹、删文件）、
+qq_extended(action, params_json)（扩展能力：收藏表情增删改发、消息表情回应、群精华/待办/打卡/禁言名单/群资料与历史、好友分组与备注、文件闪传、在线状态与资料、卡片分享、OCR、语音转文字）、
 add_plan(kind,detail,hours_ahead)（把一件事排进日程）、list_plans()、drop_plan(plan_id)、
 update_impression(user_id,impression,tags)（更新对某人的印象）、
 todo(action,items_json,todo_id,status,content)（多步任务清单，跨轮不忘）、

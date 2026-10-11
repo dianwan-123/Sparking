@@ -377,6 +377,7 @@
     { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
     { id: "culture", icon: "culture", title: "群风格与心理", desc: "它学到的说话习惯、群内黑话、对你的了解与情绪记忆" },
     { id: "learn", icon: "learn", title: "快速学习", desc: "导入导出的群聊天记录，让它一次学会这些群" },
+    { id: "gallery", icon: "gallery", title: "表情与媒体", desc: "表情包库与媒体归档：看、改描述、删" },
     { id: "backup", icon: "backup", title: "记忆备份", desc: "导出/导入它的记忆（跨 bot 搬运，嵌入模型要一致）" },
     { id: "config", icon: "config", title: "配置", desc: "全部配置项，改完即时生效、不用重启" },
     { id: "ops", icon: "ops", title: "运维", desc: "维护、危险操作、情绪与通知事件" },
@@ -1099,24 +1100,56 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       title.appendChild(el("span", "", row.group_id));
       if (row.display_name) title.appendChild(el("span", "tag", row.display_name));
       title.appendChild(el("span", "tag", `${row.messages} 条 · ${row.summaries} 摘要`));
+      if (row.tag) title.appendChild(el("span", "tag", row.tag));
+      if (Number(row.activity) >= 0) {
+        title.appendChild(el("span", "tag", `活跃度 ${Number(row.activity).toFixed(2)}`));
+      }
+      if (row.quiet_hours) title.appendChild(el("span", "tag", `静默 ${row.quiet_hours}`));
       const use = actionBtn("切到", () => {
         state.scope = row.group_id;
         $("scope-select").value = row.group_id;
         toast("已切换到 " + row.group_id);
         refresh();
       });
-      const tagBtn = actionBtn(row.tag ? "改标签" : "加标签", async () => {
+      const tagBtn = actionBtn("群配置", async () => {
         const answer = await askPrompt({
-          title: "群标签",
-          fields: [{ key: "tag", label: "这个群是干什么的（用来判断什么话该在这儿说）",
-                     value: row.tag || "", placeholder: "例：工作群 / 亲友群 / 游戏群" }],
+          title: `${row.display_name || row.group_id} · 群配置`,
+          fields: [
+            { key: "tag", label: "这个群是干什么的（影响说话分寸）", value: row.tag || "",
+              placeholder: "例：工作群 / 亲友群 / 游戏群" },
+            { key: "activity", label: "活跃度 0~1（越低越安静；-1=跟随全局）",
+              value: String(row.activity ?? -1), placeholder: "-1" },
+            { key: "reply_rate", label: "回复概率 0~1（越高越爱接话；-1=跟随全局）",
+              value: String(row.reply_rate ?? -1), placeholder: "-1" },
+            { key: "cooldown_scale", label: "冷却倍率（2=冷却翻倍更安静；-1=跟随全局）",
+              value: String(row.cooldown_scale ?? -1), placeholder: "-1" },
+            { key: "quiet_hours", label: "本群静默时段（如 23-7，留空=不设）",
+              value: row.quiet_hours || "", placeholder: "23-7" },
+            { key: "max_actions_per_hour", label: "每小时主动上限（-1=跟随全局）",
+              value: String(row.max_actions_per_hour ?? -1), placeholder: "-1" },
+            { key: "note", label: "备注（只给自己看）", value: row.note || "" },
+          ],
           okText: "保存",
         });
         if (!answer) return;
+        const number = (value) => {
+          const raw = String(value ?? "").trim();
+          if (raw === "" || raw === "-1") return -1;
+          const num = Number(raw);
+          return Number.isFinite(num) ? num : -1;
+        };
         try {
-          await post("scope_tag_save", { group_id: row.group_id, scope_id: row.scope_id,
-                                         tag: String(answer.tag || "").trim() });
-          toast("标签已保存", "ok");
+          await post("group_config_save", {
+            group_id: row.group_id, scope_id: row.scope_id,
+            tag: String(answer.tag || "").trim(),
+            activity: number(answer.activity),
+            reply_rate: number(answer.reply_rate),
+            cooldown_scale: number(answer.cooldown_scale),
+            quiet_hours: String(answer.quiet_hours || "").trim(),
+            max_actions_per_hour: number(answer.max_actions_per_hour),
+            note: String(answer.note || "").trim(),
+          });
+          toast("群配置已保存（立即生效）", "ok");
           loadGroups();
         } catch (error) { toast(String(error.message || error), "error"); }
       });
@@ -1763,6 +1796,7 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       const title = el("div", "title");
       title.appendChild(el("span", "", row.name));
       title.appendChild(el("span", "tag", row.kind));
+      if (row.origin_label) title.appendChild(el("span", "tag", row.origin_label));
       title.appendChild(el("span", "tag", `${row.tools} 个工具`));
       title.appendChild(el("span", "tag", row.enabled ? "已启用" : "已关闭"));
       const toggle = actionBtn(row.enabled ? "关闭" : "启用", async () => {
@@ -1780,6 +1814,19 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         } catch (error) { toast(String(error.message || error), "error"); }
       });
       const buttons = [toggle, reload];
+      if (row.deletable) {
+        buttons.push(actionBtn("删除", async () => {
+          if (!(await askConfirm({
+            title: "删除这个拓展", danger: true, okText: "删除",
+            message: `${row.name}（用户上传的拓展；文件与配置一起删除）`,
+          }))) return;
+          try {
+            await post("extension_delete", { id: row.id });
+            toast("已删除", "ok");
+            loadCaps();
+          } catch (error) { toast(String(error.message || error), "error"); }
+        }, "danger"));
+      }
       // 有配置模板（或已经存过配置）的拓展：给一个「配置」按钮，改完立即生效
       if (row.kind === "脚本拓展"
           && (Object.keys(row.template || {}).length || Object.keys(row.config || {}).length)) {
@@ -1867,6 +1914,29 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       if (event.target === overlay) overlay.remove();
     });
     document.body.appendChild(overlay);
+  }
+
+  // 上传自定义拓展：zip 整包 base64 发过去（限制 8MB，够装脚本与资源）
+  async function runExtensionUpload() {
+    const input = $("ext-file");
+    const log = $("ext-log");
+    const file = input && input.files && input.files[0];
+    if (!file) return toast("先选一个拓展 zip", "error");
+    const show = (value) => { if (log) { log.hidden = false; log.textContent = value; } };
+    show(`正在上传 ${file.name}（${(file.size / 1024).toFixed(0)} KB）…`);
+    try {
+      const data = await readPart(file, 0, file.size);
+      const out = await post("extension_upload", { filename: file.name, data });
+      show(`已安装：${out.display_name || out.id}（${out.id}）` + NL
+           + (out.tools && out.tools.length ? `工具：${out.tools.join("、")}` : "（无工具）")
+           + NL + "可以在下面列表里开关、配置或删除。");
+      toast("拓展已安装", "ok");
+      input.value = "";
+      loadCaps();
+    } catch (error) {
+      show("上传失败：" + String(error.message || error));
+      toast(String(error.message || error), "error");
+    }
   }
 
   function renderCapabilities() {
@@ -2055,6 +2125,8 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
       } catch (error) { toast(String(error.message || error), "error"); }
     });
     $("btn-forest-refresh").addEventListener("click", loadForest);
+    $("btn-ext-refresh").addEventListener("click", loadCaps);
+    $("btn-ext-upload").addEventListener("click", runExtensionUpload);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
     $("btn-refresh-culture").addEventListener("click", loadCulture);
     $("btn-learn-run").addEventListener("click", runImport);
