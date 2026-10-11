@@ -1,0 +1,23 @@
+{
+  "name": "demo-template",
+  "api_version": 1,
+  "display_name": "拓展模板（不加载，复制一份改名再用）",
+  "version": "1.0.0",
+  "author": "Sparking",
+  "description": "一个完整的拓展样例：工具 + 使用说明（manual.md）+ 资源文件。复制整个文件夹、改掉文件夹名与 name 字段即可成为你自己的拓展。",
+  "when_to_use": "当对话涉及【你的场景】（例：掷骰子、查排班、抽签）且需要确定性结果时使用——不要在闲聊时硬用。",
+  "default_enabled": false,
+  "permissions": ["llm", "net"],
+  "tools": [
+    {
+      "name": "template_hello",
+      "description": "打个招呼（示例工具：把这里换成你工具的真实功能说明）",
+      "params": {
+        "name": "叫谁（留空 = 对所有人）"
+      }
+    }
+  ],
+  "prompts": [
+    "【示例】这句会常驻系统提示词：只写一两句必须记住的硬性说明（本模板装着时模型能看到）。"
+  ]
+}

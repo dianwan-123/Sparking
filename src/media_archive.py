@@ -341,6 +341,38 @@ class MediaArchive:
             for row in rows
         ]
 
+    async def delete_item(self, item_id: str) -> bool:
+        """Delete one archived item: the file first (if inside the archive root), then the row."""
+        cursor = await self._conn().execute(
+            "SELECT path FROM media WHERE item_id=?", (str(item_id or ""),))
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return False
+        stored = str(row["path"] or "")
+        if stored:
+            try:
+                target = Path(stored)
+                if not target.is_absolute():
+                    target = self.root / target
+                if target.is_file() and target.is_relative_to(self.root):
+                    await asyncio.to_thread(target.unlink)
+            except OSError:
+                pass          # 文件已不在也要把记录删掉
+        async with self._lock:
+            await self._conn().execute(
+                "DELETE FROM media WHERE item_id=?", (str(item_id),))
+            await self._conn().commit()
+        return True
+
+    async def set_note(self, item_id: str, note: str) -> bool:
+        """改一条媒体的备注（控制台用）。"""
+        cursor = await self._conn().execute(
+            "UPDATE media SET note=? WHERE item_id=?",
+            (str(note or "").strip()[:200], str(item_id or "")))
+        await self._conn().commit()
+        return bool(cursor.rowcount)
+
     async def delete_scope(self, scope_id: str) -> int:
         """Delete every archived item of one scope: rows AND files."""
         return await self._purge(

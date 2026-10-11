@@ -23,6 +23,7 @@ MAX_SKILL_CODE = 12000
 MAX_SKILL_PROMPTS = 8
 MAX_PROMPT_CHARS = 800
 MAX_SKILL_TOOLS = 4
+MAX_MANUAL_CHARS = 8000
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,47}$")
 
 SKILL_REVIEW_SYSTEM_PROMPT = """
@@ -99,6 +100,8 @@ def normalize_skill(proposal: Mapping[str, Any]) -> dict[str, Any] | None:
     code = str(proposal.get("code") or "")
     if len(code) > MAX_SKILL_CODE:
         return None
+    when_to_use = str(proposal.get("when_to_use") or "").strip()[:200]
+    manual = str(proposal.get("manual") or "").strip()[:MAX_MANUAL_CHARS]
     if code.strip():
         try:
             compile(code, "<learned-skill>", "exec")
@@ -114,6 +117,8 @@ def normalize_skill(proposal: Mapping[str, Any]) -> dict[str, Any] | None:
         "id": skill_id,
         "display_name": str(proposal.get("display_name") or skill_id)[:80],
         "description": description,
+        "when_to_use": when_to_use,
+        "manual": manual,
         "prompts": prompts,
         "tools": tools,
         "code": code,
@@ -164,9 +169,11 @@ async def apply_skill(manager: Any, proposal: Mapping[str, Any]) -> dict[str, An
         "display_name": proposal.get("display_name") or proposal["id"],
         "description": proposal.get("description", ""),
         "version": "1.0.0",
+        "when_to_use": str(proposal.get("when_to_use") or ""),
         "prompts": list(proposal.get("prompts") or []),
         "tools": list(proposal.get("tools") or []),
         "permissions": list(proposal.get("permissions") or []),
     }
     return await manager.create_extension(
-        str(proposal["id"]), manifest, str(proposal.get("code") or ""))
+        str(proposal["id"]), manifest, str(proposal.get("code") or ""),
+        manual=str(proposal.get("manual") or ""))

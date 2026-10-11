@@ -260,6 +260,26 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-gallery" hidden>
+        <div class="card">
+          <h2>表情包库 <span class="muted">它自己攒下的表情，可看、可改描述、可删</span></h2>
+          <p class="muted">描述和概要写在表情上，bot 挑表情时会按这些词选——写清楚它就用得准。</p>
+          <div class="row wrap" style="margin-bottom:8px">
+            <button class="btn ghost" id="btn-gallery-refresh">刷新</button>
+            <button class="btn warn" id="btn-clear-stickers2">清空表情包</button>
+          </div>
+          <div id="sticker-grid" class="sticker-grid"></div>
+        </div>
+        <div class="card">
+          <h2>媒体归档 <span class="muted">聊天里收到的图片/文件，可看、可改备注、可删</span></h2>
+          <div class="row wrap" style="margin-bottom:8px">
+            <button class="btn ghost" id="btn-media-refresh">刷新</button>
+            <button class="btn warn" id="btn-clear-media2">清空媒体归档</button>
+          </div>
+          <div id="media-grid" class="sticker-grid"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-backup" hidden>
         <div class="card">
           <h2>记忆导出与导入 <span class="muted">把它的记忆打包带走，也能再喂回来</span></h2>

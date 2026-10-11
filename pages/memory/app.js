@@ -400,6 +400,8 @@
     culture: '<path d="M4 5.5h16v11H8.5L4.5 20z"/><path d="M8 10h8M8 13h5"/>',
     learn: '<path d="M12 4 3.5 8.5 12 13l8.5-4.5z"/><path d="M6 10.5V16c0 1.7 2.7 3 6 3s6-1.3 6-3v-5.5"/><path d="M20.5 8.5V14"/>',
     backup: '<path d="M12 3.5v10"/><path d="M8 9.5 12 13.5 16 9.5"/>' + '<path d="M4.5 16.5v2.2a1.8 1.8 0 0 0 1.8 1.8h11.4a1.8 1.8 0 0 0 1.8-1.8v-2.2"/>',
+    gallery: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.4"/>'
+      + '<circle cx="9" cy="10" r="1.8"/><path d="M4.5 17.5 10 12l3.5 3.5L16.5 12l3 4.5"/>',
   };
 
   function iconSvg(name) {
@@ -698,6 +700,7 @@
       case "culture": return loadCulture();
       case "learn": return loadLearn();
       case "backup": return loadBackup();
+      case "gallery": return loadGallery();
       case "config": return loadConfig();
       case "ops": return loadOps();
       default: return undefined;
@@ -1342,6 +1345,143 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     }, "还没有导入过任何群");
   }
 
+  // ---------------------------------------------------------------- 媒体与表情
+  function _thumb(img, mime, label) {
+    const box = el("div", "thumb-box");
+    if (img) {
+      const pic = el("img", "thumb-img");
+      pic.src = img;
+      pic.alt = label || "";
+      pic.loading = "lazy";
+      box.appendChild(pic);
+    } else {
+      box.appendChild(el("div", "thumb-empty", label || mime || "·"));
+    }
+    return box;
+  }
+
+  function _editableLine(label, value, onSave) {
+    const wrap = el("div", "edit-line");
+    const input = el("input");
+    input.value = value || "";
+    input.placeholder = label;
+    input.addEventListener("change", () => {
+      if ((input.value || "").trim() !== (value || "").trim()) onSave(input.value.trim());
+    });
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  async function loadGallery() {
+    const grid = $("sticker-grid");
+    const mediaGrid = $("media-grid");
+    if (!grid || !mediaGrid) return;
+    grid.textContent = "";
+    mediaGrid.textContent = "";
+    grid.appendChild(el("div", "muted", "加载中…"));
+    mediaGrid.appendChild(el("div", "muted", "加载中…"));
+    let data;
+    try {
+      data = await get("stickers");
+    } catch (error) {
+      grid.textContent = "";
+      grid.appendChild(el("div", "empty", String(error.message || error)));
+      return;
+    }
+    grid.textContent = "";
+    const stickers = data.items || [];
+    if (!stickers.length) {
+      grid.appendChild(el("div", "empty", "表情包库是空的——它在群里看到好表情会自己收"));
+    }
+    stickers.forEach((row) => {
+      const item = el("div", "thumb-item");
+      item.appendChild(_thumb(row.thumb, row.media_type, "表情"));
+      const meta = el("div", "thumb-meta");
+      meta.appendChild(el("div", "thumb-title", row.summary || row.file || row.sticker_id));
+      meta.appendChild(el("div", "muted",
+        `${row.uses || 0} 次使用 · ${(row.size / 1024).toFixed(0)} KB`));
+      item.appendChild(meta);
+      item.appendChild(_editableLine("一句话概要（bot 选表情用）", row.summary, async (value) => {
+        try {
+          await post("sticker_desc_save", {
+            sticker_id: row.sticker_id, summary: value,
+            description: row.description || "",
+          });
+          toast("概要已保存", "ok");
+          loadGallery();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }));
+      item.appendChild(_editableLine("详细描述（什么时候用）", row.description, async (value) => {
+        try {
+          await post("sticker_desc_save", {
+            sticker_id: row.sticker_id, summary: row.summary || "",
+            description: value,
+          });
+          toast("描述已保存", "ok");
+          loadGallery();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }));
+      const actions = el("div", "thumb-actions");
+      actions.appendChild(actionBtn("删除", async () => {
+        if (!(await askConfirm({
+          title: "删除这张表情", danger: true, okText: "删除",
+          message: row.summary || row.file || row.sticker_id,
+        }))) return;
+        try {
+          await post("sticker_delete", { sticker_id: row.sticker_id });
+          toast("已删除", "ok");
+          loadGallery();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }, "danger"));
+      item.appendChild(actions);
+      grid.appendChild(item);
+    });
+
+    let mediaData;
+    try {
+      mediaData = await get("media", { limit: 60 });
+    } catch (error) {
+      mediaGrid.textContent = "";
+      mediaGrid.appendChild(el("div", "empty", String(error.message || error)));
+      return;
+    }
+    mediaGrid.textContent = "";
+    const mediaItems = mediaData.items || [];
+    if (!mediaItems.length) {
+      mediaGrid.appendChild(el("div", "empty", "媒体归档是空的"));
+    }
+    mediaItems.forEach((row) => {
+      const item = el("div", "thumb-item");
+      const isImage = (row.mime || "").startsWith("image/");
+      item.appendChild(_thumb(row.thumb, row.mime, isImage ? "图片" : (row.kind || "文件")));
+      const meta = el("div", "thumb-meta");
+      meta.appendChild(el("div", "thumb-title",
+        `${row.kind || ""} · ${(row.size / 1024).toFixed(0)} KB`));
+      meta.appendChild(el("div", "muted", row.at || ""));
+      item.appendChild(meta);
+      item.appendChild(_editableLine("备注（bot 会按这个想起它）", row.note, async (value) => {
+        try {
+          await post("media_note_save", { media_id: row.media_id, note: value });
+          toast("备注已保存", "ok");
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }));
+      const actions = el("div", "thumb-actions");
+      actions.appendChild(actionBtn("删除", async () => {
+        if (!(await askConfirm({
+          title: "删除这条媒体", danger: true, okText: "删除",
+          message: `${row.kind || ""} ${row.at || ""}`,
+        }))) return;
+        try {
+          await post("media_delete", { media_id: row.media_id });
+          toast("已删除", "ok");
+          loadGallery();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      }, "danger"));
+      item.appendChild(actions);
+      mediaGrid.appendChild(item);
+    });
+  }
+
   // ---------------------------------------------------------------- 记忆导出 / 导入
   function formatSize(bytes) {
     const value = Number(bytes || 0);
@@ -1980,6 +2120,18 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         message: `${state.scope} 的全部记忆与消息记录都会被删除，不可恢复。`,
       }))) return;
       try { const out = await post("group_wipe", scopeParams({})); toast(`已删除 ${out.removed} 条消息`, "ok"); refresh(); }
+      catch (error) { toast(String(error.message || error), "error"); }
+    });
+    $("btn-gallery-refresh").addEventListener("click", loadGallery);
+    $("btn-media-refresh").addEventListener("click", loadGallery);
+    $("btn-clear-stickers2").addEventListener("click", async () => {
+      if (!(await askConfirm({ title: "清空表情包库", danger: true, okText: "清空" }))) return;
+      try { await post("sticker_clear", {}); toast("已清空", "ok"); loadGallery(); }
+      catch (error) { toast(String(error.message || error), "error"); }
+    });
+    $("btn-clear-media2").addEventListener("click", async () => {
+      if (!(await askConfirm({ title: "清空媒体归档", danger: true, okText: "清空" }))) return;
+      try { const out = await post("media_clear", {}); toast(`已删除 ${out.removed_files} 个文件`, "ok"); loadGallery(); }
       catch (error) { toast(String(error.message || error), "error"); }
     });
     $("btn-clear-media").addEventListener("click", async () => {

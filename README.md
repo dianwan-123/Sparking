@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.0.13-orange.svg" alt="v1.0.13">
+  <img src="https://img.shields.io/badge/version-v1.0.14-orange.svg" alt="v1.0.14">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -118,6 +118,63 @@
 
 > [!TIP]
 > zip 走分片上传，几 MB 到几十 MB 的包都能传；解析对坏行、撤回消息、只有 uid 没有 QQ 号的人都做了兼容。
+
+## 🧩 拓展系统（Skills 加强版）
+
+拓展（scripts/）是 Sparking 的"技能"形态：**一个拓展 = 工具 + 使用说明 + 资源 + 配置 + 状态**。
+它比常见的 Skills 多出执行能力——不只是"模型照着说明做"，而是能真正跑代码、调 API、管状态。
+
+### 一个拓展长什么样
+
+```
+scripts/<拓展id>/
+  extension.json     # manifest：名字、描述、何时用、工具表、权限、manual 指针
+  extension.py       # 工具实现（call_tool 入口；可选）
+  manual.md          # 完整使用说明（可选；没有就从 manifest 的 manual 字段读内联文本）
+  config.default.json# 配置模板（可选；用户改动落在数据目录，升级不丢）
+  data/…             # 附属资源（词表/模板/数据），代码里用 api.read_resource 读
+```
+
+manifest 里的两个关键字段：
+
+- **`when_to_use`**（一句话）：常驻注入系统提示词的"什么时候该用它"——模型据此判断要不要用它；
+- **`manual`**：完整使用说明，**按需加载**——系统提示词里只放一张"能力卡"（名字 + 一句话 + 何时用 +
+  工具列表），模型决定要用时才调 `extension_manual(script="…")` 读全文。省 token，也更好维护。
+
+### 工具与 API
+
+`extension.json` 的 `tools` 里声明工具（名字、说明、参数），模型用
+`extension_call(script, tool, params_json)` 调用；`extension.py` 里实现
+`call_tool(api, name, params)`。`api` 对象提供：
+
+| 能力 | 方法 | 需要权限 |
+| :--- | :--- | :--- |
+| 调模型 | `api.llm(prompt, system_prompt, provider_id)` | `llm` |
+| 写记忆 | `api.memory_note(text)` | `memory` |
+| HTTP | `api.http_get / http_post_json / http_get_bytes` | `net` |
+| 收发 QQ | `api.qq_send_group / qq_send_private` | `send` |
+| 存图/发媒体 | `api.save_image(png)` → media_id | `media` |
+| 起小程序 | `api.run_program(id, code, …)` | `program` |
+| SSH | `api.ssh_exec(cmd)` / `api.media_from_remote(path)` | `ssh` |
+| 配置 | `api.config()` / `api.get_config(k)` / `api.set_config(k, v)` | — |
+| 状态 | `api.kv_get(k)` / `api.kv_set(k, v)` | — |
+| 资源 | `api.read_resource(path)` / `api.list_resources()` / `api.manual()` | — |
+
+配置**每次调用都重读**——控制台改完立即生效。`kv` 是拓展自己的小数据库（存进度、缓存）。
+
+### 生命周期与安全
+
+- 拓展可声明 `default_enabled: false`（默认关闭，工具不暴露给模型），控制台里随时开关；
+- 权限按需声明（`llm/memory/net/send/program/media/ssh`），少声明更安全；
+- 每个拓展异常隔离：一个拓展坏了只影响它自己；
+- 拓展还可以由 bot 自己写：它把复杂流程固化成技能（`learn_skill`），写出的技能
+  与手写拓展同构（含 `manual.md`），立即热加载。
+
+### 上手
+
+`scripts/_template/` 是一份**完整模板**（不被加载）：复制整个文件夹、改掉文件夹名与
+manifest 里的 `name`，按 `manual.md` 里的注释填内容即可。控制台「能力与拓展」里可以
+查看/开关/重载/编辑配置，`extension_manual` 工具就是读的这份说明。
 
 ## 📑 常用配置
 

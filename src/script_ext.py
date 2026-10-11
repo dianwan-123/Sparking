@@ -101,6 +101,30 @@ class ScriptExtensionAPI:
         """改一个配置项（写进配置文件，立即对后续调用生效）。"""
         self._manager.set_config_value(self.name, str(key), value)
 
+    def read_resource(self, relpath: str) -> str:
+        """读本拓展目录里的一个附属资源文件（模板/词表/数据，≤2 万字符）。
+
+        路径相对拓展目录，**不能越出目录**；读不到会明确报错。
+        """
+        ext = self._manager.get(self.name)
+        if ext is None:
+            raise ScriptExtensionError(f"拓展 {self.name} 未加载")
+        return ext.read_resource(relpath)
+
+    def list_resources(self) -> "list[dict[str, str]]":
+        """列出本拓展目录里的附属资源文件（名字与大小）。"""
+        ext = self._manager.get(self.name)
+        if ext is None:
+            raise ScriptExtensionError(f"拓展 {self.name} 未加载")
+        return ext.resources()
+
+    def manual(self) -> str:
+        """本拓展的完整使用说明（与 extension_manual 工具返回的一致）。"""
+        ext = self._manager.get(self.name)
+        if ext is None:
+            raise ScriptExtensionError(f"拓展 {self.name} 未加载")
+        return ext.manual_text()
+
     def now(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -262,12 +286,18 @@ def validate_manifest(raw: Any, source: Path) -> dict[str, Any]:
     permissions = frozenset(
         str(p) for p in (raw.get("permissions") or [])
         if str(p) in _KNOWN_PERMISSIONS)
+    when_to_use = str(raw.get("when_to_use") or "").strip()
+    manual = raw.get("manual")
     return {
         "name": name,
         "api_version": api_version,
         "display_name": str(raw.get("display_name") or name),
         "version": str(raw.get("version") or "0.0.0"),
         "description": str(raw.get("description") or "")[:300],
+        "when_to_use": when_to_use[:200],
+        # manual：内联文本，或拓展目录里的文件名（如 "manual.md"）。
+        # 完整使用说明走**按需加载**（extension_manual 工具），不进常驻提示词。
+        "manual": (str(manual)[:4000] if isinstance(manual, str) else ""),
         "author": str(raw.get("author") or ""),
         "tools": clean_tools,
         "prompts": [str(x) for x in prompts if str(x).strip()],
@@ -394,6 +424,83 @@ class ScriptExtension:
                 self._manager.log(self.id, f"get_prompts 异常（忽略）：{error}")
         return result
 
+    # 手册文件的候选名（按顺序找第一个存在的）
+    _MANUAL_FILES = ("manual.md", "SKILL.md", "extension.md", "README.md")
+
+    def manual_text(self) -> str:
+        """完整使用说明：manifest 内联 → 拓展目录里的手册文件 → 空串。
+
+        供 `extension_manual` 工具按需加载（渐进式披露：常驻提示词里只有
+        一句话的"何时用"，全文要用的时候再取，省 token 也好维护）。
+        """
+        inline = str(self.manifest.get("manual") or "").strip()
+        # 内联文本（含换行）直接用；单行且以 .md/.txt/.html 结尾的视作文件名
+        newline = chr(10)
+        if inline and (newline in inline
+                       or not inline.lower().endswith((".md", ".txt", ".html"))):
+            return inline[:4000]
+        folder = Path(self.folder)
+        declared = str(self.manifest.get("manual") or "").strip()
+        candidates = ([declared] if declared else []) + list(self._MANUAL_FILES)
+        for name in candidates:
+            if not name:
+                continue
+            candidate = folder / name
+            if candidate.is_file():
+                try:
+                    return candidate.read_text(encoding="utf-8")[:12000]
+                except OSError:
+                    continue
+        return ""
+
+    def resources(self) -> "list[dict[str, str]]":
+        """拓展目录里的附属资源文件（排除代码/manifest/手册本身）。"""
+        reserved = {"extension.json", "extension.py", "config.default.json",
+                    "manual.md", "SKILL.md", "extension.md"}
+        reserved.update(self._MANUAL_FILES)
+        rows: list[dict[str, str]] = []
+        try:
+            for path in sorted(Path(self.folder).iterdir()):
+                if path.name in reserved or path.name.startswith((".", "__")):
+                    continue
+                if path.is_dir():
+                    rows.append({"name": path.name + "/", "size": 0})
+                elif path.is_file():
+                    rows.append({"name": path.name, "size": path.stat().st_size})
+        except OSError:
+            pass
+        return rows
+
+    def read_resource(self, relpath: str) -> str:
+        """读拓展目录里的一个资源文件（越界/不存在都明确报错）。"""
+        folder = Path(self.folder).resolve()
+        candidate = (folder / str(relpath or "")).resolve()
+        if not candidate.is_relative_to(folder):
+            raise ScriptExtensionError("资源路径不能越出拓展目录")
+        if not candidate.is_file():
+            raise ScriptExtensionError(f"资源不存在：{relpath}")
+        return candidate.read_text(encoding="utf-8", errors="replace")[:20000]
+
+    def capability_card(self) -> str:
+        """常驻提示词里的**一张卡**：名字 + 一句话 + 何时用 + 工具。
+
+        这是渐进式披露的第一层——完整说明在 manual 里，按需取。
+        """
+        name = str(self.manifest.get("display_name") or self.id)
+        description = str(self.manifest.get("description") or "").strip()
+        when_to_use = str(self.manifest.get("when_to_use") or "").strip()
+        tools = [str(tool.get("name") or "") for tool in self.manifest.get("tools", [])
+                 if str(tool.get("name") or "")]
+        lines = [f"◆ {name}（id={self.id}）"]
+        if description:
+            lines.append(f"  是什么：{description}")
+        if when_to_use:
+            lines.append(f"  什么时候用：{when_to_use}")
+        if tools:
+            lines.append(f"  工具：{'、'.join(tools)}（extension_call 调用）")
+        lines.append('  详细用法：extension_manual(script="' + self.id + '") 按需读取')
+        return "\n".join(lines)
+
     def summary(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -402,6 +509,9 @@ class ScriptExtension:
             "version": self.manifest.get("version", ""),
             "api_version": self.manifest.get("api_version", 1),
             "description": self.manifest.get("description", ""),
+            "when_to_use": self.manifest.get("when_to_use", ""),
+            "has_manual": bool(self.manual_text()),
+            "resources": [row["name"] for row in self.resources()],
             "author": self.manifest.get("author", ""),
             "permissions": sorted(self.manifest.get("permissions", frozenset())),
             "tools": self.manifest.get("tools", []),
@@ -627,6 +737,7 @@ class ScriptExtensionManager:
 
     async def create_extension(
         self, ext_id: str, manifest: dict[str, Any], code: str = "",
+        *, manual: str = "",
     ) -> dict[str, Any]:
         """把一个（自学习的）拓展写进 learned root 并热加载。
 
@@ -656,6 +767,10 @@ class ScriptExtensionManager:
                 encoding="utf-8")
             if str(code or "").strip():
                 (folder / "extension.py").write_text(str(code), encoding="utf-8")
+            # 完整使用说明落盘成 manual.md（extension_manual 工具按需读取）
+            if str(manual or "").strip():
+                (folder / "manual.md").write_text(
+                    str(manual).strip()[:12000] + "\n", encoding="utf-8")
         except OSError as error:
             return {"ok": False, "id": clean_id, "error": f"写入失败：{error}"}
         await self.reload()

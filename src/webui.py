@@ -17,8 +17,10 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
+import pathlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -62,7 +64,11 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("group_wipe", "清空某群记忆"),
     ("wipe_all", "清空全部记忆"),
     ("media_clear", "清空媒体归档"),
+    ("media_delete", "删除一条媒体"),
+    ("media_note_save", "改媒体备注"),
     ("sticker_clear", "清空表情包"),
+    ("sticker_delete", "删除一张表情包"),
+    ("sticker_desc_save", "改表情包描述"),
     ("impression_save", "写人物印象"),
     ("impression_delete", "删人物印象"),
     ("affinity_adjust", "调好感度"),
@@ -550,13 +556,27 @@ class PageAPI:
         items = []
         for row in rows:
             data = dict(row) if isinstance(row, Mapping) else {}
+            item_id = str(data.get("id") or "")       # recent() 返回的键是 id
+            mime = str(data.get("mime") or "")
+            thumb = ""
+            status = str(data.get("status") or "")
+            # 图片类给一张小图预览（base64 data URI，前端直接 <img>）；
+            # 非图片（文件/语音/视频）没有缩略图，前端按类型显示占位。
+            if mime.startswith("image/") and status == "saved" and media is not None:
+                try:
+                    got_mime, encoded = await media.get_base64(item_id)
+                    if encoded:
+                        thumb = f"data:{got_mime or mime};base64,{encoded}"
+                except Exception:
+                    thumb = ""
             items.append({
-                "media_id": str(data.get("item_id") or ""),
+                "media_id": item_id,
                 "kind": str(data.get("kind") or ""),
-                "mime": str(data.get("mime") or ""),
+                "mime": mime,
                 "size": int(data.get("size") or 0),
-                "note": str(data.get("note") or "")[:80],
+                "note": str(data.get("note") or "")[:200],
                 "at": str(data.get("created_at") or "")[:19],
+                "thumb": thumb,
             })
         return {"items": items, "count": len(items)}
 
@@ -570,16 +590,37 @@ class PageAPI:
             items = stickers.select(24)
         except Exception:
             items = []
+        catalog = {}
+        try:
+            catalog = {row.get("sticker_id"): row
+                       for row in (stickers.catalog(limit=0) or [])}
+        except Exception:
+            catalog = {}
         out = []
         for item in items or []:
             pick = (lambda name, default="": item.get(name, default)
                     if isinstance(item, Mapping) else getattr(item, name, default))
             path = str(pick("path"))
+            sticker_id = str(pick("sha256") or "")
+            meta = catalog.get(sticker_id) or {}
+            thumb = ""
+            try:
+                payload = path and pathlib.Path(path)
+                if payload and payload.is_file():
+                    encoded = base64.b64encode(payload.read_bytes()[:512 * 1024]).decode("ascii")
+                    thumb = f"data:{pick('media_type', 'image/png')};base64,{encoded}"
+            except Exception:
+                thumb = ""
             out.append({
-                "sha256": str(pick("sha256"))[:16],
+                "sticker_id": sticker_id,
+                "sha256": sticker_id[:16],
                 "media_type": str(pick("media_type")),
                 "size": int(pick("size", 0) or 0),
                 "file": path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1],
+                "summary": str(meta.get("summary") or ""),
+                "description": str(meta.get("description") or ""),
+                "uses": int(meta.get("uses", 0) or 0),
+                "thumb": thumb,
             })
         total = 0
         try:
@@ -1053,6 +1094,64 @@ class PageAPI:
             except Exception:
                 pass
         return {"ok": True, "removed": int(result), "media_files": files}
+
+    async def _do_media_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        media = getattr(self.host, "media", None)
+        if media is None:
+            raise WebUIError("媒体归档未启用")
+        item_id = str(body.get("media_id") or "").strip()
+        if not item_id:
+            raise WebUIError("缺少 media_id")
+        ok = await media.delete_item(item_id)
+        if not ok:
+            raise WebUIError("这条媒体已经不在了")
+        return {"ok": True, "removed": item_id}
+
+    async def _do_media_note_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        media = getattr(self.host, "media", None)
+        if media is None:
+            raise WebUIError("媒体归档未启用")
+        item_id = str(body.get("media_id") or "").strip()
+        note = str(body.get("note") or "").strip()[:200]
+        if not item_id:
+            raise WebUIError("缺少 media_id")
+        if not await media.set_note(item_id, note):
+            raise WebUIError("这条媒体已经不在了")
+        return {"ok": True, "media_id": item_id, "note": note}
+
+    async def _do_sticker_delete(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        stickers = getattr(self.host, "stickers", None)
+        if stickers is None:
+            raise WebUIError("表情包库未启用")
+        sticker_id = str(body.get("sticker_id") or "").strip()
+        if not sticker_id:
+            raise WebUIError("缺少 sticker_id")
+        try:
+            ok = stickers.delete(sticker_id)
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:160]) from error
+        if not ok:
+            raise WebUIError("这张表情已经不在了")
+        return {"ok": True, "removed": sticker_id}
+
+    async def _do_sticker_desc_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        stickers = getattr(self.host, "stickers", None)
+        if stickers is None:
+            raise WebUIError("表情包库未启用")
+        sticker_id = str(body.get("sticker_id") or "").strip()
+        summary = str(body.get("summary") or "").strip()[:120]
+        description = str(body.get("description") or "").strip()[:300]
+        if not sticker_id:
+            raise WebUIError("缺少 sticker_id")
+        if not summary and not description:
+            raise WebUIError("内容和描述至少填一个")
+        try:
+            await stickers.note(
+                sticker_id, summary=summary or None, description=description or None)
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:160]) from error
+        return {"ok": True, "sticker_id": sticker_id,
+                "summary": summary, "description": description}
 
     async def _do_media_clear(self, body: Mapping[str, Any]) -> dict[str, Any]:
         media = getattr(self.host, "media", None)

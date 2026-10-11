@@ -267,7 +267,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.13"
+PLUGIN_VERSION = "1.0.14"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -7273,10 +7273,36 @@ class LongMemoryAgentPlugin(Star):
         return "【常备指令（主人授予你的长期行动授权，每次对话都生效）】" + text[:2000]
 
     def _script_prompts_block(self) -> str:
-        """拓展提示词段落：注入回复/自主系统提示词。"""
-        return "\n\n".join(
-            text.strip() for text in self._script_manager().prompts() if text.strip()
-        )
+        """拓展提示词段落（**渐进式披露**）。
+
+        两层：
+        - **能力卡**：每个启用的拓展一张（名字 + 一句话 + 何时用 + 工具列表）——
+          常驻，让模型知道"有这么个东西、什么时候用它"；
+        - **常驻小注入**：manifest `prompts` 里的一两句硬性说明（如"尚未完工"）。
+
+        完整使用说明（manual）**不在这里**——按需用 `extension_manual` 工具取，
+        免得几个拓展的手册把系统提示词撑爆。
+        """
+        manager = self._script_manager()
+        cards: list[str] = []
+        for ext in sorted(manager.extensions.values(), key=lambda e: e.id):
+            if ext.error and ext.module is None:
+                continue
+            if not manager.is_enabled(ext.id):
+                continue
+            card = ext.capability_card()
+            if card.strip():
+                cards.append(card)
+        sections: list[str] = []
+        if cards:
+            sections.append(
+                "【可用的 scripts 拓展】下面的拓展各有完整使用说明"
+                "（用 extension_manual(script=\"id\") 按需读取，别凭感觉瞎调）：\n"
+                + "\n".join(cards))
+        always_on = [t.strip() for t in manager.prompts() if t.strip()]
+        if always_on:
+            sections.append("\n\n".join(always_on))
+        return "\n\n".join(sections)
 
     async def load_script_extensions(self) -> None:
         problems = await self._script_manager().load_all()
@@ -12086,12 +12112,48 @@ class LongMemoryAgentPlugin(Star):
 
     @filter.llm_tool(name="script_list")
     async def script_list_tool(self, event: AstrMessageEvent):
-        """列出已加载的 scripts 拓展与它们提供的工具（含参数说明）。"""
+        """列出已加载的 scripts 拓展与它们提供的工具（含参数说明、何时用）。"""
         manager = self._script_manager()
         return compact_json({
-            "scripts": manager.list(),
+            "scripts": [
+                {key: value for key, value in item.items()
+                 if key not in {"config", "config_template"}}
+                for item in manager.list()
+            ],
             "tools": manager.tool_catalog(),
         }, self.settings.context_char_budget // 2)
+
+    @filter.llm_tool(name="extension_manual")
+    async def extension_manual_tool(self, event: AstrMessageEvent, script: str):
+        """读一个 scripts 拓展的**完整使用说明**（什么时候用、分几步、参数细节、注意事项）。
+
+        系统提示词里只有它的一句话简介；决定要用某个拓展后，先来这里读全文再动手，
+        比凭名字猜参数可靠。返回里还会列出该拓展附带的资源文件
+        （用 script_call 之外的方式拿不到的模板/词表，可让拓展自己用 api.read_resource 读）。
+
+        Args:
+            script(string): 拓展 id（script_list 里能看到）。
+        """
+        manager = self._script_manager()
+        ext = manager.get(str(script or "").strip())
+        if ext is None:
+            known = "、".join(manager.extensions) or "无"
+            return f"没有叫 {script} 的拓展（已加载：{known}）"
+        if not manager.is_enabled(ext.id):
+            return f"拓展 {ext.id} 已关闭（控制台「能力与拓展」里可以打开）"
+        manual = ext.manual_text()
+        resources = ext.resources()
+        if not manual:
+            manual = (f"这个拓展没有写使用说明。可用工具："
+                      f"{'、'.join(str(t.get('name') or '') for t in ext.manifest.get('tools', [])) or '（无）'}；"
+                      "参数表用 script_list 查。")
+        return compact_json({
+            "script": ext.id,
+            "display_name": str(ext.manifest.get("display_name") or ext.id),
+            "when_to_use": str(ext.manifest.get("when_to_use") or ""),
+            "manual": manual[:8000],
+            "resources": resources,
+        }, 9000)
 
     async def _todo_action(
         self, scope: str | None, action: str, items_json: str = "",
@@ -12140,6 +12202,8 @@ class LongMemoryAgentPlugin(Star):
                     line.strip() for line in str(args.get("prompts", "")).splitlines()
                     if line.strip()
                 ],
+                "when_to_use": str(args.get("when_to_use", "")),
+                "manual": str(args.get("manual", "")),
                 "tools": parse_json_value(str(args.get("tools_json", "")) or "[]") or [],
                 "code": str(args.get("code", "")),
                 "permissions": parse_json_value(
@@ -12174,6 +12238,8 @@ class LongMemoryAgentPlugin(Star):
         ]
         if add_prompts:
             manifest["prompts"] = (list(manifest.get("prompts") or []) + add_prompts)[:8]
+        if str(args.get("when_to_use", "")).strip():
+            manifest["when_to_use"] = str(args.get("when_to_use")).strip()[:200]
         perms = parse_json_value(str(args.get("permissions_json", "")) or "[]")
         if isinstance(perms, list) and perms:
             manifest["permissions"] = [
@@ -12193,7 +12259,8 @@ class LongMemoryAgentPlugin(Star):
                 compile(code, "<learned-skill-update>", "exec")
             except SyntaxError as error:
                 return f"新版代码编译不过：{error}"
-        result = await manager.create_extension(skill_id, manifest, code)
+        result = await manager.create_extension(
+            skill_id, manifest, code, manual=str(args.get("manual", "")))
         if not result.get("ok"):
             return f"更新失败：{str(result.get('error'))[:200]}"
         return compact_json({"ok": True, "skill": skill_id,
