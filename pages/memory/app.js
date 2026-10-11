@@ -704,6 +704,35 @@
     }
   }
 
+  // 侧栏图标：优先用页面自带的 logo.png。
+  // 插件页的静态资源带一次性 asset_token（宿主把 HTML 里的相对路径重写成了带 token 的绝对地址），
+  // 运行时自己拼 "logo.png" 会 401/404 → 图标消失。所以这里直接复用宿主已经重写好的
+  // favicon 地址（它一定带 token），并且**只有图片真的加载成功才替换掉那个字形**。
+  function brandAssetUrl() {
+    const icon = document.querySelector('link[rel="icon"]');
+    const href = icon && icon.getAttribute("href");
+    if (href) return href;
+    return "logo.png";
+  }
+
+  function swapBrandLogo() {
+    const logo = document.querySelector(".brand .logo");
+    if (!logo || logo.dataset.image) return;
+    const img = document.createElement("img");
+    img.alt = "Sparking";
+    img.width = 34;
+    img.height = 34;
+    img.style.borderRadius = "10px";
+    img.addEventListener("load", () => {
+      // 加载成功才换：失败时保留原来的字形，不能留一个空方块
+      logo.textContent = "";
+      logo.appendChild(img);
+      logo.dataset.image = "1";
+    });
+    img.addEventListener("error", () => { img.remove(); });
+    img.src = brandAssetUrl();
+  }
+
   // ---------------------------------------------------------------- 概览
   async function loadOverview() {
     const [data, scopes] = await Promise.all([get("overview"), get("scopes")]);
@@ -712,19 +741,7 @@
     pill.textContent = data.enabled ? "已启用" : "未启用";
     pill.className = "pill " + (data.enabled ? "on" : "off");
     $("brand-version").textContent = data.version ? "v" + data.version : "Sparking";
-    const logo = document.querySelector(".brand .logo");
-    if (logo && !logo.dataset.image) {
-      const img = document.createElement("img");
-      img.src = "logo.png";   // 页面同级副本：跨出插件目录的路径在插件页里会 404
-      img.alt = "Sparking";
-      img.width = 34;
-      img.height = 34;
-      img.style.borderRadius = "10px";
-      img.addEventListener("error", () => { img.remove(); });
-      logo.textContent = "";
-      logo.appendChild(img);
-      logo.dataset.image = "1";
-    }
+    swapBrandLogo();
 
     const counts = data.counts || {};
     const cards = [
