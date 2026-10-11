@@ -46,7 +46,7 @@ _LAUNCH_ARGS = [
     "--disable-background-networking",
     "--no-first-run",
     "--no-default-browser-check",
-    # 反自动化特征：实录用户服务器上 Cent Browser 能开的站，我们这套打不开——
+    # 反自动化特征：已知问题用户服务器上 Cent Browser 能开的站，我们这套打不开——
     # 除去"页面卡死"，headless 被识别也是一大类原因，顺手关掉最明显的标记。
     "--disable-blink-features=AutomationControlled",
     "--disable-features=IsolateOrigins,site-per-process",
@@ -308,7 +308,7 @@ class PlaywrightDriver:
     async def _discard_page(self) -> None:
         """丢掉当前共享页面。
 
-        实录（用户日志）：bilibili 在服务器上用 Cent Browser 打得开，但我们的
+        已知问题：bilibili 在服务器上用 Cent Browser 打得开，但我们的
         Chromium 首次导航超时后**那个页面还挂在"半路"状态**——之后每次调用复用同一个
         页面，于是截图超时、browser_dom 再超时 30s、连环失败。导航一失败就把页面丢掉，
         下次调用自然拿到新页面。
@@ -536,7 +536,7 @@ class PlaywrightDriver:
             await render_page.wait_for_timeout(500)
             # 内容自适应：HTML 标了 data-shot-fit 的元素（聊天卡片就是）就按它的
             # 实际尺寸定视口，再截图——否则固定 1280 宽的视口会把 520px 宽的卡片
-            # 塞在左上角，其余全白（用户：「消息只占左上角一点点」）。
+            # 塞在左上角，其余全白（「消息只占左上角一点点」）。
             box = await self._measure_fit(render_page)
             if box:
                 # 窄卡片（聊天卡片 520px）放 2 倍：图片尺寸接近手机截图，字也清晰

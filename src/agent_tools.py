@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +10,8 @@ from .astrbot_runtime import build_runtime_manifest
 from .skill_manager import SkillManager
 
 
+# ---- 指令解析用到的词表与常量（全部显式列出，便于逐条核对与测试） ----
+# 动作词 → 规范动作名
 _PLUGIN_ACTIONS = {
     "安装": "install", "更新": "update", "启用": "enable",
     "禁用": "disable", "重载": "reload",
@@ -22,22 +23,128 @@ _SKILL_ACTIONS = {
     "create": "create", "modify": "update", "update": "update",
     "enable": "enable", "disable": "disable",
 }
-_PLUGIN_RE = re.compile(
-    r"^(?:请\s*)?(安装|更新|启用|禁用|重载|install|update|enable|disable|reload)"
-    r"\s*(?:插件|plugin)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_.\-/]{0,254})\s*[。！!]?\s*$",
-    re.IGNORECASE,
+# 资源词 → 资源名
+_RESOURCE_WORDS = {"插件": "plugin", "plugin": "plugin", "技能": "skill", "skill": "skill"}
+# 可选的礼貌前缀（剥掉后才是真正的动作词）
+_POLITE_PREFIXES = ("请", "帮我", "麻烦", "给我")
+# 引号/代码块开头：整条被引用的话不能当命令
+_QUOTE_PREFIXES = (">", "“", '"', "'", "「", "『", "```")
+# 转述、假设、提问的标记词：出现这些就不是"直接命令"
+_INDIRECT_MARKERS = (
+    "他说", "她说", "转述", "引用", "如果", "假如", "模型", "助手",
+    "建议", "提议", "是否", "能否", "可否", "要不要", "怎么办",
 )
-_SKILL_RE = re.compile(
-    r"^(?:请\s*)?(创建|修改|启用|禁用|create|modify|update|enable|disable)"
-    r"\s*(?:skill|技能)\s*[:：]?\s*([a-z0-9]+(?:-[a-z0-9]+)*)"
-    r"(?:[ \t]*\n([\s\S]+))?[ \t]*$",
-    re.IGNORECASE,
-)
-_INDIRECT_OR_QUESTION = re.compile(
-    r"[?？]|(?:^|\s|，|,)(?:他说|她说|转述|引用|如果|假如|模型|助手|建议|提议|是否|能否|可否|要不要|怎么办)"
-    r"|(?:吗|么|呢)[。！!\s]*$",
-    re.IGNORECASE,
-)
+# 句末疑问语气词（去掉尾部标点后判断）
+_QUESTION_TAILS = ("吗", "么", "呢")
+# 命令句末尾允许出现的标点（会被剥掉）
+_TRAILING_PUNCT = "。！!．."
+
+
+def _is_plugin_target(value: str) -> bool:
+    """插件目标：ASCII 字母数字开头，其余可含 . _ - /，最长 255。"""
+    if not value or len(value) > 255:
+        return False
+    if not (value[0].isascii() and value[0].isalnum()):
+        return False
+    return all(char.isascii() and (char.isalnum() or char in "._-/") for char in value)
+
+
+def _is_skill_target(value: str) -> bool:
+    """技能目标：kebab-case（ASCII 小写字母/数字，段间单个连字符）。"""
+    if not value or len(value) > 64:
+        return False
+    if value.startswith("-") or value.endswith("-") or "--" in value:
+        return False
+    return all(char.isascii() and (char.islower() or char.isdigit() or char == "-")
+               for char in value)
+
+
+def _strip_leading_polite(value: str) -> str:
+    """剥掉开头的"请/帮我/麻烦/给我"以及空白（可叠用）。"""
+    changed = True
+    while changed:
+        changed = False
+        value = value.lstrip(" \t\u3000")
+        for prefix in _POLITE_PREFIXES:
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+                changed = True
+                break
+    return value
+
+
+def _looks_indirect_or_question(head: str) -> bool:
+    """整行是反问/转述/假设吗（是的话不能当直接命令）。"""
+    if "?" in head or "？" in head:
+        return True
+    if any(marker in head for marker in _INDIRECT_MARKERS):
+        return True
+    tail = head.rstrip(" \t\u3000" + _TRAILING_PUNCT)
+    return tail.endswith(_QUESTION_TAILS)
+
+
+def _match_word(head: str, table: "dict[str, str]") -> "tuple[str, str] | None":
+    """在 head 开头匹配词表里的词（长词优先，避免"更新"抢"更新插件"）。"""
+    for word in sorted(table, key=len, reverse=True):
+        if head.startswith(word):
+            return word, head[len(word):]
+    return None
+
+
+def parse_direct_instruction(text: str) -> "dict[str, Any] | None":
+    """把一条"直接命令"解析成 {action, resource, target, payload}；不是命令返回 None。
+
+    只认**一种句式**：`[请] <动作词> <资源词>[:] <目标>`（可换行接正文）。
+    判据逐条显式：引号开头否、含问号否、含转述/假设词否、句末是疑问语气词否；
+    然后动作词、资源词按词表切分，目标按字符集校验。任何一步不满足就判"不是命令"。
+    """
+    raw = str(text or "")
+    lines = raw.splitlines()
+    if not lines:
+        return None
+    head = lines[0].strip()
+    payload = "\n".join(lines[1:]).strip() or None
+    if not head:
+        return None
+    if head.startswith(_QUOTE_PREFIXES):
+        return None
+    if _looks_indirect_or_question(head):
+        return None
+
+    rest = _strip_leading_polite(head)
+    verb = _match_word(rest, {**_PLUGIN_ACTIONS, **_SKILL_ACTIONS})
+    if verb is None:
+        return None
+    action_word, rest = verb
+    rest = rest.lstrip(" \t\u3000")
+    noun = _match_word(rest, _RESOURCE_WORDS)
+    if noun is None:
+        return None
+    resource_word, rest = noun
+    resource = _RESOURCE_WORDS[resource_word]
+    rest = rest.lstrip(" \t\u3000")
+    if rest.startswith((":", "：")):
+        rest = rest[1:].lstrip(" \t\u3000")
+    target = rest.strip(" \t\u3000")
+    target = target.rstrip(_TRAILING_PUNCT).strip(" \t\u3000")
+    if not target:
+        return None
+
+    # 动作词必须属于这个资源（"创建插件"这种没有的动作词一律判不是命令）
+    table = _PLUGIN_ACTIONS if resource == "plugin" else _SKILL_ACTIONS
+    if action_word.lower() not in {word.lower() for word in table}:
+        return None
+    action = table.get(action_word) or table.get(action_word.lower())
+    if action is None:
+        return None
+
+    if resource == "plugin":
+        if not _is_plugin_target(target):
+            return None
+        return {"action": action, "resource": "plugin", "target": target, "payload": None}
+    if not _is_skill_target(target):
+        return None
+    return {"action": action, "resource": "skill", "target": target, "payload": payload}
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,22 +304,19 @@ async def authorize_admin_instruction(event: Any) -> Authorization:
         return result(False, "instruction is too large")
     if text.startswith((">", "“", '"', "'", "「", "『", "```")):
         return result(False, "quoted text cannot authorize an operation")
-    first_line = text.splitlines()[0]
-    if _INDIRECT_OR_QUESTION.search(first_line):
-        return result(False, "indirect, suggested, or interrogative text is not authorized")
-    plugin_match = _PLUGIN_RE.fullmatch(text)
-    if plugin_match:
-        action, target = plugin_match.groups()
-        return result(True, "direct administrator instruction", _PLUGIN_ACTIONS[action.lower()], "plugin", target)
-    skill_match = _SKILL_RE.fullmatch(text)
-    if skill_match:
-        action_text, target, payload = skill_match.groups()
-        action = _SKILL_ACTIONS[action_text.lower()]
+    parsed = parse_direct_instruction(text)
+    if parsed is None:
+        return result(False, "text is not a supported direct imperative")
+    if parsed["resource"] == "skill":
+        action, payload = parsed["action"], parsed["payload"]
         if action in {"create", "update"} and not payload:
             return result(False, "skill content must be present in the direct instruction")
         if action in {"enable", "disable"} and payload:
             return result(False, "unexpected skill content")
-        return result(True, "direct administrator instruction", action, "skill", target, payload)
+        return result(True, "direct administrator instruction", action, "skill",
+                      parsed["target"], payload)
+    return result(True, "direct administrator instruction", parsed["action"],
+                  "plugin", parsed["target"])
     return result(False, "text is not a supported direct imperative")
 
 

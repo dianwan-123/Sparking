@@ -151,7 +151,7 @@ class StickerManager:
         result = [entry for _, entry in scored[:max(0, limit)]]
         if not result:
             # 无描述/无词命中时回退热门库存——否则没有 vision 描述的库 pick 恒空，
-            # 模型以为"没货"，是从不主动发表情的一环（实录）。
+            # 模型以为"没货"，是从不主动发表情的一环。
             result = self.catalog(limit=limit)
         return result
 
@@ -325,7 +325,7 @@ class StickerManager:
     def send_path(self, record: "StickerRecord", *, max_edge: int = 256) -> str:
         """表情包**发送用**的路径：缩到表情包规格（默认最长边 256px）。
 
-        实录："bot 发表情包时会直接发送图片，导致比例非常大"——原图常常是
+        已知问题："bot 发表情包时会直接发送图片，导致比例非常大"——原图常常是
         1000px+ 的梗图，QQ 按原尺寸铺满聊天框。真人群友发的表情包是小图，
         所以发送前统一缩放（按 sha256 缓存副本，只算一次；动图与缩放失败
         一律回退原图，绝不因为缩放把表情发丢了）。
@@ -375,7 +375,7 @@ class StickerManager:
     def _cache_size_ok(target: Path, max_edge: int) -> bool:
         """缓存副本必须真的是"小图"。
 
-        实录（用户）：表情包还是发很大的图，gif/动图却正常——因为 gif 走早返回、
+        已知问题：表情包还是发很大的图，gif/动图却正常——因为 gif 走早返回、
         不进这个缓存，而静态图的缓存副本**只要存在就被无条件信任**：历史遗留的大图
         副本于是被永久复用（那版还没按像素尺寸判断，或尺寸上限不同）。
         """

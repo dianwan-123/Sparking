@@ -191,18 +191,48 @@ def _extract_at_targets(text: str) -> list[str]:
     return seen[:5]
 
 
-# 技术类问题（数学/信息学）：命中就强制先检索知识库再回答。中文词直接匹配；
-# ASCII 缩写用 ASCII 字母数字的 lookaround 定界（\b 对汉字无效——汉字也算
-# \w，"这道DP题"里 DP 前后都不存在 \b）。
-_TECH_QUESTION_RE = re.compile(
-    r"数学|微积分|导数|积分|极限|线性代数|矩阵|行列式|概率论|组合数|几何|三角函数|方程|不等式"
-    r"|数论|质数|素数|同余|对数|向量|信息学|算法|数据结构|复杂度|动态规划|递归|递推|贪心|二分"
-    r"|图论|最短路|生成树|线段树|树状数组|并查集|哈希|链表|单调栈|快排|归并|排序算法|搜索算法"
-    r"|编程|代码|编译|报错|调试|指针|数组|溢出|正则|题解|题面|评测机|洛谷|蓝桥|天梯"
-    r"|(?<![A-Za-z0-9])(?:DP|OI|NOIP|NOI|CSP|CSES?|TLE|MLE|WA|RE|CE|bug|hash|python"
-    r"|java|linux|git|codeforces|leetcode|atcoder)(?![A-Za-z0-9])",
-    re.IGNORECASE,
+# 技术类问题（数学/信息学）：命中就强制先检索知识库再回答。
+# 用**词表 + 显式定界**而不是一条大正则：中文词直接子串匹配；ASCII 词（python/DP…）
+# 要求两侧不是 ASCII 字母数字——否则 "response" 里的 "re"、"git" 出现在别的词里都会误判。
+_TECH_QUESTION_WORDS = (
+    "数学", "微积分", "导数", "积分", "极限", "线性代数", "矩阵", "行列式", "概率论",
+    "组合数", "几何", "三角函数", "方程", "不等式", "数论", "质数", "素数", "同余",
+    "对数", "向量", "信息学", "算法", "数据结构", "复杂度", "动态规划", "递归", "递推",
+    "贪心", "二分", "图论", "最短路", "生成树", "线段树", "树状数组", "并查集", "哈希",
+    "链表", "单调栈", "快排", "归并", "排序算法", "搜索算法", "编程", "代码", "编译",
+    "报错", "调试", "指针", "数组", "溢出", "正则", "题解", "题面", "评测机", "洛谷",
+    "蓝桥", "天梯",
 )
+_TECH_QUESTION_TOKENS = (
+    "dp", "oi", "noip", "noi", "csp", "cses", "tle", "mle", "wa", "re", "ce",
+    "bug", "hash", "python", "java", "linux", "git", "codeforces", "leetcode",
+    "atcoder",
+)
+
+
+def _has_ascii_token(lowered: str, token: str) -> bool:
+    """token 是否作为**独立的 ASCII 词**出现（两侧不能是 ASCII 字母数字）。"""
+    start = 0
+    while True:
+        index = lowered.find(token, start)
+        if index < 0:
+            return False
+        before = lowered[index - 1] if index > 0 else ""
+        after_index = index + len(token)
+        after = lowered[after_index] if after_index < len(lowered) else ""
+        if not (before.isascii() and before.isalnum()) and \
+                not (after.isascii() and after.isalnum()):
+            return True
+        start = index + 1
+
+
+def looks_like_tech_question(text: str) -> bool:
+    """这句话是不是数学/信息学类问题（命中就强制先查知识库）。"""
+    value = str(text or "")
+    if any(word in value for word in _TECH_QUESTION_WORDS):
+        return True
+    lowered = value.lower()
+    return any(_has_ascii_token(lowered, token) for token in _TECH_QUESTION_TOKENS)
 
 
 def _within_hours(stamp: Any, hours: float) -> bool:
@@ -320,7 +350,7 @@ class LongMemoryAgentPlugin(Star):
         self._dangling: dict[str, followup.Dangling] = {}
         # 待展开的合并转发：按会话累积（攒批时逐条覆盖会丢掉先前的转发）
         self._pending_forwards: dict[str, list[str]] = {}
-        # 单实例守卫：重装/重载可能留下旧实例的循环在跑（实录：v0.32.6 旧实例与
+        # 单实例守卫：重装/重载可能留下旧实例的循环在跑（已知问题：v0.32.6 旧实例与
         # v0.33.x 新实例并存，日志两套行号、旧实例抱死配置烧 5/5、抢日程）
         self._instance_id = ""
         self._instance_checked_at = 0.0
@@ -329,7 +359,7 @@ class LongMemoryAgentPlugin(Star):
         self._workspace_obj: Workspace | None = None
         self._batch_buffers: dict[str, list[_BatchedMessage]] = {}
         self._batch_timers: dict[str, asyncio.Task[Any]] = {}
-        # 唤醒合并窗口：连发的 @/私聊一起读完一次回（v0.36.1 实录三连@回三次太机械）
+        # 唤醒合并窗口：连发的 @/私聊一起读完一次回（v0.36.1 已知问题三连@回三次太机械）
         self._wake_buffers: dict[str, list[_BatchedMessage]] = {}
         self._wake_timers: dict[str, asyncio.Task[Any]] = {}
         self._wake_first_at: dict[str, float] = {}
@@ -370,7 +400,7 @@ class LongMemoryAgentPlugin(Star):
 
         AstrBotConfig 是普通 dict 子类：面板 save_config 会 merge 进同一对象，
         但运行中的插件只在 __init__ 构建过一次 settings，不刷新就永远是旧值——
-        实录：面板里填好了 SSH，bot 仍说"未配置"。
+        已知问题：面板里填好了 SSH，bot 仍说"未配置"。
         """
         signature = self._config_signature()
         if not signature or signature == self._config_signature_seen:
@@ -464,7 +494,7 @@ class LongMemoryAgentPlugin(Star):
     def _reap_zombie_instances(self) -> int:
         """清理同插件旧实例残留的后台任务。
 
-        实录：AstrBot 重装/重载未终止旧实例时，旧循环会与新实例并存——旧实例
+        已知问题：AstrBot 重装/重载未终止旧实例时，旧循环会与新实例并存——旧实例
         抱着过期配置继续跑（两套行号、死模型 5/5 重试、和新实例抢日程）。这里在
         同一事件循环上找到"属于本插件类、但不是本实例"的循环任务并取消。
         """
@@ -493,7 +523,7 @@ class LongMemoryAgentPlugin(Star):
                 continue
             # 关键：按类名比较，不能用 type(owner) is type(self)——热重载会生成
             # 同名的新类对象，旧实例的类与新类 is 比较为 False，僵尸正好被漏掉
-            # （实录：v0.32.6 僵尸因此逃过两轮清理，继续刷 deepseek 重试）
+            # （已知问题：v0.32.6 僵尸因此逃过两轮清理，继续刷 deepseek 重试）
             if type(owner).__name__ != type(self).__name__:
                 continue
             task.cancel()
@@ -504,7 +534,7 @@ class LongMemoryAgentPlugin(Star):
 
     async def initialize(self) -> None:
         # 时间基准：库里的时间存 UTC，凡是要给模型/给人看的都按这个时区换算
-        # （实录：下午两点的消息被说成"凌晨六点"——UTC 串被原样递出去了）
+        # （已知问题：下午两点的消息被说成"凌晨六点"——UTC 串被原样递出去了）
         try:
             zone = timeutil.configure(self.context.get_config().get("timezone"))
         except Exception:
@@ -520,7 +550,7 @@ class LongMemoryAgentPlugin(Star):
         self._claim_instance_slot()
         self._reap_zombie_instances()
         self.ingest = IngestService(self.storage)
-        await self._seed_prompt_injections()   # 自带注入预设入库（用户改过的不覆盖）
+        await self._seed_prompt_injections()   # 自带注入预设入库（已改过的不覆盖）
         self.ledger = MemoryLedger(self.storage)
         self.retrieval = RetrievalService(self.storage, embedding=await self._embedding_adapter())
         self.context_builder = ContextBuilder(
@@ -1050,7 +1080,7 @@ class LongMemoryAgentPlugin(Star):
             if self.settings.allows_group(key):
                 groups.append(scope_id)
         # 顺序即优先级：当前会话 → 白名单群（群聊是主场景）→ 私聊 → 插件自身痕迹。
-        # 原来按"首次出现顺序"截前 9 个，群一多就会有群被无声挤出去（实录：记忆"没互通"）。
+        # 原来按"首次出现顺序"截前 9 个，群一多就会有群被无声挤出去（已知问题：记忆"没互通"）。
         ordered = ([current] if current else []) + groups + privates + others
         unique: list[str] = []
         for scope_id in ordered:
@@ -1081,7 +1111,7 @@ class LongMemoryAgentPlugin(Star):
         """解析真实可用的 provider id：候选链（调用方指定→会话偏好→全局默认）
         逐一对照 AstrBot 注册表，指向已删除模型时自动落到还活着的候选。
 
-        实录：配置/会话偏好/全局默认都还指向已删除的 deepseek 时，旧的单步回退
+        已知问题：配置/会话偏好/全局默认都还指向已删除的 deepseek 时，旧的单步回退
         （回退目标="当前主模型"）会被 provider_id == live_id 短路，永远重试死模型。
         """
         known = {
@@ -1099,7 +1129,7 @@ class LongMemoryAgentPlugin(Star):
         except Exception:
             pass
         # 无事件的自主调用（闲时/日程/心跳）没有会话偏好层：插件配置的回复模型
-        # 应优先于 AstrBot 全局默认——实录：全局默认停在被删的旧模型上，闲时动作
+        # 应优先于 AstrBot 全局默认——已知问题：全局默认停在被删的旧模型上，闲时动作
         # 全部 5/5 重试失败（"Provider catapi/deepseek-v4.1-flash not found"）
         candidates.append(str(self.settings.reply_provider_id or ""))
         try:
@@ -1111,7 +1141,7 @@ class LongMemoryAgentPlugin(Star):
 
         async def _resolvable(candidate: str) -> bool:
             """候选是否真能被 AstrBot 取到实例——注册表(get_all_providers)可能仍列出
-            已失效条目（实录：全局默认指向的旧模型在注册表里还在，llm_generate 查找时
+            已失效条目（已知问题：全局默认指向的旧模型在注册表里还在，llm_generate 查找时
             却报 "Provider not found"）。取不到/查询异常都不额外否决。"""
             if not candidate:
                 return False
@@ -1204,7 +1234,7 @@ class LongMemoryAgentPlugin(Star):
     async def _system_prompt_dropped(self, provider_id: str) -> bool:
         """这个模型看不看得见 system 消息？（按 provider 缓存一次探测结果）
 
-        实测（用户机器上的 catapi/deepseek-v4.1-flash）：system 里写"你只会说喵"，
+        实测（本机实测的 catapi/deepseek-v4.1-flash）：system 里写"你只会说喵"，
         问它 1+1 照样答 2——**整条 system 被吞**。插件里所有规则、所有 JSON 契约
         都走 system，于是"模型看起来答非所问、学什么都学不成"。
         探测办法：给一个只在 system 里出现的暗号，问它暗号是什么；答不上来就改道。
@@ -1316,7 +1346,7 @@ class LongMemoryAgentPlugin(Star):
                 if text.strip():
                     self._record_usage(response)
                     return text
-                # 空输出（实录：mimo-v2.6-flash 偶发 content=None、0 completion tokens，
+                # 空输出（已知问题：mimo-v2.6-flash 偶发 content=None、0 completion tokens，
                 # AstrBot 日志"returned empty output"）——非 agent 路径无副作用，可重试；
                 # agent 路径绝不能重跑（会重复执行工具副作用，比如重复发消息），
                 # 空文本直接交调用方兜底（parse_json_object("")→None→{}）。
@@ -1340,14 +1370,14 @@ class LongMemoryAgentPlugin(Star):
             except Exception as error:
                 last_error = error
                 # 内容审核拦截（400 prompt_blocked / PROHIBITED_CONTENT）：重试毫无意义，
-                # 只会连着烧 5 轮 token（实录：同一条被拦 3 次以上）。直接放弃这一轮。
+                # 只会连着烧 5 轮 token（已知问题：同一条被拦 3 次以上）。直接放弃这一轮。
                 if self._looks_like_prompt_blocked(error):
                     logger.warning(
                         "长程记忆：请求被模型侧内容审核拦截，本轮不再重试：%s",
                         str(error)[:160],
                     )
                     raise RuntimeError(f"内容审核拦截：{str(error)[:120]}") from error
-                # 上游已删/未注册的模型（实录 "Provider catapi/xxx not found" 烧满
+                # 上游已删/未注册的模型（已知问题 "Provider catapi/xxx not found" 烧满
                 # 5 次重试）：拉黑 + 立刻换候选模型重试
                 if self._looks_like_provider_missing(error):
                     self._dead_providers.add(provider_id)
@@ -1491,7 +1521,7 @@ class LongMemoryAgentPlugin(Star):
         self._ensure_gateway(event)
         # 合并转发：消息本体带 forward 段时（NapCat 段类型有 forward/forwardtransfer/
         # flashtransfer 变体），立刻展开内容入同一 scope 的查询记忆，并留出判定同步展开。
-        # 按会话累积——攒批时逐条覆盖会丢掉先到的那条转发（实录"读不了合并转发"）。
+        # 按会话累积——攒批时逐条覆盖会丢掉先到的那条转发（已知问题"读不了合并转发"）。
         forward_ids = self._forward_ids(raw)
         if forward_ids:
             self._spawn(self._ingest_forward_notes(raw, stored.scope_id))
@@ -1519,7 +1549,7 @@ class LongMemoryAgentPlugin(Star):
             # 不拦截，交给 AstrBot 默认管线兜底。
             if self.settings.wake_merge_seconds > 0:
                 event.stop_event()
-                # 真人节奏：连发的@/私聊一起读完、一次回（v0.36.1 实录三连@回三次太机械）
+                # 真人节奏：连发的@/私聊一起读完、一次回（v0.36.1 已知问题三连@回三次太机械）
                 self._buffer_wake_message(
                     self._conversation_key(event), event, stored, image_only)
                 return
@@ -1759,7 +1789,7 @@ class LongMemoryAgentPlugin(Star):
             "hint": "warmth是你对TA的好感度（0-100），影响你的态度和回复意愿，但你仍可自主决定",
         }
         try:
-            # 同一个人只有一个印象：跨群合并（实录"人物印象每个群不互通"）
+            # 同一个人只有一个印象：跨群合并（已知问题"人物印象每个群不互通"）
             sender_impression = await self.storage.get_impression_any(
                 self._shared_scope_ids(scope_id), str(event.get_sender_id())
             )
@@ -1867,7 +1897,7 @@ class LongMemoryAgentPlugin(Star):
                     "note": "这是被引用消息里的合并转发全文，已按 谁说的：内容 排列",
                 }
             context_data["quoted_note"] = (
-                "上面是用户这条消息引用的原消息：files[].excerpt 是文件（PDF/文档）"
+                "上面是当前消息引用的原消息：files[].excerpt 是文件（PDF/文档）"
                 "已经读出来的正文节选，需要更多细节时用 read_document(media_id) 读全文；"
                 "image_media_ids 是图片，可用 look_at_image 查看；forward 是被引用消息里"
                 "合并转发的全文。直接基于这些内容回应——不要说看不到文件/转发、也不要让对方重发。"
@@ -1889,7 +1919,7 @@ class LongMemoryAgentPlugin(Star):
             tech_enriched = True
         if batch_items:
             # 批次以**聊天记录形态**给出（"昵称：内容"逐行），不再用对象数组——
-            # 数组会诱导模型逐项作答（实录："窗口内一条一条详细回复"）
+            # 数组会诱导模型逐项作答（已知问题："窗口内一条一条详细回复"）
             lines = [
                 f"{item.sender_name or item.event.get_sender_id()}：{item.text}"
                 for item in batch_items if item.text
@@ -1936,7 +1966,7 @@ class LongMemoryAgentPlugin(Star):
                     "这批消息说话人们的风格档案；回复时自然吸收他们的用词和语气"
                 )
         # 表情包库存：让判定/回复知道"我有表情可用"——不看库存的话 sticker 动作
-        # 仿佛不存在，bot 会永远只发文字（实录"从不主动发表情"）。
+        # 仿佛不存在，bot 会永远只发文字（已知问题"从不主动发表情"）。
         if self.stickers is not None:
             try:
                 stock = self.stickers.stats()
@@ -1983,7 +2013,7 @@ class LongMemoryAgentPlugin(Star):
             except Exception:
                 pass
         # SSH 就绪时明确告知回复 agent——否则它会说「ip呢账号呢密码呢，一个没掏出来」
-        # （实录：配置完好、工具可用，模型凭"没被告知"拒绝干活）
+        # （已知问题：配置完好、工具可用，模型凭"没被告知"拒绝干活）
         if self._ssh_configured():
             ssh_cfg = self._ssh_config()
             context_data["ssh_ready"] = {
@@ -2246,7 +2276,7 @@ class LongMemoryAgentPlugin(Star):
         self._injections_cache = None
 
     async def _seed_prompt_injections(self) -> None:
-        """把自带预设补进库（用户改过的不覆盖，只补缺的）。"""
+        """把自带预设补进库（已改过的不覆盖，只补缺的）。"""
         if self.storage is None:
             return
         try:
@@ -2292,18 +2322,20 @@ class LongMemoryAgentPlugin(Star):
             parts.append(orders)
         return "\n\n".join(parts) + "\n\n" + MEMORY_TRUST_POLICY
 
-    _VISION_REFUSAL_RE = re.compile(
-        r"无法查看|无法识别|不支持视觉|看不到图|不能查看图片|无法查看或识别|"
-        r"cannot see|no vision|vision.*not support|as a text",
-        re.I,
+    # 模型（或通道）拿不到图时会客套拒绝；这些句子绝不能入记忆。
+    _VISION_REFUSAL_WORDS = (
+        "无法查看", "无法识别", "不支持视觉", "看不到图", "不能查看图片",
+        "无法查看或识别", "cannot see", "no vision", "as a text",
     )
 
     @staticmethod
     def _is_vision_refusal(text: str) -> bool:
         """模型（或通道）拿不到图时会客套拒绝；这句垃圾绝不能入记忆。"""
-        return bool(text) and bool(
-            LongMemoryAgentPlugin._VISION_REFUSAL_RE.search(text[:200])
-        )
+        if not text:
+            return False
+        head = str(text)[:200].lower()
+        return any(word.lower() in head
+                   for word in LongMemoryAgentPlugin._VISION_REFUSAL_WORDS)
 
     async def _describe_images(
         self, images: list[tuple[str, str]], event: AstrMessageEvent | None = None,
@@ -2370,12 +2402,41 @@ class LongMemoryAgentPlugin(Star):
             logger.warning("长程记忆：读取已归档图片失败：%s", str(error)[:150])
             return []
 
+    @staticmethod
+    def _time_of_day(hour: int) -> str:
+        """把小时换成中文时段说法（寒暄要按它对上）。"""
+        if hour < 5:
+            return "凌晨"
+        if hour < 9:
+            return "早上"
+        if hour < 11:
+            return "上午"
+        if hour < 13:
+            return "中午"
+        if hour < 18:
+            return "下午"
+        if hour < 23:
+            return "晚上"
+        return "深夜"
+
+    def _now_brief(self) -> str:
+        """给模型的"现在几点"一行话（含时段说法 + 硬性要求）。
+
+        已知问题：下午 13:15 说"晚上好"——因为主动发言/追问那些路径压根没带时间，
+        模型只能猜。这里统一给，并要求寒暄必须按它对上。
+        """
+        moment = timeutil.now()
+        return (f"现在是 {moment.strftime('%Y-%m-%d %H:%M')}（{moment.strftime('%A')}，"
+                f"本地时间，{self._time_of_day(moment.hour)}）。"
+                "**打招呼/寒暄（早安、晚安、下午好…）必须按这个时间说，说错很出戏**；"
+                "判断「隔了多久」「是不是该睡了」也以它为准。")
+
     async def _agent_reply_system_prompt(self, persona: str = "") -> str:
         """agent 循环（tool_loop_agent）专用系统提示词：最终回应不再强制 JSON。
 
         旧【最终输出】的严格 JSON 格式（thought/mode/message）是给无工具两段式
         设计的——在多轮工具循环里教模型"只输出一个 JSON"会让它跳过工具直接
-        给计划文本（实录：判定=agent 却一次工具都没调、直接出 4 段纯文本）。
+        给计划文本（已知问题：判定=agent 却一次工具都没调、直接出 4 段纯文本）。
         工具 schema 已经在请求里传给模型，这里也不再重复注入工具清单文本
         （50+ 工具名列两遍只会挤劣化行为）。"""
         parts = [part for part in (persona, REPLY_SYSTEM_PROMPT.strip()) if part]
@@ -2400,6 +2461,7 @@ class LongMemoryAgentPlugin(Star):
                 "不确定工具名或用法时，先调 find_tools 搜关键词（如 知识库/搜索/图片/文件/"
                 "群相册/定时）——比凭记忆猜工具名可靠；搜到的工具与你自己的一样可以直接调用。"
                 % (digest["total"], listed))
+        parts.append(self._now_brief())
         parts.append(QQMSG_STYLE_PROMPT)
         parts.append(GROUP_LIFE_BEHAVIORS_PROMPT)
         parts.append(TASK_DISPATCH_PROMPT)
@@ -2518,7 +2580,7 @@ class LongMemoryAgentPlugin(Star):
         except Exception:
             recent_designs = []
         # 服务器状态类主题：先抓真实指标塞进提示词，画出来的是真数据仪表盘
-        # （实录机器人被要求"画图看看服务器状态"，只剩空谈——要么真数据，要么别画）
+        # （已知问题机器人被要求"画图看看服务器状态"，只剩空谈——要么真数据，要么别画）
         metrics = ""
         status_haystack = " ".join(
             part for part in (subject, " ".join(recent_designs)) if part)
@@ -2621,7 +2683,7 @@ class LongMemoryAgentPlugin(Star):
     async def _recent_message_ids(self, scope_id: str, count: int) -> list[str]:
         """取某会话最近 N 条消息的内部 id（旧→新，含 bot 自己发的）。
 
-        实录：让 bot "把你自己的最后一条消息做成卡片"，它手里没有任何 id（卡片/转发
+        已知问题：让 bot "把你自己的最后一条消息做成卡片"，它手里没有任何 id（卡片/转发
         工具当时只认 id），于是绕去 design_render 手搓 HTML 画了个丑页面。
         有了这个，模型只要给条数就能干活——顺手的路不该比歪路更难走。
         """
@@ -2651,7 +2713,7 @@ class LongMemoryAgentPlugin(Star):
                 response = await self.gateway.execute("get_msg", message_id=mid)
                 data = qq_payload(response)
                 # 形状校验：网关偶尔回一个非空但没有消息字段的壳（错误对象/空信封）。
-                # 那种"数据"过不了下面，会把 detail 建成空署名+空内容（实录：转发节点署名
+                # 那种"数据"过不了下面，会把 detail 建成空署名+空内容（已知问题：转发节点署名
                 # 全变"群友"）——形状不对就当没取到，回落本地库存。
                 if data and not ({"message", "raw_message", "sender"} & set(data)):
                     logger.info("长程记忆：get_msg %s 返回的形状不是消息，回落库存", mid[:16])
@@ -2677,7 +2739,7 @@ class LongMemoryAgentPlugin(Star):
                 logger.info("长程记忆：get_msg %s 失败（回落库存）：%s",
                             mid[:16], str(error)[:120])
             if detail is None and self.storage is not None:
-                # 先当前会话，再兜底扫其它会话——录实录：跨群引用消息 id 时，
+                # 先当前会话，再兜底扫其它会话——录已知问题：跨群引用消息 id 时，
                 # 只认当前会话会「一条都取不到」，模型只好改拿手边的消息凑。
                 tried: list[str] = []
                 for candidate in [str(scope_id or "")] + [
@@ -2701,7 +2763,7 @@ class LongMemoryAgentPlugin(Star):
                         "name": str(row.sender_name),
                         "time": timeutil.to_text(row.occurred_at, "%Y-%m-%d %H:%M"),
                         # 入库时存的是原始段（@/图片/表情/引用都在），别再压成纯文本——
-                        # 实录：卡片里 @、表情包、引用全丢了，就是这么丢的
+                        # 已知问题：卡片里 @、表情包、引用全丢了，就是这么丢的
                         "segments": stored_parts or [{"type": "text",
                                                       "data": {"text": str(row.text or "")}}],
                         "reply_to": str(getattr(row, "reply_to", "") or ""),
@@ -2728,7 +2790,7 @@ class LongMemoryAgentPlugin(Star):
                                   scope_id: str | None, *, depth: int = 0) -> None:
         """把一条消息补齐成"能画成卡片"的样子：引用源消息、图片内联、转发子消息。
 
-        实录（用户两张截图）：卡片里引用、表情包、@、转发全丢了——因为旧代码只把
+        已知问题：卡片里引用、表情包、@、转发全丢了——因为旧代码只把
         `text` 交给渲染器，而原始段（parts）、引用目标（reply_to）都没用上。
         """
         segments = [seg for seg in list(item.get("segments") or [])
@@ -2823,7 +2885,7 @@ class LongMemoryAgentPlugin(Star):
 
         形如 ``[{"name": "长公主", "uin": "364962863", "text": "原话"}]``；
         也可以给 ``segments`` 直接放 OneBot 段数组。署名按"名字(QQ号)"拼
-        （用户要的"包含qq号和名字"就是这种客户端里能一眼看到的形式），
+        （需要的"包含qq号和名字"就是这种客户端里能一眼看到的形式），
         name/uin 缺一个就用另一个。
         """
         text = str(raw or "").strip()
@@ -2852,7 +2914,7 @@ class LongMemoryAgentPlugin(Star):
     async def _inline_media_segment(self, segment: dict[str, Any]) -> dict[str, Any]:
         """把一段媒体内联成 base64；抓不到就降级成文字占位。
 
-        实录（合并转发发不出去的真因）：SnowLuma 打包转发时会把节点里的图片**下载**
+        已知问题（合并转发发不出去的真因）：SnowLuma 打包转发时会把节点里的图片**下载**
         下来内联（makeImageElem → downloadHttp），**任何一张图下载失败都会让整条
         转发发送失败**（`TypeError: fetch failed`）——实测塞一个失效 URL 就复现。
         所以这里先自己把图抓成 base64：SnowLuma 不再需要联网，坏图只丢那一段。
@@ -2881,7 +2943,7 @@ class LongMemoryAgentPlugin(Star):
     def _looks_like_image(payload: bytes) -> bool:
         """魔数校验：图片抓回来必须真是图片。
 
-        实录：CDN 链接过期后常返回一个 404 的 HTML 页，旧代码照样当图片内联，
+        已知问题：CDN 链接过期后常返回一个 404 的 HTML 页，旧代码照样当图片内联，
         卡片上就是一块乱码/空白。不是图片就当抓取失败（卡片回退原 URL、转发走占位）。
         """
         head = bytes(payload[:16])
@@ -2894,7 +2956,7 @@ class LongMemoryAgentPlugin(Star):
                                  kind: str = "image") -> bytes:
         """媒体段 → 原始字节。依次试：远端 URL → 本地文件 → 网关 get_image。
 
-        实录（转发里图片全变"[图片已失效]"的真因）：get_msg 回里的 `file` 往往是
+        已知问题（转发里图片全变"[图片已失效]"的真因）：get_msg 回里的 `file` 往往是
         **裸文件名**（比如 "a1b2c3.jpg"，既不是 URL 也不是本地路径），而旧代码
         `file or url` 优先拿它 → 读不到就当坏图。现在 URL 优先，裸文件名交给
         get_image 去换真内容（SnowLuma 会给新 URL，NapCat 会给本地路径）。
@@ -2977,7 +3039,7 @@ class LongMemoryAgentPlugin(Star):
     def _clean_forward_name(value: Any) -> str:
         """节点署名清洗：去控制字符/代理对残渣，压掉多余空白并限长。
 
-        实录：转发窗口标题出现过 "&ÿÿÆê ◆◆◆◆" 这类乱码——署名里混进了坏字符，
+        已知问题：转发窗口标题出现过 "&ÿÿÆê ◆◆◆◆" 这类乱码——署名里混进了坏字符，
         QQ 自己拼 "<甲>和<乙>的聊天记录" 就花了。
         """
         text = str(value or "")
@@ -3058,7 +3120,7 @@ class LongMemoryAgentPlugin(Star):
         target_group = str(target_group_id or "").strip()
         target_user = str(target_user_id or "").strip()
         if target_group and not target_group.isdigit():
-            # 群名也能用（实录：模型手里只有"数学指令讨论群"这种名字）
+            # 群名也能用（已知问题：模型手里只有"数学指令讨论群"这种名字）
             resolved, key, hint = await self._resolve_scope_ref(target_group)
             if not resolved:
                 return f"没能定位目标群：{hint}"
@@ -3104,7 +3166,7 @@ class LongMemoryAgentPlugin(Star):
             else:
                 nodes = await self._build_forward_nodes(details)
                 # 卡片文案各就其位：summary=标题、prompt=预览前缀、news=逐条预览。
-                # 实录：三个字段塞同一句话，QQ 卡片上就出现两行一样的文字。
+                # 已知问题：三个字段塞同一句话，QQ 卡片上就出现两行一样的文字。
                 preview = self._forward_preview(details)
                 if target_group:
                     await self.gateway.execute(
@@ -3140,7 +3202,7 @@ class LongMemoryAgentPlugin(Star):
         "挂人"、留档、展示聊天记录都用它。
 
         **要做聊天记录样子的卡片一律用它**——不要用 design_render 自己写 HTML 画聊天界面
-        （实录：那样会画成大字报，字号溢出、也不像聊天记录）。
+        （已知问题：那样会画成大字报，字号溢出、也不像聊天记录）。
         不知道消息 id 时：latest_count=1 就是"我最近一条"，5 就是最近五条。
 
         Args:
@@ -3246,7 +3308,7 @@ class LongMemoryAgentPlugin(Star):
         入库时没抓到的那份（比如运行时才展开的引用转发），后续读取也能命中。"""
         if not scope_id or not str(text or "").strip():
             return
-        # 注意：这里不设最小长度——嵌套转发可能只有一两句（实录 11 字的接龙），
+        # 注意：这里不设最小长度——嵌套转发可能只有一两句（已知问题 11 字的接龙），
         # 长度门槛会把它们悄悄丢掉，之后资源失效就永久读不到了。
         if self.storage is None or not self.ingest:
             return
@@ -3279,7 +3341,7 @@ class LongMemoryAgentPlugin(Star):
     async def _reply_id_for(self, scope_id: str | None, candidate: Any) -> str:
         """引用目标校验：内部编号/QQ 号都接受 → 翻成 QQ 消息号；不确定就返回 ""。
 
-        宁可少一个引用，也不许引用错消息（实录：模型拿内部编号当 QQ 号，
+        宁可少一个引用，也不许引用错消息（已知问题：模型拿内部编号当 QQ 号，
         结果引用了"戳一戳"通知那条消息，看起来像"莫名其妙引用错消息"）。
         """
         value = str(candidate or "").strip()
@@ -3319,7 +3381,8 @@ class LongMemoryAgentPlugin(Star):
         provider = self.settings.reply_provider_id or ""
         answer = await self._llm_text(
             provider,
-            prompt=f"当前会话氛围与最近聊天：见下。要你回应的事：{text}",
+            prompt=(f"现在是 {timeutil.text('%Y-%m-%d %H:%M %A')}。"
+                    f"当前会话氛围与最近聊天：见下。要你回应的事：{text}"),
             system_prompt=await self._agent_reply_system_prompt(await self._persona_prompt()),
             event=None,
         )
@@ -3736,7 +3799,7 @@ class LongMemoryAgentPlugin(Star):
                 recent = self.stickers.select(limit=1)
                 sticker = recent[0] if recent else None
             # 清空过记忆/文件被清掉后旧引用会失效：这时**静默跳过**，
-            # 既不报错、也不给模型转述失败的机会（实录：bot 说"表情包没发出去"）。
+            # 既不报错、也不给模型转述失败的机会（已知问题：bot 说"表情包没发出去"）。
             if sticker is not None and Path(sticker.path).is_file() \
                     and self._sticker_claim(str(event.get_group_id() or ""), sticker.sha256):
                 try:
@@ -3802,7 +3865,7 @@ class LongMemoryAgentPlugin(Star):
                 plan.explicit_segments,
             )
         # 攒批回复的段数上限：真人扫一眼聊天记录只说一两句，不会逐条作答。
-        # 提示词之外再加一道程序兜底（实录："窗口内一条一条详细回复"）。
+        # 提示词之外再加一道程序兜底（已知问题："窗口内一条一条详细回复"）。
         if batch_mode and plan.segments:
             text_segments = [s for s in plan.segments if s.action == "text"]
             if len(text_segments) > 3:
@@ -3970,12 +4033,12 @@ class LongMemoryAgentPlugin(Star):
             or "风控" in error_text
         )
 
-    # 方括号是**可选**的：实录模型有时候写 `[sticker: <sha>]`，有时候只写 `sticker: <sha>`，
-    # 后者以前没被认出来 → 原样当成正文发出去（用户截图：群里出现 "sticker: 6af5f198…"）。
+    # 方括号是**可选**的：已知问题模型有时候写 `[sticker: <sha>]`，有时候只写 `sticker: <sha>`，
+    # 后者以前没被认出来 → 原样当成正文发出去（已知问题：群里出现 "sticker: 6af5f198…"）。
     _STICKER_PLACEHOLDER_RE = re.compile(
         r"[\[（(]?\s*(?:sticker|贴纸|表情包|表情)\s*[:：]?\s*([0-9a-fA-F]{16,64})\s*[\]）)]?",
         re.IGNORECASE)
-    # "悬挂的占位开头"：实录模型把 [sticker: 和 <sha>] 拆成两条消息发出去，
+    # "悬挂的占位开头"：已知问题模型把 [sticker: 和 <sha>] 拆成两条消息发出去，
     # 任何一半单独看都不是完整占位 → 发送前要把相邻两段拼起来再判断
     _STICKER_DANGLING_RE = re.compile(
         r"[\[（(]?\s*(?:sticker|贴纸|表情包|表情)\s*[:：]?\s*$",
@@ -4016,7 +4079,7 @@ class LongMemoryAgentPlugin(Star):
     def _dedupe_media_plan(self, plan: Any) -> Any:
         """去掉计划里**相邻或重复**的同一媒体段。
 
-        实录：一次回复里弹了三条一模一样的表情——模型把同一个 sticker 段写了好几遍。
+        已知问题：一次回复里弹了三条一模一样的表情——模型把同一个 sticker 段写了好几遍。
         这里按 (action, sticker_id/media_id/path) 去重，只留第一次。
         """
         segments = list(getattr(plan, "segments", ()) or [])
@@ -4048,8 +4111,8 @@ class LongMemoryAgentPlugin(Star):
     def _text_first_plan(self, plan: Any) -> Any:
         """把所有媒体段挪到文字之后，媒体之间、文字之间各自保持原顺序。
 
-        实录（用户截图）：回复是「文字 → 表情 → 文字 → 表情」，表情被夹在两句中间。
-        用户要的是**别在文字之间夹图片/表情**：先说完整段话，再发图/表情。
+        已知问题：回复是「文字 → 表情 → 文字 → 表情」，表情被夹在两句中间。
+        这里要的是**别在文字之间夹图片/表情**：先说完整段话，再发图/表情。
         稳定分区，不改任何一段的内容与延迟。
         """
         segments = list(getattr(plan, "segments", ()) or [])
@@ -4075,7 +4138,7 @@ class LongMemoryAgentPlugin(Star):
     def _merge_split_sticker_plan(self, plan: Any) -> Any:
         """把被拆成两段的 [sticker: … ] 占位拼回一段（计划段级）。
 
-        实录（用户截图）：一个气泡是"……你嘴硬 [sticker:"、下一个气泡是
+        已知问题：一个气泡是"……你嘴硬 [sticker:"、下一个气泡是
         "9dc80a0b…218]"。分开发出去就是两行源码，必须拼起来当成一次表情发送。
         """
         segments = list(getattr(plan, "segments", ()) or [])
@@ -4115,7 +4178,7 @@ class LongMemoryAgentPlugin(Star):
         action = descriptor.get("action")
         if action == "text":
             raw_text = str(descriptor.get("text", ""))
-            # 实录：模型把 sticker_id 当文本发了出来（"[sticker: 36ae…]"）。
+            # 已知问题：模型把 sticker_id 当文本发了出来（"[sticker: 36ae…]"）。
             # 整段就是一个占位 → 直接改发真表情；混在正文里 → 摘掉占位再发文字。
             placeholder = self._STICKER_PLACEHOLDER_RE.search(raw_text)
             if placeholder:
@@ -4128,7 +4191,7 @@ class LongMemoryAgentPlugin(Star):
                     return
                 descriptor["text"] = raw_text   # 必须写回：后面按 descriptor 取正文
             # 整包计划/工具 JSON（{"thought":…}/{"mode":…} 等）当正文发出去就是严重
-            # 穿帮——旧守卫只查 {"mode"/{"action" 两个前缀，{"thought" 直接漏网（实录）
+            # 穿帮——旧守卫只查 {"mode"/{"action" 两个前缀，{"thought" 直接漏网）
             if is_plan_json_leak(raw_text):
                 logger.info("长程记忆：拦截疑似未解析的计划JSON，跳过发送")
                 return
@@ -4212,7 +4275,7 @@ class LongMemoryAgentPlugin(Star):
     def _sanitize_outgoing(self, text: Any) -> str:
         """**所有**要发进聊天的文本都过这里（统一出口）。
 
-        实录（用户截图）两次外泄：①"（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"
+        已知问题两次外泄：①"（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"
         ②"（把刚才那张呆滞无语的表情包丢出来）"——分别是工具名外泄与舞台提示。
         这里把六类检测收敛到一处，任何新增发送路径只要走它就自动受保护：
         计划 JSON / 本地路径 / 伪 XML 工具语法 / 状态播报 / 失败汇报 / 工具名 / 舞台提示。
@@ -4375,7 +4438,7 @@ class LongMemoryAgentPlugin(Star):
                            *, analyzer: bool = False) -> ToolSet:
         """子agent工具集：执行型=除浏览器+派发递归外全部；analyzer（决策层）只读。
 
-        实录驱动的两个原则：①子agent要能真正干活（用户明确要求扩大到除 browser
+        已知问题驱动的两个原则：①子agent要能真正干活（明确要求扩大到除 browser
         use 外全部操作）；②需求分析层绝不发消息/改状态——它只产出结构化结论。
         """
         self._refresh_settings_if_changed()
@@ -4404,7 +4467,7 @@ class LongMemoryAgentPlugin(Star):
         if not tools:
             return ""
         # 省 token：清单只留"名字 + 一句话"，并设总长上限。
-        # 实录：清单越滚越长（AstrBot 内置 + 各插件 + 拓展），每轮都重复灌进上下文，
+        # 已知问题：清单越滚越长（AstrBot 内置 + 各插件 + 拓展），每轮都重复灌进上下文，
         # 模型反而抓不住重点、还挤掉了记忆与任务说明。
         lines: list[str] = []
         budget = 1600
@@ -4484,7 +4547,7 @@ class LongMemoryAgentPlugin(Star):
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             # 相对路径不只认插件 workspace：AstrBot 自带工具写进 data/workspaces/… 的文件
-            # 也要找得到（实录：run_script("pelican_gif.py") 报"脚本不存在"、其实在别处）
+            # 也要找得到（已知问题：run_script("pelican_gif.py") 报"脚本不存在"、其实在别处）
             try:
                 found = self._workspace().resolve_existing(candidate)
                 if found.is_file():
@@ -4522,7 +4585,7 @@ class LongMemoryAgentPlugin(Star):
         if not inside:
             # 不在表情库目录里的图（比如归档/工作区里的那份副本）也可能是表情包：
             # 按**内容 sha256** 认出来，照样缩到表情规格发出去。
-            # 实录（用户）：表情包还是发很大的图，gif 却正常——因为走的不是同一条路。
+            # 已知问题：表情包还是发很大的图，gif 却正常——因为走的不是同一条路。
             try:
                 import hashlib
 
@@ -4553,7 +4616,7 @@ class LongMemoryAgentPlugin(Star):
             raise RuntimeError("QQ 网关未就绪")
         p = Path(path)
         # 表情包无论从哪个入口发（sticker 段/图片段/send_local_file），
-        # 都先缩到表情包规格——实录"发表情包直接发大图，比例非常大"
+        # 都先缩到表情包规格——已知问题"发表情包直接发大图，比例非常大"
         scaled = self._sticker_scaled_path(p)
         if scaled is not None:
             p = scaled
@@ -4599,7 +4662,7 @@ class LongMemoryAgentPlugin(Star):
                                  kind: str, file_name: str = "") -> None:
         """用 AstrBot 原生发送把媒体发进当前会话（webchat/qqofficial 等非 OneBot 平台）。
 
-        NapCat 网关只认数字 QQ 目标——实录 webchat 会话 id 是 `Rikka0612`，
+        NapCat 网关只认数字 QQ 目标——已知问题 webchat 会话 id 是 `Rikka0612`，
         `int()` 转换当场炸掉（"发送失败：invalid literal for int() with base 10"），
         所以当前会话一律优先走平台原生通道。
         """
@@ -4933,7 +4996,7 @@ class LongMemoryAgentPlugin(Star):
 
         SnowLuma 的 get_image 返回远端 URL（没有本地路径也没有 base64），NapCat
         返回本地路径；而表情学习/图片描述等下游只收本地文件或 base64（拒绝 URL
-        是刻意的防 SSRF 设计，实录报错 "URLs are not accepted"）。这里把 URL 按
+        是刻意的防 SSRF 设计，已知问题报错 "URLs are not accepted"）。这里把 URL 按
         需有界下载转成 base64，本地路径原样放行，两者都拿不到时返回 None。
         """
         inner = result.get("data", result) if isinstance(result, Mapping) else None
@@ -5322,7 +5385,7 @@ class LongMemoryAgentPlugin(Star):
         用 `messages_of()` 统一解包（信封/解包两种形状都吃）。
 
         嵌套转发（转发里再套转发）递归展开：深度≤2，visited 防环，内层按缩进块
-        接在所属节点下面（实录：套娃转发只显示 [forward] 占位等于没读到）。
+        接在所属节点下面（已知问题：套娃转发只显示 [forward] 占位等于没读到）。
         """
         self._bind_gateway_client()
         if self.gateway is None:
@@ -5375,7 +5438,7 @@ class LongMemoryAgentPlugin(Star):
             # 内容有两种真实形态（都实测过）：
             #  ① 发送侧 node：{"data": {"nickname","content": [...]}}（我们构造出去的）
             #  ② 事件侧：OneBot 消息事件本身 —— 内容在 `message`、发送者在 `sender`
-            # 旧代码只认 `content`，于是事件侧全被渲染成 "[空]"（实录读转发只出昵称）。
+            # 旧代码只认 `content`，于是事件侧全被渲染成 "[空]"（已知问题读转发只出昵称）。
             nested: list[str] = []
             text = ""
             for key in ("content", "message"):
@@ -5411,7 +5474,7 @@ class LongMemoryAgentPlugin(Star):
                 inner = await self._fetch_forward_text(
                     nid, depth=depth + 1, visited=visited, scope_id=scope_id)
                 if inner:
-                    # 嵌套层单独入库：这一层往往比外层先过期（实录：外层还能读、
+                    # 嵌套层单独入库：这一层往往比外层先过期（已知问题：外层还能读、
                     # 内层 SnowLuma 已报 "download forward message payload is empty"），
                     # 抓到的这一刻就存下来，之后读内层 id 永远命中缓存。
                     if depth == 0:
@@ -5419,7 +5482,7 @@ class LongMemoryAgentPlugin(Star):
                     indented = "\n".join("  " + line for line in inner.splitlines())
                     lines.append(f"{prefix}[嵌套转发] ↓\n{indented}")
                 else:
-                    # 文案要"不可脑补"：实录模型看到简称会把这一层猜成
+                    # 文案要"不可脑补"：已知问题模型看到简称会把这一层猜成
                     # "他也跟着接龙了一句"（其实这层是另一条合并转发卡）
                     lines.append(
                         f"{prefix}[嵌套转发未能展开：这层本身又是一条合并转发，"
@@ -5863,6 +5926,9 @@ class LongMemoryAgentPlugin(Star):
             payload_data: dict[str, Any] = {
                 "task": task_name, "instruction": instruction,
                 "previous_results": results[-6:], "transcript": transcript[-4:],
+                # 主动发言也要知道现在几点（已知问题：下午一点说"晚上好"）
+                "now": timeutil.text("%Y-%m-%d %H:%M %A"),
+                "time_of_day": self._time_of_day(timeutil.now().hour),
             }
             # steering（openclaw 移植）：任务开始后群里的新消息可能含新指示，
             # 每轮带上让 agent 及时调整，而不是做完已经过时的步骤
@@ -5894,8 +5960,8 @@ class LongMemoryAgentPlugin(Star):
             task_prompt = (
                 "\n\n".join(
                     part for part in
-                    (persona, SCHEDULED_TASK_PROMPT.strip(), script_block,
-                     self._standing_orders_block(),
+                    (persona, self._now_brief(), SCHEDULED_TASK_PROMPT.strip(),
+                     script_block, self._standing_orders_block(),
                      await self._injections_block()) if part
                 )
             )
@@ -5960,7 +6026,7 @@ class LongMemoryAgentPlugin(Star):
             if due:
                 await self._run_plan_item(due[0])
                 return
-        # 2.5) 话说到一半没人回？按节奏追问（用户要的「聊天生动性」）
+        # 2.5) 话说到一半没人回？按节奏追问（需要的「聊天生动性」）
         try:
             await self._follow_up_round()
         except Exception as error:
@@ -6071,7 +6137,7 @@ class LongMemoryAgentPlugin(Star):
         except Exception as error:
             logger.warning("长程记忆：日程[%s]执行失败：%s", kind, str(error)[:200])
             # 瞬时故障（上游 503/模型通道抖动/超时）不该让日程直接判死：
-            # 顺延重试，超过上限才标记 failed（实录：opus 通道瞬时 503 烧穿所有日程）
+            # 顺延重试，超过上限才标记 failed（已知问题：opus 通道瞬时 503 烧穿所有日程）
             text = str(error)
             transient = (
                 self._looks_like_provider_missing(error)
@@ -6391,7 +6457,7 @@ class LongMemoryAgentPlugin(Star):
                                          provider: str = "") -> dict[str, Any]:
         """白名单群才做：给参与度最高的人建/更新印象与人物档案（带昵称）。
 
-        实录（用户第一次导入）：面板显示"印象 0 条"，**而且一句解释都没有**——
+        已知问题：面板显示"印象 0 条"，**而且一句解释都没有**——
         这条链路以前遇到"没有可用模型 / 模型返回解析不了 / 样本不足"都会静默跳过。
         现在每一步都有账：谁成了、谁没成、为什么，全部回报给面板。
         """
@@ -6465,7 +6531,7 @@ class LongMemoryAgentPlugin(Star):
     async def _import_learn_provider(self) -> str:
         """导入学习用哪个模型：配置里的 → 解析出的 → 注册表里第一个能用的。
 
-        实录：导入后印象 0 条且毫无提示——最可能就是这一步返回空（配置留空、
+        已知问题：导入后印象 0 条且毫无提示——最可能就是这一步返回空（配置留空、
         默认模型解析拿不到），以前直接静默跳过。
         """
         for candidate in (self.settings.summary_provider_id, self.settings.reply_provider_id,
@@ -6608,13 +6674,13 @@ class LongMemoryAgentPlugin(Star):
         返回 (数据, 失败原因, 单次输入字符数)；`原因` 为空表示成功，其余取值：
         ``call``（模型没调通）、``empty``（样本没信息量）、``parse``（输出不是 JSON）。
 
-        实录（用户第一次导入，8/8 全废）：原来的用户消息是一坨裸 JSON，
+        已知问题：原来的用户消息是一坨裸 JSON，
         规则全在 system 里，而这个模型**把 system 整条吞掉**——它于是把样本
         当成"用户发来的东西"去回答（样本里提到德国劳动法，它就讲德国劳动法）。
         现在把任务交代写进用户消息，并挑真正有信息量的样本（见 usable_samples）。
         """
         # 按预算填充（import_learn_chars，独立于正常回复的上下文预算）：
-        # 用户实测"每次输入只有几千字符"——原来是写死的 60~120 条 × 100 字。
+        # 曾经遇到"每次输入只有几千字符"——原来是写死的 60~120 条 × 100 字。
         budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
         samples = qq_import.budgeted_samples(texts, budget)
         if not samples:
@@ -6767,8 +6833,8 @@ class LongMemoryAgentPlugin(Star):
     def _affinity_nudge(*, text: str) -> tuple[float, str]:
         """按这条消息的语气决定好感度涨跌（确定性规则，不指望模型自觉）。
 
-        实录：旧代码每回复一次就 `adjust_affinity(+1.0)`，**好感只涨不跌**——
-        用户做了次冒犯性测试（"你当我爸爸要不要"），好感度反而升了。
+        已知问题：旧代码每回复一次就 `adjust_affinity(+1.0)`，**好感只涨不跌**——
+        冒犯性发言曾（"你当我爸爸要不要"），好感度反而升了。
         现在负面明显重于正面：好感涨得慢、掉得快，才像真人。
         """
         from .src.emotions import classify_interaction
@@ -6824,7 +6890,7 @@ class LongMemoryAgentPlugin(Star):
     async def _resolve_scope_ref(self, ref: str) -> tuple[str, str, str]:
         """把"群号 / QQ号 / 群名（或名字片段）"解析成 (scope_id, 会话号, 提示)。
 
-        实录：用户要"数学指令讨论群"的记录，模型手里只有名字，而检索工具只认当前
+        已知问题：用户要"数学指令讨论群"的记录，模型手里只有名字，而检索工具只认当前
         会话 → 它只好拿私聊的消息凑数。这里让带名字的目标都能解析出来；解析不了
         就返回候选清单（宁可让它再问一句，也不要它默默换群）。
         """
@@ -7078,7 +7144,7 @@ class LongMemoryAgentPlugin(Star):
                                 *, account: str = "") -> None:
         """把**我们自己主动发出去**的话记进记忆（`self:` 前缀）。
 
-        实录（用户截图）：bot 说"刚还在潜水呢 冒个泡"，紧接着又评论
+        已知问题：bot 说"刚还在潜水呢 冒个泡"，紧接着又评论
         "刚说冒泡 这泡冒得有点慢 是不是又沉下去了"——它在评论自己刚说的话。
         真因是所有主动发送路径（工具/自主循环/日程/拓展/追问）都没记自己的话，
         于是下一轮看到 QQ 回显的那条，就当成"别人说的"了。
@@ -7096,7 +7162,7 @@ class LongMemoryAgentPlugin(Star):
 
             self_id = str(self._self_id() or "")
             # **账号要跟这个会话原本的账号一致**，否则会新建一个 account_id='self'
-            # 的平行会话：自己发的话记到另一个 scope 里，等于没记（实录踩过）。
+            # 的平行会话：自己发的话记到另一个 scope 里，等于没记（已知问题踩过）。
             account_id = str(account or "").strip()
             if not account_id:
                 account_id = await self._account_for_conversation(conversation)
@@ -7123,7 +7189,7 @@ class LongMemoryAgentPlugin(Star):
     async def _account_for_conversation(self, conversation: str) -> str:
         """按会话号反查它属于哪个账号（bot 自己的号）——写记忆时必须用同一个。
 
-        实录：曾经直接用 `_self_id()`（拿不到就是空/self）当账号，结果给自己发的话
+        已知问题：曾经直接用 `_self_id()`（拿不到就是空/self）当账号，结果给自己发的话
         建了一个平行会话，等于没记。这里优先用插件已知的会话，再退回 self_id。
         """
         conversation = str(conversation or "").strip()
@@ -7327,7 +7393,7 @@ class LongMemoryAgentPlugin(Star):
             lines.append(f"[来源:{index}] {who}：{text[:200]}")
         if len(lines) < 8:
             return counts
-        # 按预算截窗口（不再写死 120 行）：预算大就多喂，用户要的是"每次输入很多消息"
+        # 按预算截窗口（不再写死 120 行）：预算大就多喂，这里要的是"每次输入很多消息"
         budget = int(getattr(self.settings, "import_learn_chars", 96000) or 96000)
         kept: list[str] = []
         used = 0
@@ -7896,7 +7962,7 @@ class LongMemoryAgentPlugin(Star):
                     nickname=str(args.get("nickname", "")) or None,
                     longnick=str(args.get("longnick", "")) or None), 3000)
             if tool == "qq_set_status" and self.qq:
-                # 模型会把签名文本传给 status（实录：'月读渲染中勿扰'）——
+                # 模型会把签名文本传给 status（已知问题：'月读渲染中勿扰'）——
                 # 非数字一律当 0（在线），不能让 ValueError 炸掉动作循环
                 try:
                     status_value = int(str(args.get("status", 0)).strip() or 0)
@@ -9755,7 +9821,7 @@ class LongMemoryAgentPlugin(Star):
     async def _follow_up_round(self) -> None:
         """心跳里的一轮：话说到一半没人回 → 按节奏追问一次。
 
-        用户要的「生动」不是照抄某句话，而是这三件事：
+        需要的「生动」不是照抄某句话，而是这三件事：
         ①注意到状态变了（有悬着的话头）；②有自己的节奏（越等越急、口气递进）；
         ③有边界（次数上限、静默时段不发、对方一回来立刻清零）。
         说什么交给模型（带上口气与话头），这里只管节奏。
@@ -9787,7 +9853,9 @@ class LongMemoryAgentPlugin(Star):
                     "conversation": dangling.conversation,
                     "last_thing_we_said": dangling.topic,
                     "how_long_they_are_silent": why,
-                }, 2000), system_prompt=brief)
+                    "now": timeutil.text("%Y-%m-%d %H:%M %A"),
+                    "time_of_day": self._time_of_day(timeutil.now().hour),
+                }, 2000), system_prompt=brief + "\n\n" + self._now_brief())
             line = _bubble_text(self._sanitize_outgoing(raw))
         except Exception as error:
             logger.info("长程记忆：追问生成失败：%s", str(error)[:120])
@@ -9870,7 +9938,7 @@ class LongMemoryAgentPlugin(Star):
 
         这条是即时发出的，和你最终的正常回复相互独立、条数互不影响；可按需发 0 到多条。
         【克制】默认别播报：没人要求就保持安静，最终结果用正常回复给。只有任务较长、
-        用户明确要进度、或需要让对方等一下时，才发一两条很短的（如"稍等 我去过下验证"）。
+        明确要进度、或需要让对方等一下时，才发一两条很短的（如"稍等 我去过下验证"）。
         若过程里已经把要说的都说完了，最终回复可以用 noop。
 
         Args:
@@ -9938,7 +10006,7 @@ class LongMemoryAgentPlugin(Star):
             user_id(string): 目标QQ号，发群则留空。
         """
         self._require_qq(event)
-        # 默认发到当前会话：群=本群，私聊=对方QQ号（实录：模型只传 media_id
+        # 默认发到当前会话：群=本群，私聊=对方QQ号（已知问题：模型只传 media_id
         # 时报 "group_id 和 user_id 至少填一个"，图就发不出去）
         current_group = str(event.get_group_id() or "")
         if current_group:
@@ -10064,7 +10132,7 @@ class LongMemoryAgentPlugin(Star):
     def _sticker_claim(self, scope_id: str, sha: str) -> bool:
         """这条回复里这张表情**发过没有**？没发过→登记并返回 True。
 
-        实录（用户截图）：一次回复弹出三条一模一样的表情。查证后的成因是——
+        已知问题：一次回复弹出三条一模一样的表情。查证后的成因是——
         一次回复里有**三条互不知情的发送路径**：①决策级 sticker 动作
         ②计划里的 sticker 段 ③正文里的 [sticker: id] 占位。模型把"发这张"
         表达了两三遍（写了段、又把占位写进正文），三条路于是各发一遍。
@@ -10095,7 +10163,7 @@ class LongMemoryAgentPlugin(Star):
     async def _send_sticker_action(self, args: dict[str, Any]) -> str:
         """往群里发一张库存表情包（主动发/被要求发都走这里）。
 
-        实录：提示词一直承诺有 send_sticker，但它只挂在内部动作分发上、**没有注册成工具**，
+        已知问题：提示词一直承诺有 send_sticker，但它只挂在内部动作分发上、**没有注册成工具**，
         模型在主循环里按名字调用不到 → 跑去别家插件的 run_wyc_tool 包装器里试，白烧一轮
         （日志：无效的工具名称或工具未启用: send_sticker）。现在补成真工具，两处共用这一段。
         """
@@ -10873,7 +10941,7 @@ class LongMemoryAgentPlugin(Star):
         """技术类问题（数学/信息学）强制先查知识库：由插件主动检索并把结果
         与指令注入上下文。不指望模型自觉调用 kb_search——弱模型经常不查就编。"""
         question = str(question or "").strip()
-        if not question or not _TECH_QUESTION_RE.search(question):
+        if not question or not looks_like_tech_question(question):
             return None
         hits: Any = []
         try:
@@ -11085,7 +11153,7 @@ class LongMemoryAgentPlugin(Star):
         return str(reason)
 
     def _remember_nav_failure(self, url: str, reason: str) -> None:
-        """记下失败：实录里模型在同一个站点上连着试 browser_screenshot→browser_dom→
+        """记下失败：已知问题里模型在同一个站点上连着试 browser_screenshot→browser_dom→
         ssh_screenshot→python_exec，四条路全废还烧了十几轮 token。"""
         if not url or not reason:
             return
@@ -11439,7 +11507,7 @@ class LongMemoryAgentPlugin(Star):
         """把远程服务器上的文件拉进本地媒体库（整块 base64 回传）。
 
         这是"把服务器上的图发我"的专用通道——走 ssh_exec 的常规输出会被 12k
-        上限截断成坏文件（实录：bot 说"图送上来了"却怎么也发不出来）。
+        上限截断成坏文件（已知问题：bot 说"图送上来了"却怎么也发不出来）。
         """
         if self._ssh is None or not self._ssh_configured():
             raise SSHError("SSH 未配置：请在插件配置填 ssh_host / ssh_user / ssh_password")
@@ -11543,7 +11611,7 @@ class LongMemoryAgentPlugin(Star):
     async def ssh_fetch_tool(self, event: AstrMessageEvent, remote_path: str,
                              note: str = ""):
         """把远程服务器上的文件（图片/日志/任何文件）拉回媒体库，返回 media_id，
-        再用 send_image(media_id) 发给用户。用户说"把服务器上那张图发我/把日志发来"
+        再用 send_image(media_id) 发给用户。有反馈说"把服务器上那张图发我/把日志发来"
         就用它——这是把远程文件发到 QQ 的正确通道（ssh_exec 的输出上限传不了文件）。
 
         Args:
@@ -11638,7 +11706,7 @@ class LongMemoryAgentPlugin(Star):
     async def _design_screenshot(self, content: str) -> str:
         """Render HTML content in a fresh browser page and archive the PNG."""
         # screenshot 是 async（_pw_driver 的方法），不能塞进 to_thread 的同步
-        # lambda——那只会拿到 coroutine（实录：object of type 'coroutine' has no len()）
+        # lambda——那只会拿到 coroutine（已知问题：object of type 'coroutine' has no len()）
         png = await self._pw_driver().screenshot(None, fallback_html=content)
         if not png:
             raise BrowserError("渲染截图为空")
@@ -12194,7 +12262,7 @@ class LongMemoryAgentPlugin(Star):
         permissions_json: str = "",
     ):
         """把刚验证有效的一套流程固化成你自己的新技能（写完立刻热加载，下次同类任务直接可用）。
-        复杂多步流程收尾、或用户纠正过你的做法时，值得固化；一件小事不值得。
+        复杂多步流程收尾、或被纠正过的做法时，值得固化；一件小事不值得。
 
         Args:
             skill_id(string): 技能英文短名（小写字母/数字/中划线），如 exam-paper-answers。
@@ -12619,15 +12687,6 @@ def _is_image_only(raw: dict[str, Any], text: str) -> bool:
         isinstance(part, dict) and part.get("type") in {"image", "mface"}
         for part in message
     )
-
-
-# 画图/设计请求（确定性直通）：命中就不再指望 agent 自觉调 design_render——
-# 巨大工具集+超长提示词下弱模型/强模型的工具调用都会失效（实录：判定=agent
-# 却一个工具都没调、直接出了纯文本回复）。走"LLM 出 SVG→渲染→截图→发送"。
-_DRAW_REQUEST_RE = re.compile(
-    r"画(一?张|个|一下)?|绘制|来(一?张|个)?图|设计(一?张|个|一下)?(海报|头像|图标|logo|表情)"
-    r"|生成(一?张|个)?(图片|图像|图)|鹦鹉|鹈鹕|骑士|骑(着|个)?",
-)
 
 
 _BROWSER_TOOL_NAMES = frozenset({

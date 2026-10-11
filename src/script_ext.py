@@ -1,6 +1,6 @@
 """scripts/ 万能拓展接口（Script Extensions）。
 
-设计目标：**长期兼容**。用户（或外部 agent）在插件目录 ``scripts/<id>/`` 放一个
+设计目标：**长期兼容**。使用者（或外部 agent）在插件目录 ``scripts/<id>/`` 放一个
 文件夹，即可给 bot 提供工具、附加提示词与消息钩子；插件升级不需要拓展跟着改。
 
 兼容性三原则（改动本文件时必须遵守）：
@@ -81,7 +81,7 @@ class ScriptExtensionAPI:
         """读取本拓展的配置（``data_dir/config.json`` 覆盖 ``config.default.json``）。
 
         每个拓展可以在自己的文件夹里放 ``config.default.json``（默认值模板，随插件走），
-        用户的改动写到数据目录的 ``config.json``（升级不丢）。**每次调用都重读**，
+        改动写到数据目录的 ``config.json``（升级不丢）。**每次调用都重读**，
         所以控制台改完立刻生效，不用重载拓展。
         """
         return self._manager.effective_config(self.name)
@@ -98,7 +98,7 @@ class ScriptExtensionAPI:
         return data.get(str(key), default)
 
     def set_config(self, key: str, value: Any) -> None:
-        """改一个配置项（写进用户配置文件，立即对后续调用生效）。"""
+        """改一个配置项（写进配置文件，立即对后续调用生效）。"""
         self._manager.set_config_value(self.name, str(key), value)
 
     def now(self) -> str:
@@ -273,7 +273,7 @@ def validate_manifest(raw: Any, source: Path) -> dict[str, Any]:
         "prompts": [str(x) for x in prompts if str(x).strip()],
         "permissions": permissions,
         # 默认是否启用：拓展可以声明 default_enabled=false（内置实验性拓展用），
-        # 用户随时能在控制台打开；用户的选择优先于这里的默认值。
+        # 可在控制台打开；显式选择优先于这里的默认值。
         "default_enabled": bool(raw.get("default_enabled", True)),
         # 未知字段一律忽略（向前兼容：老插件读新 manifest 不炸）
     }
@@ -458,7 +458,7 @@ class ScriptExtensionManager:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    # ---- 启用状态（拓展可以声明默认关闭；用户的选择优先并落盘） ----
+    # ---- 启用状态（拓展可以声明默认关闭；显式选择优先并落盘） ----
     def _state_path(self) -> Path:
         self.data_root.mkdir(parents=True, exist_ok=True)
         return self.data_root / "_extensions.json"
@@ -471,7 +471,7 @@ class ScriptExtensionManager:
         return data if isinstance(data, dict) else {}
 
     def is_enabled(self, ext_id: str) -> bool:
-        """用户改过就用用户的选择；没改过看拓展自己声明的 default_enabled。"""
+        """显式设置过就用显式设置；没改过看拓展自己声明的 default_enabled。"""
         ext = self.get(ext_id)
         if ext is None:
             return False
@@ -497,7 +497,7 @@ class ScriptExtensionManager:
         self.log(ext_id, "已启用" if enabled else "已关闭")
         return bool(enabled)
 
-    # ---- 拓展配置（模板随拓展走，用户改动落在数据目录） ----
+    # ---- 拓展配置（模板随拓展走，改动落在数据目录） ----
     def config_path(self, ext_id: str) -> Path:
         return self.data_dir(ext_id) / "config.json"
 
@@ -514,7 +514,7 @@ class ScriptExtensionManager:
         return data if isinstance(data, dict) else {}
 
     def effective_config(self, ext_id: str) -> dict[str, Any]:
-        """模板打底 + 用户改动覆盖（用户没写过的项用默认值）。"""
+        """模板打底 + 改动覆盖（没写过的项用默认值）。"""
         data = dict(self.config_template(ext_id))
         try:
             raw = json.loads(self.config_path(ext_id).read_text(encoding="utf-8"))
@@ -525,7 +525,7 @@ class ScriptExtensionManager:
         return data
 
     def save_config(self, ext_id: str, values: Mapping[str, Any]) -> dict[str, Any]:
-        """整份写入用户配置（控制台用）。未知键也保留——拓展可能读自定义字段。"""
+        """整份写入配置（控制台用）。未知键也保留——拓展可能读自定义字段。"""
         if self.get(ext_id) is None:
             raise ScriptExtensionError(f"没有叫 {ext_id} 的拓展")
         clean = {str(k): v for k, v in dict(values or {}).items() if str(k).strip()}

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """QQ 消息卡片渲染器（伪截图）。
 
-用户要求：不是对 QQ 真截图，而是把「用户头像 + 消息内容」做成聊天卡片形式的
+不是对 QQ 真截图，而是把「用户头像 + 消息内容」做成聊天卡片形式的
 图片——要处理好图文混排与合并转发的情况。纯函数构建 HTML，交给
 ``_design_screenshot``（fresh page 渲染）出图；头像直接用 QQ 官方头像接口，
 图片段用消息里自带的 CDN url。
@@ -192,7 +192,7 @@ def build_card_html(messages: list[dict[str, Any]], *, title: str = "聊天记�
         f".footer{{text-align:center;color:{_TIME_COLOR};font-size:11px;margin-top:10px;}}"
         "</style></head><body>"
         # data-shot-fit：让截图管线按这个盒子的真实尺寸定画布（否则固定宽视口
-        # 会把卡片塞在左上角、其余全白——用户截图里的"消息只占一点点"）
+        # 会把卡片塞在左上角、其余全白——已知问题里的"消息只占一点点"）
         "<div class='card' data-shot-fit>"
         f"<div class='title'><span>{_escape(title)}（{count}条）</span></div>"
         + rows + footer_html +

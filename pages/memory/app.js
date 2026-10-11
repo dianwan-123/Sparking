@@ -1,5 +1,5 @@
 // ===== 记忆森林渲染器（与 pages/tree/forest.js 同源，内联以保证插件页可用）=====
-// 改渲染器请改 pages/tree/forest.js，然后跑 tools/sync_forest.py 同步这一份。
+// 渲染器与 pages/tree/forest.js 同源，两份内容需保持一致。
 
 // Sparking 记忆森林 —— 圆形节点 + 连线 的真实可视化（零依赖，纯 SVG）
 // 用法：window.SparkingForest.mount(container, { getTree, onEdit, onDelete, onAddChild })

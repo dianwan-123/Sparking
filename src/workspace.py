@@ -55,7 +55,7 @@ class Workspace:
     def resolve_existing(self, path: str | Path) -> Path:
         """解析路径；相对路径先按主目录找，找不到再到其它允许根里找同名相对路径。
 
-        实录（用户日志）：模型用 AstrBot 自带工具把脚本写进
+        已知问题：模型用 AstrBot 自带工具把脚本写进
         `data/workspaces/default_GroupMessage_xxx/pelican_gif.py`，随后
         `run_script("pelican_gif.py")` 只在插件 workspace 里找 → "脚本不存在"（其实就在）。
         """

@@ -44,7 +44,7 @@ class ContextBuilder:
             memory_scopes, summary_limit, levels=(1, 2, 3), query=query or None)
         if query.strip():
             # 有查询词时，上面那两条是**按关键词过滤**的：当前这句话谁也匹配不上，
-            # 整块记忆就是空的（实录：私聊里问"你群里平时聊什么"，群记忆一条没进来，
+            # 整块记忆就是空的（已知问题：私聊里问"你群里平时聊什么"，群记忆一条没进来，
             # 它只好反问对方那个群在聊什么）。所以再补一份"最近的"，与命中的合并。
             seen_summaries = {row.summary_id for row in summary_rows}
             for row in await self.storage.list_summaries(
@@ -57,7 +57,7 @@ class ContextBuilder:
                 if row.memory_id not in seen_catalog:
                     catalog_rows.append(row)
                     seen_catalog.add(row.memory_id)
-        # 各会话一句话近况：模型先有全局印象，细节再按需查（用户要的
+        # 各会话一句话近况：模型先有全局印象，细节再按需查（需要的
         # "把每个群大概记忆一起放进 prompt"）。一条一行，别撑爆预算。
         all_scopes = [s for s in dict.fromkeys((scope_id, *cross_scope_ids)) if s]
         grouped = await self.storage.latest_summaries_by_scope(all_scopes)
@@ -72,7 +72,7 @@ class ContextBuilder:
             topics_by_scope = {}
         overviews: list[dict[str, Any]] = []
         for one in all_scopes[:16]:
-            # 一律用真名（用户要的是"每个群大概记忆"，看到"本群"就不知道是哪个群了）；
+            # 一律用真名（这里要的是"每个群大概记忆"，看到"本群"就不知道是哪个群了）；
             # 当前会话由 current 字段标出来
             label = str(labels.get(one, "") or "").strip() or one[:8]
             digests = grouped.get(one) or []
@@ -96,7 +96,7 @@ class ContextBuilder:
                 overviews.append(item)
 
         # 我自己最近说过的话（只取当前会话、只取自己发的）：自我连续性的根基。
-        # 实录：bot 上一句说"我在学 xxx"，下一句被问"你在学 xxx 吗"却回"xxx 是啥"——
+        # 已知问题：bot 上一句说"我在学 xxx"，下一句被问"你在学 xxx 吗"却回"xxx 是啥"——
         # 它自己刚说的话没在它眼前。这里显式列出来，并放在最后才被截断的位置。
         my_recent: list[dict[str, Any]] = []
         try:
@@ -312,7 +312,7 @@ def _summary(value: SummaryRecord, origin: str = "本群") -> dict[str, Any]:
     # body 截短：L1 的 body 是原始 JSON 块，整段放进信封会挤爆预算；
     # title + topics + 截短的 body 足够模型知道"发生过什么"。
     body = str(value.body)[:500]
-    # 带发生时间：不带时间的话模型会把"上个月的事"当成刚发生的（实录：翻旧账当新事说）
+    # 带发生时间：不带时间的话模型会把"上个月的事"当成刚发生的（已知问题：翻旧账当新事说）
     data = _escape({"summary_id": value.summary_id, "origin": origin, "level": value.level,
                     "at": timeutil.to_text(value.created_at),
                     "range": [value.start_seq, value.end_seq], "title": value.title,

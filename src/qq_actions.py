@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""SnowLuma / OneBot v11 全量动作表（由 tools/gen_qq_actions.py 生成，勿手改）。
+"""SnowLuma / OneBot v11 全量动作表（与网关文档保持同步）。
 
 来源：SnowLuma 文档站 catalog.json，共 193 个动作。
 每个动作带：分类、中文说明、只读标记、风险级别、参数表（含类型/必填/默认/说明）。

@@ -137,7 +137,7 @@ class MediaArchive:
     async def ensure_open(self) -> None:
         """按需重开。
 
-        实录（用户日志）：插件重载后，上一实例里仍在跑的 agent 工具循环继续调本插件的
+        已知问题：插件重载后，上一实例里仍在跑的 agent 工具循环继续调本插件的
         工具，而它持有的归档连接已被 terminate 关掉 → 连环 `media archive is not open`
         （看图/发图/媒体列表全废，bot 看起来像傻了）。真正要用连接前自动重开一次，
         幂等且走已有的锁，代价极小。

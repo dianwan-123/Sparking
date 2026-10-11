@@ -123,7 +123,7 @@ class Storage:
 
         防御：若上一个路径在异常分支漏了收尾、连接上还挂着事务，先回滚掉——
         否则后面每一次写都会以 "cannot start a transaction within a transaction"
-        连环失败（实录：用户日志里 ingest_message 整条炸穿，消息直接不入库）。
+        连环失败（已知问题：日志里 ingest_message 整条炸穿，消息直接不入库）。
         """
         if getattr(db, "in_transaction", False):
             await db.rollback()
@@ -169,7 +169,7 @@ class Storage:
         scope_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{platform}\0{account_id}\0{conversation_id}").hex
         await db.execute(
             # 名字只在拿得到时更新：入库链路常带空 display_name，直接覆盖会把
-            # 群名抹掉（实录：控制台会话列表只剩号码、按群名找不到会话）。
+            # 群名抹掉（已知问题：控制台会话列表只剩号码、按群名找不到会话）。
             "INSERT INTO scopes(scope_id,platform,account_id,conversation_id,display_name,created_at) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(platform,account_id,conversation_id) DO UPDATE SET display_name="
             "CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE scopes.display_name END",
@@ -381,7 +381,7 @@ class Storage:
                             max_retries: int = 2) -> bool:
         """执行失败后顺延重试：改回 pending 并把 due_at 推后；超过上限返回 False。
 
-        实录：上游瞬时 503 / 模型通道抖动会让日程直接 failed 永不重来——
+        已知问题：上游瞬时 503 / 模型通道抖动会让日程直接 failed 永不重来——
         瞬时故障应该顺延，只有真正做不了（或重试超限）才判死。
         """
         row = await self._fetchone(
@@ -559,7 +559,7 @@ class Storage:
     async def find_message_any(self, scope_id: str, ref: str) -> StoredMessage | None:
         """按**内部编号或 QQ 上游 id** 任一取消息。
 
-        实录（bot"拼不出合并转发"）：`forward_messages` 拿到的 id 可能来自
+        已知问题（bot"拼不出合并转发"）：`forward_messages` 拿到的 id 可能来自
         `search_chat_history`（那里叫 message_id=内部编号）也可能来自上下文
         （qq_id=上游编号），而旧的回落只认上游 id → 模型传内部编号时两条路都
         查不到，于是回一句"没取到"，模型就以为"拼不了转发"。
@@ -583,9 +583,9 @@ class Storage:
     async def resolve_reply_target(self, scope_id: str, candidate: str) -> str:
         """把引用目标校验并翻成 **QQ 上游消息号**；确认不了返回 ""（调用方就别引用）。
 
-        实录（"bot 莫名其妙引用错消息"）：上下文里同时给了内部编号 message_id 和
+        已知问题（"bot 莫名其妙引用错消息"）：上下文里同时给了内部编号 message_id 和
         QQ 消息号 qq_id，模型时常拿内部编号去填 reply_to_message_id —— QQ 端按号
-        一找，引用到的是**另一条完全不相干的消息**（实录：回复的是群友的感慨，
+        一找，引用到的是**另一条完全不相干的消息**（已知问题：回复的是群友的感慨，
         引用条却是"戳一戳"通知那条）。所以发送前必须：①两种 id 都接受并翻译；
         ②系统通知类消息（notice./request.）一律不许被引用。
         """
@@ -642,7 +642,7 @@ class Storage:
         await self._validate_owned(scope_id, "summary_nodes", "summary_id", input_summary_ids)
         db, summary_id, now = self._conn(), uuid.uuid4().hex, utc_now()
         # created_at 记的是「这段内容**什么时候发生的**」，不是「什么时候压缩的」。
-        # 实录：导入 2022 年的聊天记录后压缩，摘要 created_at 写成今天 → 模型把它
+        # 已知问题：导入 2022 年的聊天记录后压缩，摘要 created_at 写成今天 → 模型把它
         # 当成刚发生的事（旧事当新事）。所以压缩方要把被覆盖内容的真实时间传进来。
         happened_at = str(occurred_at or "").strip() or now
         data = manifest or {"messages": message_ids, "summaries": input_summary_ids}
@@ -654,7 +654,7 @@ class Storage:
                 await db.executemany("INSERT INTO summary_inputs(summary_id,input_summary_id) VALUES(?,?)", [(summary_id, item) for item in input_summary_ids])
                 await db.executemany("INSERT INTO summary_citations VALUES(?,?,?)", [(summary_id, item, "") for item in message_ids])
                 # 群话题：每个话题按 (scope,title) 唯一，命中就 hits+1 并推进 last_seq
-                # （实录：v0.40.0 我改 list_impressions 时误删了这段，导致话题不再记录）
+                # （已知问题：v0.40.0 我改 list_impressions 时误删了这段，导致话题不再记录）
                 for topic in list(dict.fromkeys(str(x).strip() for x in topics))[:12]:
                     if not topic:
                         continue
@@ -673,7 +673,7 @@ class Storage:
     async def upsert_topics(self, scope_id: str, topics: Sequence[str], last_seq: int) -> int:
         """把一批话题写进 group_topics（同 scope 同标题 hits+1 并推进 last_seq）。
 
-        compression 侧一直在调它（实录日志：'Storage' object has no attribute 'upsert_topics'），
+        compression 侧一直在调它（已知问题日志：'Storage' object has no attribute 'upsert_topics'），
         但方法从来没被实现过——话题表因此永远是空的。与 store_summary 里那段内联 SQL 同语义。
         """
         cleaned = [str(item).strip()[:80] for item in (topics or [])]
@@ -683,7 +683,7 @@ class Storage:
         db = self._conn()
         now = utc_now()
         # 必须持写锁：否则和 ingest/压缩并发时，两边各自 BEGIN IMMEDIATE 会互相踩
-        # （实录：'cannot start a transaction within a transaction'）
+        # （已知问题：'cannot start a transaction within a transaction'）
         async with self._write_lock:
             await self._begin_write(db)
             try:
@@ -838,7 +838,7 @@ class Storage:
     async def drop_plan(self, plan_id: str) -> bool:
         """撤销一条日程（WebUI 的「撤销任务」用）。
 
-        实录：这个方法在重构里被删了，但 WebUI 两处还在调 → 点撤销直接
+        已知问题：这个方法在重构里被删了，但 WebUI 两处还在调 → 点撤销直接
         `AttributeError: 'Storage' object has no attribute 'drop_plan'`。
         """
         plan_id = str(plan_id or "").strip()
@@ -1050,7 +1050,7 @@ class Storage:
     ) -> list[dict[str, Any]]:
         """读人物印象；`merge=True` 会把**同一个人的多条印象合并成一条**。
 
-        实录："bot 的人物印象每个群不互通，一个人在两个群会有不同的印象"。
+        已知问题："bot 的人物印象每个群不互通，一个人在两个群会有不同的印象"。
         合并策略：正文取最新一条非空、标签取并集、名字取最新非空、时间取最新，
         并附带 `groups` 说明这个人出现在哪些群。写入仍按群存（保留各自的细节），
         读取与注入一律走合并视图 —— 所以对 bot 来说"一个人只有一份印象"。
@@ -1432,7 +1432,7 @@ class Storage:
             return int(cursor.rowcount or 0)
 
     async def seed_prompt_injections(self, presets: "Sequence[Mapping[str, Any]]") -> int:
-        """把自带预设补进库（已存在的不动——用户改过的内容不该被覆盖）。"""
+        """把自带预设补进库（已存在的不动——已改过的内容不该被覆盖）。"""
         existing = {row["injection_id"] for row in await self.list_prompt_injections()}
         added = 0
         for order, item in enumerate(presets):
@@ -1565,7 +1565,7 @@ class Storage:
                 await db.execute("DELETE FROM stickers")
                 await db.execute("DELETE FROM jobs")
                 await db.execute("DELETE FROM audit_logs")
-                # 实录（用户）：点了"清空全部记忆"，情绪/任务/日程还留着。
+                # 已知问题：点了"清空全部记忆"，情绪/任务/日程还留着。
                 # 记忆相关的一律清干净——scopes 靠外键级联带走消息/摘要/话题/印象/好感/风格，
                 # 下面这些是各自独立的表，要显式删。
                 for table in ("agent_plans", "tasks", "mood_events", "person_profiles",

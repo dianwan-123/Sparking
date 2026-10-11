@@ -61,7 +61,7 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
 def iter_json_objects(text: str) -> "list[dict[str, Any]]":
     """把文本里所有能解析出来的平衡 `{…}` 块按出现顺序列出来。
 
-    实录（deepseek-v4.1-flash 在 catapi 上）：模型把规则当耳旁风，先写一大段分析、
+    已知问题（deepseek-v4.1-flash 在 catapi 上）：模型把规则当耳旁风，先写一大段分析、
     再顺手把 JSON 塞在中间；原来的 `parse_json_object` 只认第一个 `{` 块，
     那块往往是它举例用的片段 → 解析失败 → 学习整段静默跳过。
     """
@@ -206,7 +206,7 @@ def compact_json(value: Any, limit: int = 12000, *,
     """把结构序列化成 JSON，超预算时**按结构压缩**（永远输出合法 JSON）。
 
     与旧实现的关键区别：旧的是 `text[:limit] + "…"` —— 切出**半截 JSON**，调用方
-    拿去 parse 必然失败、退回 `{}`，于是记忆整块丢失（实录：导入的大群历史长，
+    拿去 parse 必然失败、退回 `{}`，于是记忆整块丢失（已知问题：导入的大群历史长，
     判定/回复链路的 `memory_context` 几乎每轮都是空的，表现成"不认自己刚说的话、
     旧事当新事、答非所问"）。这里只做三种操作，且**增量计长**（大结构也快）：
       ① 丢掉可丢的键 → ② 截短最长的字符串 → ③ 从最长的列表尾部删元素

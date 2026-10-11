@@ -174,7 +174,7 @@ class DecisionEngine:
         for name in ("intent", "query"):
             if name in value:
                 # 模型常给出 "intent": null——必须归一成 ""，否则下方切片
-                # None[:500] 会以 TypeError 让整批判定失败（实录）
+                # None[:500] 会以 TypeError 让整批判定失败（曾因此让整批判定失败）
                 if value[name] is None:
                     value[name] = ""
                 elif not isinstance(value[name], str):

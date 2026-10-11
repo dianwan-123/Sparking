@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """WebUI 数据面与动作面（完全重写版）。
 
-用户诉求（实录）：①所有删除功能点了没反应；②界面有错别字（"LLLM"）；③很卡。
+背景：①所有删除功能点了没反应；②界面有错别字（"LLLM"）；③很卡。
 根因（本地实测）：删除入口只认**内部编号**，前端拿到的是 QQ 消息号 → 静默删 0 条；
 `storage.stats()` 的键是 `message_identities` 而前端读 `messages` → 计数全空；
 前端一次性拉全量数据、无分页。
@@ -322,7 +322,7 @@ class PageAPI:
         out: list[dict[str, Any]] = []
         for item in entries:
             # 注意：CatalogEntry 是 dataclass(slots=True)——**没有 __dict__**，
-            # 用 getattr(item,"__dict__",{}) 会拿到 {}（实录：账本全是"记忆 — —"）
+            # 用 getattr(item,"__dict__",{}) 会拿到 {}（已知问题：账本全是"记忆 — —"）
             pick = (lambda name, default="": item.get(name, default)
                     if isinstance(item, Mapping) else getattr(item, name, default))
             out.append({
@@ -725,7 +725,7 @@ class PageAPI:
     # ------------------------------------------------------------ 记忆森林
     @staticmethod
     def _time_text(value: Any, granularity: str) -> str:
-        """按层级给时间粒度：越具体的记忆显示得越精确（用户明确要求）。"""
+        """按层级给时间粒度：越具体的记忆显示得越精确（明确要求）。"""
         raw = str(value or "").strip()
         if not raw:
             return ""
@@ -1317,7 +1317,7 @@ class PageAPI:
     async def _do_memory_edit_by_bot(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """把"这条记忆要改成什么"交给 bot，由它自己调 memory_edit 动手。
 
-        这是"智能记忆修改"的第二条路：用户说清意图，bot 决定怎么改（改哪条、改成什么），
+        这是"智能记忆修改"的第二条路：有反馈说清意图，bot 决定怎么改（改哪条、改成什么），
         并留下修订记录。它不动手时会说明理由，不假装改了。
         """
         node_id = str(body.get("node_id") or "").strip()
@@ -1347,7 +1347,7 @@ class PageAPI:
                     '只输出 JSON：{"action":"update|forget|keep",'
                     '"subject":"新标题（action=update 时给）",'
                     '"value":"新内容（action=update 时给）",'
-                    '"reply":"一句话对用户说"}'),
+                    '"reply":"一句话对有反馈说"}'),
                 system_prompt=("你在修改自己的长期记忆。只动这一条，别改别的；"
                                "拿不准就用 action=keep 并说清原因，不要瞎改。"))
         except Exception as error:

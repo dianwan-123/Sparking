@@ -42,7 +42,7 @@ LLMFn = Callable[..., Awaitable[str]]
 class EvalExample:
     """一条评测用例（≈ hermes-evo EvalExample）。"""
 
-    task_input: str          # 用户会怎么问
+    task_input: str          # 提问会怎么写
     expected_behavior: str   # 好回答的标准（评分 rubric，不是标准答案文本）
     difficulty: str = "medium"
     category: str = "general"
@@ -289,7 +289,7 @@ def quick_fitness(agent_output: str, expected_behavior: str) -> float:
     """快速代理指标（≈ hermes-evo skill_fitness_metric 的重叠粗筛）。
 
     零 LLM 成本：用于 train 集的粗筛轮。**字符 bigram 重叠**而非空格分词——
-    中文没有空格分词，英文式词重叠对中文恒为 0（实录：粗筛恒 0.3 全被淘汰）。
+    中文没有空格分词，英文式词重叠对中文恒为 0（已知问题：粗筛恒 0.3 全被淘汰）。
     """
     output = (agent_output or "").strip()
     if not output:
@@ -323,7 +323,7 @@ class SyntheticDatasetBuilder:
 生成 {num_cases} 条多样化的评测用例，覆盖它的不同侧面。
 
 只输出一个严格 JSON 数组，每项：
-{{"task_input": "用户实际会怎么问（口语，QQ聊天风格）",
+{{"task_input": "实际提问会长什么样（口语，QQ聊天风格）",
   "expected_behavior": "好回答的标准——描述该做到什么（含格式/语言风格要求），不是标准答案文本",
   "difficulty": "easy|medium|hard",
   "category": "考察目标文本的哪个侧面"}}

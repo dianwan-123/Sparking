@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """快速学习：导入导出的群聊天记录（QQChatExporter V5 / chunked-jsonl）。
 
-用户给的语料形状：
+语料形状：
     <群文件夹>/
         manifest.json          # chatInfo{name,type,selfUin,selfName} + statistics{senders,timeRange}
         chunks/chunk_0001.jsonl  # 每行一条消息
@@ -84,7 +84,7 @@ def _iso_from_ms(value: Any) -> str:
 def _sender_of(raw: Mapping[str, Any]) -> tuple[str, str, str]:
     """→ (uin, uid, 名字)。名字优先群名片，其次导出给的显示名。
 
-    实录：同一份导出里**同一个人有时只带 uid、没有 uin**（两条并列出现），
+    已知问题：同一份导出里**同一个人有时只带 uid、没有 uin**（两条并列出现），
     直接拿它当 id 会把一个人算成两个。所以 uid 单独返回，交给上层回填。
     """
     sender = raw.get("sender") if isinstance(raw.get("sender"), Mapping) else {}
@@ -314,7 +314,7 @@ def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
                    *, min_count: int = SAMPLE_MIN) -> list[str]:
     """挑出真正能看出「这个人是什么样」的发言样本（按**条数**上限，老接口）。
 
-    实录：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
+    已知问题：某个人 2208 条发言，取最近 12 条全是 `[卡片消息]`（导出里卡片没有正文），
     模型只能回一句"你发的是聊天记录片段，想让我做什么？"——样本本身没信息量。
     这里先丢掉纯占位与太短的，再从**整段历史**里均匀取样（不是只取末尾）。
     """
@@ -324,7 +324,7 @@ def usable_samples(texts: Iterable[str], limit: int = SAMPLE_MAX,
 def budgeted_samples(texts: Iterable[str], char_budget: int, *,
                      min_count: int = SAMPLE_MIN,
                      max_count: int = 8000) -> list[str]:
-    """按**字符预算**取样：预算大就多喂（用户要的"每次输入很多消息"）。
+    """按**字符预算**取样：预算大就多喂（需要的"每次输入很多消息"）。
 
     条数 = 预算 ÷ 每条上限（SAMPLE_PER_MESSAGE），再夹在 [min_count, max_count]。
     这样把 `import_learn_chars` 设到模型最大上下文时，一次就能喂几百上千条。

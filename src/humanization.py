@@ -281,7 +281,7 @@ _INNER_VOICE_RE = re.compile(
 
 
 # -- Hermes 移植：失控重复检测（agent/repetition_guard.py 的算法） ----------------
-# 模型陷入退化重复循环时会把整个输出预算都花在复读同一段上（hermes 实录：60k 字符
+# 模型陷入退化重复循环时会把整个输出预算都花在复读同一段上（hermes 已知问题：60k 字符
 # 的一轮变成 31 条 Discord 消息）。这里用同样的判据：长片段（≥400字）里 60+ 字的
 # 重复窗口占多数、且（有行结构时）非空行至多一半是不同的 → 判定失控。
 _RUNAWAY_MIN_FRAGMENT = 400
@@ -370,7 +370,7 @@ _STATUS_NARRATION_RE = re.compile(
     + r")[\s！!。.~～）)】\]－—-]*$")
 
 
-# 指示语：上面那段 / 这张图 / 那条消息……（实录："（已发上面那段）"）
+# 指示语：上面那段 / 这张图 / 那条消息……（已知问题："（已发上面那段）"）
 # 名词可以省：只说"上面那段""这张"也算（动词在场时不会误伤正常话）
 _DEIXIS = (r"(?:上[面头]|下[面头]|前[面头])?(?:那|这)(?:段|张|条|个|些|份)?"
            r"(?:话|段话|图|图片|照片|卡片|文件|表情包|表情|消息|记录|转发|东西|内容|文字)?")
@@ -387,14 +387,6 @@ def _strip_brackets(value: str) -> str:
     return value.strip(_BRACKET_CHARS)
 
 
-# 失败类播报：实录（用户截图）bot 说"表情包没发出去 反正这比赛我是真看不出啥含金量"——
-# 那是工具报错被它转述成了聊天内容。工具失败自己消化，绝不向群友汇报。
-_FAIL_REPORT_RE = re.compile(
-    r"(?:表情包|表情|图片|图|文件|语音|视频|转发|卡片|消息)?"
-    r"(?:没|没有|未能|没能|无法|不能|发送失败|发不出去|失败了|发送不出去)"
-    r"(?:发出去|发出|发送|送达|发出去|贴出去|发出来)?")
-
-
 _STAGE_DIRECTION_VERBS = ("丢", "发", "甩", "扔", "丢出来", "发出来", "递", "贴", "补", "来一句")
 _STAGE_DIRECTION_NOUNS = ("表情包", "表情", "图片", "图", "卡片", "记录", "转发", "照片", "截图")
 
@@ -402,7 +394,7 @@ _STAGE_DIRECTION_NOUNS = ("表情包", "表情", "图片", "图", "卡片", "记
 def is_stage_direction(text: Any) -> bool:
     """整条消息是**舞台提示**：写着"（把刚才那张表情包丢出来）"这类旁白，而不是真的说话。
 
-    实录（用户截图）：bot 发了一句"（把刚才那张呆滞无语的表情包丢出来）"——它把自己的
+    已知问题：bot 发了一句"（把刚才那张呆滞无语的表情包丢出来）"——它把自己的
     动作当成台词写出来了。真发表情就直接发，不需要旁白；配音式的动作说明一律丢掉。
     """
     stripped = " ".join(str(text or "").split())
@@ -419,7 +411,7 @@ def is_stage_direction(text: Any) -> bool:
 def is_tool_name_leak(text: Any, tool_names: "Iterable[str] | None" = None) -> bool:
     """消息里出现了**工具名**——聊天里不该有工具名，那是内部机制外泄。
 
-    实录（用户截图）："（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"——
+    已知问题："（按指令 sticker 已通过 send_sticker 发出 最终回复即上文文字）"——
     它把工具调用过程当台词写出来了（旧守卫只认 `xx_tool(` 这种带括号的形式，漏了裸名）。
     工具名取自插件实际可调用的工具表（权威名单），命中即视为泄漏。
     """
@@ -467,7 +459,7 @@ def is_failure_report(text: Any) -> bool:
 def is_tool_status_narration(text: Any) -> bool:
     """整条消息就是"工具干完活了"的状态播报（表情包已发 / 图片已发送 / 转发完成）。
 
-    实录（用户截图）：bot 先发一条"（表情包已发）"再发那张表情——那是我们工具的
+    已知问题：bot 先发一条"（表情包已发）"再发那张表情——那是我们工具的
     返回值（`已发表情包到群X`）被它改写成了聊天内容。工具结果不是台词，不该出现在群里；
     要报告进度就得说人话（"发你了"），整条只有状态词的，直接丢掉。
     """
@@ -493,7 +485,7 @@ def is_tool_status_narration(text: Any) -> bool:
 def is_tool_markup_leak(text: Any) -> bool:
     """文本里带了"工具/伪 XML 标记"——那是模型把调用语法当消息发出来了。
 
-    实录（用户截图）：私聊里发出去一条 `<sticker sticker_id="9dc8..."/>`，
+    已知问题：私聊里发出去一条 `<sticker sticker_id="9dc8..."/>`，
     用户看到的就是这段源码。真发表情包要走 send_sticker 或计划里的 sticker 段。
     """
     stripped = str(text or "").strip()
@@ -505,7 +497,7 @@ def is_tool_markup_leak(text: Any) -> bool:
 def is_local_path_leak(text: Any) -> bool:
     """文本里掺了服务器本地文件路径，或让用户去调用某个"工具(参数)"。
 
-    实录（截图）：bot 把 `C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\custom_xxx.png`
+    已知问题：bot 把 `C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\custom_xxx.png`
     和自己的臆想调用 `push_image_to_device(image_path=..., page_id=...)` 当回复发给了用户。
     这是把"工具产出的中间结果"当"要对人说的话"——必须拦在发送层。
     """

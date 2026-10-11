@@ -119,8 +119,8 @@ class PluginConfig:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "PluginConfig":
         d = dict(data or {})
-        # WebUI set_conf 会把 None 塞进配置（用户清空输入框）：None 统一转 ""，
-        # 否则 str(None)='None' 把字面 "None" 当配置值（实录：persona_id='None'
+        # WebUI set_conf 会把 None 塞进配置（清空输入框时）：None 统一转 ""，
+        # 否则 str(None)='None' 把字面 "None" 当配置值（已知问题：persona_id='None'
         # → 人格对象的 system_prompt=None → prompt.strip() 崩掉主动参与与回复）。
         for key, value in list(d.items()):
             if value is None:

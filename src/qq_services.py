@@ -75,7 +75,7 @@ class QQService:
                                   sub_type: str = "invite") -> Any:
         """处理群相关申请。**sub_type 必须对**：invite=邀请你进群，add=别人申请进你的群。
 
-        实录：这里曾把 sub_type 写死成 "invite"，于是"别人申请入群"用同一个 flag 去批，
+        已知问题：这里曾把 sub_type 写死成 "invite"，于是"别人申请入群"用同一个 flag 去批，
         OneBot 侧对不上、申请就一直挂着——两类申请的处理方式必须由调用方区分。
         """
         kind = str(sub_type or "invite").strip().lower()
@@ -462,7 +462,7 @@ class QzoneService:
     def _publish_blocker(self, text: str) -> str:
         """该不该拦这条说说？返回空串=可以发，否则一句人话原因。
 
-        实录（用户）："bot 会把一件事反复发几次空间"——同一件事被它当成新灵感反复发；
+        已知问题："bot 会把一件事反复发几次空间"——同一件事被它当成新灵感反复发；
         v1.0.11 又发现"同话题换说法"也躲过了旧守卫（"松饼要热的 唱两句再说" vs
         "松饼还没吃够"，2-gram 重合率才 0.3，但话题是同一个）。真人不会这样发。
         """
