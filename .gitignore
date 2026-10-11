@@ -18,14 +18,9 @@ __pycache__/
 .zcodeignore
 plugin_data/
 
-# 开发期一次性脚本：只保留生成器、打包器与前端工具（sync_forest 被 app.js 注释引用，得跟着走）
-tools/*
-!tools/gen_qq_actions.py
-!tools/package.py
-!tools/forest_smoke.js
-!tools/forest_preview.html
-!tools/sync_forest.py
-!tools/webui_mock.js
+# 开发工具（生成器/打包器/预览页/假数据）——**不进仓库**：
+# 它们只在本机开发时用，运行时不依赖（唯一的引用是 app.js 里的一句注释）。
+tools/
 
 # 临时探测文件
 *.tmp
