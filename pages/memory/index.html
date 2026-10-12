@@ -86,15 +86,30 @@
 
       <section class="panel" id="panel-forest" hidden>
         <div class="toolbar">
-          <input type="search" id="forest-filter" placeholder="过滤节点标题…">
-          <button class="btn primary" id="btn-forest-new">新增记忆</button>
-          <button class="btn ghost" id="btn-forest-refresh">刷新</button>
+          <select id="web-scope" title="只看某个会话"></select>
+          <input type="search" id="web-search" placeholder="高亮节点（人物/话题/事实）…">
+          <button class="btn ghost" id="btn-web-archived" title="显示回溯归档的记忆">显示归档</button>
+          <button class="btn ghost" id="btn-web-refresh">刷新</button>
+          <button class="btn primary" id="btn-web-new">新增记忆</button>
+          <button class="btn" id="btn-web-prune" title="选择若干节点，沿路径丢弃低价值节点并压缩必要节点">剪枝</button>
+          <button class="btn" id="btn-web-branches">分支 · <span id="web-branch-count">0</span></button>
+          <button class="btn ghost" id="btn-web-rebuild" title="按当前记忆清空并重建整张网">重建</button>
           <a class="btn ghost" href="../tree/index.html" target="_blank" rel="noopener">独立页打开</a>
         </div>
-        <p class="muted">每棵树是一个会话：群 → 类目 → 条目 → 证据。点三角展开；
-          账本与印象节点可编辑/删除；时间粒度随层级变化（L1 分钟 / L2 天 / L3 月 / 印象相对时间）。</p>
-        <div id="forest-graph" class="graph"></div>
-        <div id="forest" class="list" hidden></div>
+        <p class="muted">节点＝人物 / 会话 / 话题 / 事实 / 摘要，连线＝关系：同一人物、同一话题把不同会话的记忆连成一张网。
+          悬停看详情；点击选中（可创建分支、让 bot 改账本记忆）；双击聚焦；滚轮缩放、拖拽平移。</p>
+        <div class="web-kinds" id="web-kinds"></div>
+        <div class="web-stage">
+          <div id="forest-graph" class="graph"></div>
+          <aside id="web-detail" class="web-detail" hidden></aside>
+          <aside id="web-branches" class="web-drawer" hidden></aside>
+        </div>
+        <div class="muted small" id="web-stats"></div>
+        <div class="prune-bar" id="web-prune-bar" hidden>
+          <span id="web-prune-info">剪枝：点选若干节点（至少两个）</span>
+          <button class="btn primary" id="btn-web-prune-run" disabled>执行剪枝</button>
+          <button class="btn ghost" id="btn-web-prune-cancel">退出剪枝</button>
+        </div>
       </section>
 
       <section class="panel" id="panel-people" hidden>

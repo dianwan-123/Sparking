@@ -96,6 +96,7 @@ def build_package(tables: Mapping[str, Iterable[Mapping[str, Any]]],
         "notes": [
             "重新导入时需要匹配的嵌入模型：模型不一致时只导入文本，向量会被跳过（会写明）。",
             "不进包的东西：媒体/表情包文件、用量统计、审计流水（它们属于本机运行数据）。",
+            "记忆网（MemoryWeb）由摘要/账本/话题/印象自动织成：导入后自动转换补齐，无需单独搬运。",
         ],
     }
     if extra:

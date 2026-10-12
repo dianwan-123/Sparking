@@ -1,356 +1,453 @@
-// ===== 记忆森林渲染器（与 pages/tree/forest.js 同源，内联以保证插件页可用）=====
-// 渲染器与 pages/tree/forest.js 同源，两份内容需保持一致。
-
-// Sparking 记忆森林 —— 圆形节点 + 连线 的真实可视化（零依赖，纯 SVG）
-// 用法：window.SparkingForest.mount(container, { getTree, onEdit, onDelete, onAddChild })
-//   getTree(nodeId|null) -> Promise<{roots:[...]}|{children:[...]}>
-// 特性：整洁树布局（父子居中对齐）、悬停详情浮层、左键菜单（编辑/删除/加子节点/展开收拢）、
-//       滚轮缩放、拖拽平移、懒加载（点开才拉子节点）、按类型着色、数量徽标。
-(function () {
+// ===== 记忆网渲染器（MemoryWeb，内联版）=====
+// 与 pages/tree/web.js 同源，两份内容需保持一致。
+// 零依赖 Canvas 力导向图：节点 = 人物 / 会话 / 话题 / 事实 / 摘要，连线 = 关系。
+window.SparkingWeb = (() => {
   "use strict";
 
-  const NS = "http://www.w3.org/2000/svg";
-  // 亮色主题下调过的配色：节点色够深，白色文字/白描边才压得住（主色跟 AstrBot 的 #3c96ca 同族）
-  const COLORS = {
-    scope: "#3c96ca",       // 会话（群/私聊）
-    category: "#7c6bd6",    // 类目
-    summary: "#2fa87a",     // 分层摘要
-    catalog: "#e0a01c",     // 记忆账本
-    impression: "#d2699f",  // 人物印象
-    topic: "#2aa8bf",       // 群话题
-    message: "#93a0b4",     // 证据消息
-    default: "#a3adba",
+  const KIND_STYLE = {
+    person:  { color: "#f59e0b", label: "人物" },
+    group:   { color: "#6366f1", label: "会话" },
+    topic:   { color: "#10b981", label: "话题" },
+    fact:    { color: "#64748b", label: "事实" },
+    summary: { color: "#ec4899", label: "摘要" },
   };
-  const ROW_GAP = 46;
-  const COL_GAP = 210;
-  const NODE_R = 17;
+  const REL_LABEL = {
+    includes: "包含", about: "关于", mentions: "提到", has_participant: "参与者",
+    derives_from: "压缩自", co_occurs: "同现", in: "属于", member_of: "成员",
+  };
+  const ARCHIVED_COLOR = "#94a3b8";
 
-  function svgEl(tag, attrs) {
-    const node = document.createElementNS(NS, tag);
-    Object.keys(attrs || {}).forEach((key) => node.setAttribute(key, attrs[key]));
-    return node;
+  function hashUnit(value, salt) {
+    const str = String(value) + ":" + String(salt || 0);
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i += 1) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return ((h >>> 0) % 100000) / 100000;
   }
 
-  function colorOf(node) {
-    return COLORS[node.type] || COLORS.default;
-  }
-
-  function mount(container, api) {
-    const state = {
-      nodes: new Map(),      // id -> node 数据
-      children: new Map(),   // id -> [childId]
-      expanded: new Set(),
-      roots: [],
-      scale: 1,
-      offset: { x: 40, y: 30 },
-      drag: null,
-      selected: null,
-      api,
-    };
-
-    container.classList.add("forest-host");
-    container.innerHTML = "";
-    const svg = svgEl("svg", { class: "forest-svg" });
-    const viewport = svgEl("g", { class: "forest-viewport" });
-    svg.appendChild(viewport);
-    container.appendChild(svg);
-
+  function mount(container, opts) {
+    const options = opts || {};
+    const canvas = document.createElement("canvas");
+    canvas.className = "web-canvas";
+    container.appendChild(canvas);
+    const ctx = canvas.getContext("2d");
     const tip = document.createElement("div");
-    tip.className = "forest-tip";
+    tip.className = "web-tip";
     tip.hidden = true;
     container.appendChild(tip);
 
-    const menu = document.createElement("div");
-    menu.className = "forest-menu";
-    menu.hidden = true;
-    container.appendChild(menu);
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    let W = 800, H = 520;
+    let data = { nodes: [], edges: [] };
+    const positions = new Map();       // id -> {x, y, vx, vy}
+    const selection = new Set();
+    let hover = null;
+    let dragNode = null;
+    let panning = null;
+    let moved = false;
+    let view = { x: 0, y: 0, scale: 1 };
+    let running = 0;
+    let raf = 0;
 
-    // 提示条（空树/加载失败）：单独一个元素，别用 container.innerHTML 覆盖——
-    // 那会把上面已经建好的 svg/tip/menu 一起销毁，之后再刷新就永远画不出图了（实录踩过）。
-    const notice = document.createElement("div");
-    notice.className = "forest-empty";
-    notice.hidden = true;
-    container.appendChild(notice);
-
-    function showNotice(text) {
-      notice.textContent = text;
-      notice.hidden = false;
-      state.roots = [];
-      state.nodes.clear();
-      state.children.clear();
+    function resize() {
+      const rect = container.getBoundingClientRect();
+      W = Math.max(320, Math.round(rect.width));
+      H = Math.max(240, Math.round(rect.height));
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + "px";
+      canvas.style.height = H + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       render();
     }
 
-    function applyTransform() {
-      viewport.setAttribute("transform",
-        `translate(${state.offset.x},${state.offset.y}) scale(${state.scale})`);
+    function radiusOf(node) {
+      const weight = Math.max(1, Number(node.weight) || 1);
+      return Math.min(16, 4.2 + Math.sqrt(weight) * 1.7);
     }
 
-    function register(node, parentId) {
-      state.nodes.set(node.id, node);
-      if (parentId) {
-        const list = state.children.get(parentId) || [];
-        if (!list.includes(node.id)) list.push(node.id);
-        state.children.set(parentId, list);
-      }
+    function seed() {
+      positions.clear();
+      const nodes = data.nodes || [];
+      nodes.forEach((node, index) => {
+        const angle = index * 2.399963;
+        const radius = 40 + Math.sqrt(index + 1) * 26;
+        positions.set(node.id, {
+          x: W / 2 + Math.cos(angle) * radius,
+          y: H / 2 + Math.sin(angle) * radius,
+          vx: 0, vy: 0,
+        });
+      });
     }
 
-    // ---------------------------------------------------------------- 布局
-    function layout() {
-      const positions = new Map();
-      let cursor = 0;
-      const walk = (id, depth) => {
-        const node = state.nodes.get(id);
-        if (!node) return { y: cursor };
-        const kids = (state.children.get(id) || [])
-          .filter((kid) => state.expanded.has(id) || state.expanded.has(kid));
-        let y;
-        if (!state.expanded.has(id) || !kids.length) {
-          y = cursor;
-          cursor += ROW_GAP;
-        } else {
-          const childYs = kids.map((kid) => walk(kid, depth + 1).y);
-          y = (childYs[0] + childYs[childYs.length - 1]) / 2;
+    function step() {
+      const nodes = data.nodes || [];
+      const edges = data.edges || [];
+      const cell = 150;
+      const grid = new Map();
+      const cellKey = (x, y) => Math.round(x / cell) + "|" + Math.round(y / cell);
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const key = cellKey(pos.x, pos.y);
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(node);
+      });
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        let fx = 0, fy = 0;
+        const cx = Math.round(pos.x / cell), cy = Math.round(pos.y / cell);
+        for (let gx = cx - 1; gx <= cx + 1; gx += 1) {
+          for (let gy = cy - 1; gy <= cy + 1; gy += 1) {
+            const bucket = grid.get(gx + "|" + gy);
+            if (!bucket) continue;
+            bucket.forEach((other) => {
+              if (other.id === node.id) return;
+              const target = positions.get(other.id);
+              if (!target) return;
+              let dx = pos.x - target.x, dy = pos.y - target.y;
+              let distance = Math.sqrt(dx * dx + dy * dy) || 1;
+              if (distance > cell * 1.6) return;
+              const force = 1400 / (distance * distance);
+              fx += (dx / distance) * force;
+              fy += (dy / distance) * force;
+            });
+          }
         }
-        positions.set(id, { x: depth * COL_GAP, y });
-        return { y };
-      };
-      state.roots.forEach((id) => walk(id, 0));
-      return positions;
+        fx += (W / 2 - pos.x) * 0.012;
+        fy += (H / 2 - pos.y) * 0.012;
+        pos.vx = (pos.vx + fx) * 0.82;
+        pos.vy = (pos.vy + fy) * 0.82;
+      });
+      edges.forEach((edge) => {
+        const a = positions.get(edge.source);
+        const b = positions.get(edge.target);
+        if (!a || !b) return;
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+        const target = 96;
+        const strength = 0.018 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
+        const force = (distance - target) * strength;
+        const ux = dx / distance, uy = dy / distance;
+        a.vx += ux * force; a.vy += uy * force;
+        b.vx -= ux * force; b.vy -= uy * force;
+      });
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        if (node.id === (dragNode && dragNode.id)) return;
+        pos.x += Math.max(-12, Math.min(12, pos.vx));
+        pos.y += Math.max(-12, Math.min(12, pos.vy));
+        pos.x = Math.max(24, Math.min(W - 24, pos.x));
+        pos.y = Math.max(24, Math.min(H - 24, pos.y));
+      });
+    }
+
+    function toScreen(point) {
+      return { x: point.x * view.scale + view.x, y: point.y * view.scale + view.y };
+    }
+    function toWorld(x, y) {
+      return { x: (x - view.x) / view.scale, y: (y - view.y) / view.scale };
     }
 
     function render() {
-      const positions = layout();
-      viewport.innerHTML = "";
-      const edges = svgEl("g", { class: "forest-edges" });
-      const nodesLayer = svgEl("g", { class: "forest-nodes" });
-      viewport.appendChild(edges);
-      viewport.appendChild(nodesLayer);
-
-      state.nodes.forEach((node) => {
-        const parent = node.__parent;
-        if (!parent) return;
-        const from = positions.get(parent);
-        const to = positions.get(node.id);
-        if (!from || !to) return;
-        const mid = (from.x + to.x) / 2;
-        edges.appendChild(svgEl("path", {
-          d: `M ${from.x + NODE_R} ${from.y} C ${mid} ${from.y}, ${mid} ${to.y}, ${to.x - NODE_R} ${to.y}`,
-          fill: "none",
-          stroke: "#cfd8e3",
-          "stroke-width": 1.5,
-        }));
+      ctx.clearRect(0, 0, W, H);
+      const nodes = data.nodes || [];
+      const edges = data.edges || [];
+      const byId = new Map(nodes.map((node) => [node.id, node]));
+      ctx.save();
+      ctx.translate(view.x, view.y);
+      ctx.scale(view.scale, view.scale);
+      edges.forEach((edge) => {
+        const a = positions.get(edge.source);
+        const b = positions.get(edge.target);
+        if (!a || !b) return;
+        const weight = Math.max(1, Number(edge.weight) || 1);
+        ctx.strokeStyle = edge.archived ? "rgba(148,163,184,0.35)" : "rgba(100,116,139,0.34)";
+        ctx.lineWidth = Math.min(3.2, 0.8 + Math.log2(weight + 1) * 0.9) / view.scale;
+        if (edge.archived) ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
       });
-
-      state.nodes.forEach((node) => {
+      nodes.forEach((node) => {
         const pos = positions.get(node.id);
         if (!pos) return;
-        const group = svgEl("g", { class: "forest-node", tabindex: "0" });
-        group.setAttribute("transform", `translate(${pos.x},${pos.y})`);
-        group.dataset.nodeId = node.id;
-
-        const circle = svgEl("circle", {
-          r: NODE_R + (node.type === "scope" ? 4 : 0),
-          fill: colorOf(node),
-          stroke: state.selected === node.id ? "#1565c0" : "#ffffff",
-          "stroke-width": state.selected === node.id ? 2.5 : 1.5,
-        });
-        group.appendChild(circle);
-
-        const label = svgEl("text", {
-          x: NODE_R + 10, y: 5,
-          fill: "#1b1c1d", "font-size": "12.5px",
-        });
-        label.textContent = String(node.label || node.id).slice(0, 26);
-        group.appendChild(label);
-
-        if (node.count) {
-          const badge = svgEl("text", {
-            x: 0, y: 4, "text-anchor": "middle",
-            fill: "#ffffff", "font-size": "10px", "font-weight": "700",
-          });
-          badge.textContent = state.expanded.has(node.id) ? String(node.count)
-            : `${node.count}+`;
-          group.appendChild(badge);
+        const style = KIND_STYLE[node.kind] || KIND_STYLE.fact;
+        const archived = node.status === "archived";
+        const radius = radiusOf(node);
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = archived ? ARCHIVED_COLOR : style.color;
+        ctx.globalAlpha = archived ? 0.45 : 1;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        if (archived) {
+          ctx.setLineDash([4, 4]);
+          ctx.strokeStyle = "#64748b";
+          ctx.lineWidth = 1.4 / view.scale;
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
-        nodesLayer.appendChild(group);
-
-        group.addEventListener("mouseenter", (event) => showTip(node, event));
-        group.addEventListener("mousemove", (event) => moveTip(event));
-        group.addEventListener("mouseleave", () => { tip.hidden = true; });
-        group.addEventListener("click", (event) => {
-          event.stopPropagation();
-          state.selected = node.id;
-          openMenu(node, event);
-          render();
-        });
-        group.addEventListener("dblclick", (event) => {
-          event.stopPropagation();
-          menu.hidden = true;
-          toggleExpand(node.id);
-        });
+        if (selection.has(node.id)) {
+          ctx.beginPath();
+          ctx.arc(pos.x, pos.y, radius + 4, 0, Math.PI * 2);
+          ctx.strokeStyle = "#2563eb";
+          ctx.lineWidth = 2.4 / view.scale;
+          ctx.stroke();
+        } else if (hover && hover.id === node.id) {
+          ctx.beginPath();
+          ctx.arc(pos.x, pos.y, radius + 3, 0, Math.PI * 2);
+          ctx.strokeStyle = "#0f172a";
+          ctx.lineWidth = 1.6 / view.scale;
+          ctx.stroke();
+        }
       });
-      applyTransform();
+      const showLabels = view.scale > 1.1;
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const important = (Number(node.weight) || 1) >= 3 || selection.has(node.id)
+          || (hover && hover.id === node.id);
+        if (!important && !showLabels) return;
+        const label = String(node.label || "").slice(0, 14);
+        ctx.font = "11px 'Segoe UI', 'Microsoft YaHei', sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        const y = pos.y + radiusOf(node) + 3;
+        ctx.strokeStyle = "rgba(255,255,255,0.85)";
+        ctx.lineWidth = 3 / view.scale;
+        ctx.strokeText(label, pos.x, y);
+        ctx.fillStyle = "#0f172a";
+        ctx.fillText(label, pos.x, y);
+      });
+      ctx.restore();
     }
 
-    // ---------------------------------------------------------------- 提示
-    function showTip(node, event) {
-      const lines = [];
-      lines.push(`<b>${escapeHtml(node.label || node.id)}</b>`);
-      if (node.type) lines.push(`类型：${escapeHtml(kindText(node))}`);
-      if (node.time) {
-        lines.push(`时间：${escapeHtml(node.time)}`
-          + (node.time_granularity ? `（${escapeHtml(node.time_granularity)}）` : ""));
-      }
-      if (node.count) lines.push(`子节点：${node.count}`);
-      if (node.status) lines.push(`状态：${escapeHtml(node.status)}`);
-      if (node.hint) lines.push(`<span class="tip-body">${escapeHtml(String(node.hint).slice(0, 240))}</span>`);
-      lines.push('<span class="tip-hint">左键：菜单 · 双击：展开/收起</span>');
-      tip.innerHTML = lines.join("<br>");
-      tip.hidden = false;
-      moveTip(event);
-    }
-
-    function moveTip(event) {
-      const box = container.getBoundingClientRect();
-      const x = event.clientX - box.left + 16;
-      const y = event.clientY - box.top + 12;
-      tip.style.left = Math.min(x, box.width - 300) + "px";
-      tip.style.top = Math.min(y, box.height - 120) + "px";
-    }
-
-    function kindText(node) {
-      const map = {
-        scope: "会话", category: "类目", summary: "分层摘要", catalog: "记忆账本",
-        impression: "人物印象", topic: "群话题", message: "证据消息",
+    function schedule(steps) {
+      running = Math.max(running, steps);
+      if (raf) return;
+      const loop = () => {
+        raf = 0;
+        const batch = Math.min(14, running);
+        for (let i = 0; i < batch; i += 1) step();
+        running -= batch;
+        render();
+        if (running > 0) raf = requestAnimationFrame(loop);
       };
-      return map[node.type] || node.type || "-";
+      raf = requestAnimationFrame(loop);
     }
 
-    // ---------------------------------------------------------------- 菜单
-    function openMenu(node, event) {
-      const box = container.getBoundingClientRect();
-      menu.innerHTML = "";
-      const items = [];
-      if (node.count) {
-        items.push([state.expanded.has(node.id) ? "收起子节点" : "展开子节点",
-                    () => toggleExpand(node.id)]);
-      }
-      if (state.api.onAddChild) {
-        items.push(["＋ 加子节点", () => state.api.onAddChild(node)]);
-      }
-      if (node.editable && state.api.onEdit) {
-        items.push(["✎ 编辑", () => state.api.onEdit(node)]);
-      }
-      if (node.editable && state.api.onDelete) {
-        items.push(["🗑 删除", () => state.api.onDelete(node)]);
-      }
-      if (!items.length) items.push(["（这一层没有可执行的操作）", null]);
-      items.forEach(([label, handler]) => {
-        const button = document.createElement("button");
-        button.className = "forest-menu-item";
-        button.textContent = label;
-        if (handler) {
-          button.addEventListener("click", (clickEvent) => {
-            clickEvent.stopPropagation();
-            menu.hidden = true;
-            handler();
-          });
-        } else {
-          button.disabled = true;
+    function hit(x, y) {
+      const world = toWorld(x, y);
+      let best = null, bestDistance = 0;
+      (data.nodes || []).forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const dx = world.x - pos.x, dy = world.y - pos.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        const limit = radiusOf(node) + 5;
+        if (distance <= limit && (best === null || distance < bestDistance)) {
+          best = node;
+          bestDistance = distance;
         }
-        menu.appendChild(button);
       });
-      menu.hidden = false;
-      menu.style.left = Math.min(event.clientX - box.left, box.width - 180) + "px";
-      menu.style.top = Math.min(event.clientY - box.top, box.height - 160) + "px";
+      return best;
     }
 
-    // ---------------------------------------------------------------- 交互
-    async function toggleExpand(id) {
-      const node = state.nodes.get(id);
-      if (!node) return;
-      if (state.expanded.has(id)) {
-        state.expanded.delete(id);
+    function pointer(event) {
+      const rect = canvas.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
+
+    function emitSelect(node) {
+      if (typeof options.onSelect === "function") options.onSelect(node);
+    }
+    function emitMulti() {
+      if (typeof options.onMultiSelect === "function") {
+        const nodes = (data.nodes || []).filter((node) => selection.has(node.id));
+        options.onMultiSelect(nodes);
+      }
+    }
+
+    function onPointerDown(event) {
+      const point = pointer(event);
+      const node = hit(point.x, point.y);
+      moved = false;
+      if (node) {
+        const world = toWorld(point.x, point.y);
+        const pos = positions.get(node.id);
+        dragNode = { id: node.id, dx: pos.x - world.x, dy: pos.y - world.y };
+      } else {
+        panning = { x: point.x, y: point.y, vx: view.x, vy: view.y };
+      }
+      canvas.setPointerCapture(event.pointerId);
+    }
+
+    function onPointerMove(event) {
+      const point = pointer(event);
+      if (dragNode) {
+        const world = toWorld(point.x, point.y);
+        const pos = positions.get(dragNode.id);
+        pos.x = world.x + dragNode.dx;
+        pos.y = world.y + dragNode.dy;
+        moved = true;
+        schedule(6);
         render();
         return;
       }
-      if (!state.children.has(id)) {
-        try {
-          const data = await state.api.getTree(id);
-          const kids = (data && data.children) || [];
-          kids.forEach((child) => {
-            child.__parent = id;
-            register(child, id);
-          });
-          node.count = kids.length || node.count;
-        } catch (error) {
-          node.hint = `加载失败：${String(error.message || error)}`;
+      if (panning) {
+        view.x = panning.vx + (point.x - panning.x);
+        view.y = panning.vy + (point.y - panning.y);
+        moved = true;
+        render();
+        return;
+      }
+      const node = hit(point.x, point.y);
+      const changed = (node && node.id) !== (hover && hover.id);
+      hover = node;
+      if (changed) {
+        render();
+        if (node) {
+          const style = KIND_STYLE[node.kind] || KIND_STYLE.fact;
+          tip.textContent = "[" + style.label + "] " + node.label
+            + "（权重 " + (Number(node.weight) || 1) + "）";
+          tip.style.left = Math.min(W - 220, point.x + 12) + "px";
+          tip.style.top = Math.max(6, point.y - 30) + "px";
+          tip.hidden = false;
+        } else {
+          tip.hidden = true;
         }
+        if (typeof options.onHover === "function") options.onHover(node);
       }
-      state.expanded.add(id);
-      render();
     }
 
-    svg.addEventListener("click", () => { menu.hidden = true; });
-    svg.addEventListener("wheel", (event) => {
+    function onPointerUp(event) {
+      const point = pointer(event);
+      if (dragNode && !moved) {
+        const node = hit(point.x, point.y);
+        if (node) {
+          if (options.multi) {
+            if (selection.has(node.id)) selection.delete(node.id);
+            else selection.add(node.id);
+            emitMulti();
+          } else if (event.ctrlKey || event.metaKey || event.shiftKey) {
+            if (selection.has(node.id)) selection.delete(node.id);
+            else selection.add(node.id);
+            emitMulti();
+          } else {
+            selection.clear();
+            selection.add(node.id);
+            emitSelect(node);
+          }
+          render();
+        }
+      } else if (!dragNode && !moved) {
+        selection.clear();
+        render();
+        emitSelect(null);
+      }
+      dragNode = null;
+      panning = null;
+    }
+
+    function onWheel(event) {
       event.preventDefault();
+      const point = pointer(event);
+      const world = toWorld(point.x, point.y);
       const factor = event.deltaY < 0 ? 1.12 : 0.89;
-      state.scale = Math.max(0.35, Math.min(2.4, state.scale * factor));
-      applyTransform();
-    }, { passive: false });
-    svg.addEventListener("mousedown", (event) => {
-      if (event.target.closest(".forest-node")) return;
-      state.drag = { x: event.clientX, y: event.clientY,
-                     ox: state.offset.x, oy: state.offset.y };
-      menu.hidden = true;
-    });
-    window.addEventListener("mousemove", (event) => {
-      if (!state.drag) return;
-      state.offset.x = state.drag.ox + (event.clientX - state.drag.x);
-      state.offset.y = state.drag.oy + (event.clientY - state.drag.y);
-      applyTransform();
-    });
-    window.addEventListener("mouseup", () => { state.drag = null; });
-
-    async function reload(filter) {
-      state.nodes.clear();
-      state.children.clear();
-      state.expanded.clear();
-      state.selected = null;
-      let data;
-      try {
-        data = await state.api.getTree(null);
-      } catch (error) {
-        showNotice(`加载失败：${String(error.message || error)}`);
-        return;
-      }
-      notice.hidden = true;
-      const keyword = String(filter || "").trim();
-      state.roots = ((data && data.roots) || [])
-        .filter((node) => !keyword || String(node.label || "").includes(keyword))
-        .map((node) => {
-          register(node, null);
-          return node.id;
-        });
-      if (!state.roots.length) {
-        showNotice("还没有记忆——先去群里聊几句，或点「新增记忆」");
-        return;
-      }
+      view.scale = Math.max(0.35, Math.min(3.2, view.scale * factor));
+      view.x = point.x - world.x * view.scale;
+      view.y = point.y - world.y * view.scale;
       render();
     }
 
-    function escapeHtml(value) {
-      return String(value == null ? "" : value)
-        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+    function onDblClick(event) {
+      const point = pointer(event);
+      const node = hit(point.x, point.y);
+      if (node) focus(node.id, 1.5);
     }
 
-    reload();
-    return { reload, render, expand: toggleExpand };
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointerleave", () => { hover = null; tip.hidden = true; render(); });
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("dblclick", onDblClick);
+    window.addEventListener("resize", resize);
+    let observer = null;
+    if (typeof ResizeObserver === "function") {
+      observer = new ResizeObserver(() => resize());
+      observer.observe(container);
+    }
+
+    resize();
+    requestAnimationFrame(resize);
+
+    return {
+      setData(next) {
+        const nextNodes = (next && next.nodes) || [];
+        const nextEdges = (next && next.edges) || [];
+        // 保留已有节点的位置：切换类别过滤 / 刷新时不重排（只给新节点排位置）
+        const previous = new Map(positions);
+        positions.clear();
+        nextNodes.forEach((node, index) => {
+          const old = previous.get(node.id);
+          if (old) {
+            positions.set(node.id, old);
+          } else {
+            const angle = index * 2.399963;
+            const radius = 40 + Math.sqrt(index + 1) * 26;
+            positions.set(node.id, {
+              x: W / 2 + Math.cos(angle) * radius,
+              y: H / 2 + Math.sin(angle) * radius,
+              vx: 0, vy: 0,
+            });
+          }
+        });
+        data = { nodes: nextNodes, edges: nextEdges };
+        const alive = new Set(nextNodes.map((node) => node.id));
+        Array.from(selection).forEach((id) => { if (!alive.has(id)) selection.delete(id); });
+        schedule(90);
+      },
+      setSelection(ids) {
+        selection.clear();
+        (ids || []).forEach((id) => selection.add(String(id)));
+        render();
+      },
+      getSelection() {
+        return Array.from(selection);
+      },
+      focus(id, scale) {
+        const pos = positions.get(String(id));
+        if (!pos) return;
+        view.scale = Math.max(0.6, Math.min(3, scale || 1.4));
+        view.x = W / 2 - pos.x * view.scale;
+        view.y = H / 2 - pos.y * view.scale;
+        render();
+      },
+      setMulti(enabled) {
+        options.multi = Boolean(enabled);
+        if (!enabled) {
+          selection.clear();
+          render();
+        }
+      },
+      destroy() {
+        if (raf) cancelAnimationFrame(raf);
+        if (observer) observer.disconnect();
+        window.removeEventListener("resize", resize);
+        container.textContent = "";
+      },
+    };
   }
 
-  window.SparkingForest = { mount };
+  return { mount, KIND_STYLE, REL_LABEL };
 })();
 
 // Sparking 控制台前端（完全重写）
@@ -369,7 +466,7 @@
   const PANELS = [
     { id: "overview", icon: "overview", title: "概览", desc: "运行状态、给 bot 下令、模型用量" },
     { id: "memory", icon: "memory", title: "记忆", desc: "消息、分层摘要与记忆账本" },
-    { id: "forest", icon: "forest", title: "记忆森林", desc: "圆形节点＝一条记忆，连线＝关系；点节点可编辑" },
+    { id: "forest", icon: "forest", title: "记忆网 MemoryWeb", desc: "人物/会话/话题/事实/摘要连成一张网；支持分支、回溯与剪枝" },
     { id: "people", icon: "people", title: "人物", desc: "人物印象（跨群互通）、好感度与说话风格" },
     { id: "groups", icon: "groups", title: "群与会话", desc: "会话列表、白名单与群话题" },
     { id: "schedule", icon: "schedule", title: "日程与任务", desc: "任务队列、待办与事件条件指令" },
@@ -692,7 +789,7 @@
     switch (state.panel) {
       case "overview": return loadOverview();
       case "memory": return loadMemory();
-      case "forest": return loadForest();
+      case "forest": return loadWeb();
       case "people": return loadPeople();
       case "groups": return loadGroups();
       case "schedule": return loadSchedule();
@@ -870,165 +967,348 @@
     renderMessages();
   }
 
-  // ---------------------------------------------------------------- 记忆森林
-  function forestNode(node, depth) {
-    const wrap = el("div", "node");
-    const row = el("div", "item");
-    const toggle = el("button", "btn ghost", node.count ? "▸" : "·");
-    toggle.style.minWidth = "28px";
-    row.appendChild(toggle);
-    const main = el("div", "main");
-    const title = el("div", "title");
-    title.appendChild(el("span", "", node.label || node.id));
-    if (node.count) title.appendChild(el("span", "tag", `${node.count} 项`));
-    if (node.time) {
-      const tag = el("span", "tag", node.time);
-      tag.title = node.time_granularity || "";
-      title.appendChild(tag);
-    }
-    if (node.kind) title.appendChild(el("span", "tag", node.kind));
-    main.appendChild(title);
-    if (node.hint) main.appendChild(el("div", "body", node.hint));
-    row.appendChild(main);
-    const actions = el("div", "actions");
-    if (node.editable) {
-      actions.appendChild(actionBtn("编辑", () => forestEdit(node)));
-      actions.appendChild(actionBtn("让 bot 改", () => forestAskBot(node)));
-      actions.appendChild(actionBtn("删除", async () => {
-        if (!(await askConfirm({ title: "删除这个记忆节点", danger: true, okText: "删除",
-                                 message: `${node.label}\n${(node.hint || "").slice(0, 80)}` }))) return;
-        try {
-          await post("memory_node_delete", scopeParams({ node_id: node.id }));
-          toast("已删除", "ok");
-          loadForest();
-        } catch (error) { toast(String(error.message || error), "error"); }
-      }, "danger"));
-    }
-    if (node.type === "scope" || node.type === "category") {
-      actions.appendChild(actionBtn("新增", () => forestEdit(null, node)));
-    }
-    if (actions.childNodes.length) row.appendChild(actions);
-    wrap.appendChild(row);
-    const kids = el("div", "list");
-    kids.hidden = true;
-    kids.style.marginLeft = "18px";
-    wrap.appendChild(kids);
-    if (node.count) {
-      toggle.addEventListener("click", async () => {
-        const open = !kids.hidden;
-        kids.hidden = open;
-        toggle.textContent = open ? "▸" : "▾";
-        if (!open || kids.dataset.loaded === "1") return;
-        try {
-          const data = await get("memory_tree", { node: node.id });
-          kids.textContent = "";
-          const list = (data && data.children) || [];
-          if (!list.length) kids.appendChild(el("div", "muted", "（这一层是空的）"));
-          list.forEach((child) => kids.appendChild(forestNode(child, depth + 1)));
-          kids.dataset.loaded = "1";
-        } catch (error) { toast(String(error.message || error), "error"); }
+  // ---------------------------------------------------------------- 记忆网（MemoryWeb）
+  const webState = {
+    graph: null, snapshot: null, pruneMode: false, pruneSelection: [],
+    showArchived: false, hiddenKinds: new Set(),
+  };
+  const WEB_KIND_LABEL = { person: "人物", group: "会话", topic: "话题", fact: "事实", summary: "摘要" };
+  const WEB_KIND_COLOR = { person: "#f59e0b", group: "#6366f1", topic: "#10b981", fact: "#64748b", summary: "#ec4899" };
+  const WEB_REL_LABEL = (window.SparkingWeb && window.SparkingWeb.REL_LABEL) || {};
+
+  function webRenderKinds() {
+    const box = $("web-kinds");
+    box.textContent = "";
+    Object.keys(WEB_KIND_LABEL).forEach((kind) => {
+      const chip = el("button", "chip" + (webState.hiddenKinds.has(kind) ? " off" : ""));
+      const dot = el("span", "dot");
+      dot.style.background = WEB_KIND_COLOR[kind];
+      chip.appendChild(dot);
+      chip.appendChild(el("span", "", WEB_KIND_LABEL[kind]));
+      chip.addEventListener("click", () => {
+        if (webState.hiddenKinds.has(kind)) webState.hiddenKinds.delete(kind);
+        else webState.hiddenKinds.add(kind);
+        webRenderKinds();
+        webApplyKindFilter();
       });
-    }
-    return wrap;
+      box.appendChild(chip);
+    });
   }
 
-  let forestGraph = null;
+  function webApplyKindFilter() {
+    if (!webState.snapshot || !webState.graph) return;
+    const hidden = webState.hiddenKinds;
+    const nodes = webState.snapshot.nodes.filter((node) => !hidden.has(node.kind));
+    const alive = new Set(nodes.map((node) => node.id));
+    const edges = webState.snapshot.edges.filter(
+      (edge) => alive.has(edge.source) && alive.has(edge.target));
+    webState.graph.setData({ nodes, edges });
+  }
 
-  async function loadForest() {
-    // 优先用圆形节点图（pages/tree/forest.js）；渲染器不可用时回退成列表
-    if (window.SparkingForest && $("forest-graph")) {
-      $("forest-graph").hidden = false;
-      $("forest").hidden = true;   // [hidden] 已在 CSS 里强制 display:none
-      if (!forestGraph) {
-        forestGraph = window.SparkingForest.mount($("forest-graph"), {
-          getTree: (nodeId) => nodeId ? get("memory_tree", { node: nodeId })
-                                      : get("memory_tree", {}),
-          onAddChild: (parent) => forestEdit(null, parent),
-          onEdit: (node) => forestEdit(node),
-          onDelete: async (node) => {
-            if (!(await askConfirm({
-              title: "删除这个记忆节点", danger: true, okText: "删除",
-              message: `${node.label}
-${(node.hint || "").slice(0, 80)}` }))) return;
-            try {
-              await post("memory_node_delete", scopeParams({ node_id: node.id }));
-              toast("已删除", "ok");
-              forestGraph.reload($("forest-filter").value);
-            } catch (error) { toast(String(error.message || error), "error"); }
-          },
-        });
-      } else {
-        forestGraph.reload($("forest-filter").value);
-      }
+  function webRenderStats() {
+    const stats = (webState.snapshot && webState.snapshot.stats) || {};
+    const pending = Object.values(stats.pending || {}).reduce((a, b) => a + (b || 0), 0);
+    const bits = ["节点 " + (stats.nodes || 0), "连线 " + (stats.edges || 0),
+                  "来源 " + (stats.sources || 0)];
+    if (pending) bits.push("待入网 " + pending);
+    if (stats.pruned) bits.push("已剪枝 " + stats.pruned);
+    if (stats.last_sync_at) bits.push("上次同步 " + String(stats.last_sync_at).replace("T", " ").slice(0, 16));
+    $("web-stats").textContent = bits.join(" · ");
+  }
+
+  function webRenderBranches() {
+    const list = (webState.snapshot && webState.snapshot.branches) || [];
+    $("web-branch-count").textContent = String(list.length);
+    const drawer = $("web-branches");
+    drawer.textContent = "";
+    const head = el("div", "web-drawer-head");
+    head.appendChild(el("strong", "", "记忆分支"));
+    const close = el("button", "btn ghost", "关闭");
+    close.addEventListener("click", () => { drawer.hidden = true; });
+    head.appendChild(close);
+    drawer.appendChild(head);
+    if (!list.length) {
+      drawer.appendChild(el("div", "muted small",
+        "还没有分支：选中一个节点，点「创建分支」；以后可以「回溯」到这里。"));
       return;
     }
-    // 渲染器不可用：藏掉图形区，只用列表（不留一个空框）
-    if ($("forest-graph")) $("forest-graph").hidden = true;
-    $("forest").hidden = false;
-    const box = $("forest");
+    list.forEach((branch) => {
+      const card = el("div", "branch-card" + (branch.status === "reverted" ? " reverted" : ""));
+      card.appendChild(el("div", "branch-title", branch.label || branch.node_key));
+      const bits = ["切口 " + String(branch.cut_at || "").replace("T", " ").slice(0, 16),
+                    branch.status === "reverted"
+                      ? "已回溯 " + String(branch.reverted_at || "").replace("T", " ").slice(0, 16)
+                      : "未回溯"];
+      if (branch.note) bits.push("备注：" + branch.note);
+      card.appendChild(el("div", "muted small", bits.join("　")));
+      if (branch.status !== "reverted") {
+        const revert = el("button", "btn danger", "回溯到此分支");
+        revert.addEventListener("click", async () => {
+          const okay = await askConfirm({
+            title: "回溯到「" + (branch.label || "该分支") + "」",
+            message: "会把该节点之后的记忆压缩成一份「回溯存档」（勾选「显示归档」可查看），"
+              + "删除这些记忆的原始记录，并封住对应的消息区间（不会再被重新压成新记忆）。"
+              + "记忆基本回到该节点时刻。此操作不可撤销。",
+            okText: "确认回溯", danger: true,
+          });
+          if (!okay) return;
+          toast("回溯中……");
+          try {
+            const out = await post("web_branch_revert", { branch_id: branch.branch_id });
+            toast("已回溯：归档 " + (out.archived || []).length + " 份，删除摘要 "
+              + (out.summaries || 0) + " 条、账本 " + (out.ledger || 0) + " 条，封口 "
+              + (out.sealed || []).length + " 个会话", "ok");
+            await loadWeb();
+            $("web-branches").hidden = false;
+          } catch (error) { toast(String(error.message || error), "error"); }
+        });
+        card.appendChild(revert);
+      } else if (branch.archive_ref) {
+        card.appendChild(el("div", "muted small",
+          "回溯存档：" + String(branch.archive_ref).split(",").length + " 份"));
+      }
+      drawer.appendChild(card);
+    });
+  }
+
+  function webRenderDetail(detail) {
+    const box = $("web-detail");
     box.textContent = "";
-    box.appendChild(el("div", "muted", "加载中…"));
-    try {
-      const data = await get("memory_tree", {});
-      box.textContent = "";
-      const keyword = ($("forest-filter").value || "").trim();
-      const roots = (data.roots || []).filter(
-        (node) => !keyword || String(node.label || "").includes(keyword));
-      if (!roots.length) box.appendChild(el("div", "empty", "还没有记忆——去群里聊几句，或点「新增记忆」"));
-      roots.forEach((node) => box.appendChild(forestNode(node, 0)));
-    } catch (error) {
-      box.textContent = "";
-      box.appendChild(el("div", "empty", String(error.message || error)));
+    if (!detail) { box.hidden = true; return; }
+    box.hidden = false;
+    const node = detail.node;
+    const head = el("div", "web-detail-head");
+    const dot = el("span", "dot");
+    dot.style.background = WEB_KIND_COLOR[node.kind] || "#64748b";
+    head.appendChild(dot);
+    head.appendChild(el("strong", "", node.label || node.key));
+    const close = el("button", "btn ghost", "×");
+    close.addEventListener("click", () => { box.hidden = true; });
+    head.appendChild(close);
+    box.appendChild(head);
+    const bits = [WEB_KIND_LABEL[node.kind] || node.kind, "权重 " + node.weight];
+    if (node.meta && node.meta.at) bits.push("时间 " + String(node.meta.at).replace("T", " ").slice(0, 16));
+    if (node.meta && node.meta.level) bits.push("层级 L" + node.meta.level);
+    if (node.status === "archived") bits.push("（归档）");
+    box.appendChild(el("div", "muted small", bits.join("　")));
+
+    const actions = el("div", "row");
+    const branchBtn = el("button", "btn primary", "在此创建分支");
+    branchBtn.addEventListener("click", async () => {
+      const out = await askPrompt({
+        title: "在「" + String(node.label || "").slice(0, 20) + "」创建分支",
+        fields: [{ key: "note", label: "备注（可选）", value: "" }],
+        okText: "创建",
+      });
+      if (!out) return;
+      try {
+        const result = await post("web_branch_create", { node_id: node.id, note: out.note });
+        toast("分支已创建（切口 " + String(result.branch.cut_at || "").slice(0, 16) + "）", "ok");
+        await loadWeb();
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
+    actions.appendChild(branchBtn);
+    const ledgerSource = (detail.sources || []).find(
+      (source) => String(source.ref || "").startsWith("ledger:"));
+    if (ledgerSource) {
+      const askBot = el("button", "btn ghost", "让 bot 改");
+      askBot.addEventListener("click", async () => {
+        const want = await askPrompt({
+          title: "让 bot 改这条记忆",
+          fields: [{ key: "note", label: "你想让它怎么改", value: "", multiline: true,
+                     placeholder: "例：这条记错了，其实我早就不学 Rust 了" }],
+          okText: "交给它改",
+        });
+        if (!want || !String(want.note || "").trim()) return;
+        try {
+          toast("已交给它，稍等…", "ok");
+          const entryId = String(ledgerSource.ref).slice("ledger:".length);
+          const out = await post("memory_edit_by_bot", {
+            node_id: "item:catalog:" + entryId,
+            label: node.label, hint: node.label,
+            instruction: String(want.note).trim(), scope: node.scope_id,
+          });
+          toast(out && out.changed ? "它已经改好了" : "它看过后没改（理由见提示）", "ok");
+          if (out && out.reply) {
+            await askConfirm({ title: "它说", message: String(out.reply).slice(0, 600),
+                               okText: "知道了", cancelText: "" });
+          }
+          await loadWeb();
+        } catch (error) { toast(String(error.message || error), "error"); }
+      });
+      actions.appendChild(askBot);
+    }
+    if (webState.pruneMode) {
+      const add = el("button", "btn", "加入剪枝选择");
+      add.addEventListener("click", () => {
+        if (!webState.pruneSelection.includes(node.id)) webState.pruneSelection.push(node.id);
+        webState.graph.setSelection(webState.pruneSelection);
+        webUpdatePruneBar();
+      });
+      actions.appendChild(add);
+    }
+    box.appendChild(actions);
+
+    if (detail.edges && detail.edges.length) {
+      box.appendChild(el("div", "web-detail-title", "关系（" + detail.edges.length + "）"));
+      const list = el("div", "web-detail-list");
+      detail.edges.slice(0, 30).forEach((edge) => {
+        const row = el("div", "web-detail-edge");
+        const rel = WEB_REL_LABEL[edge.relation] || edge.relation;
+        row.textContent = (edge.direction === "out" ? rel + " → " : "← " + rel + " ")
+          + edge.other_label + (edge.weight > 1 ? "（×" + edge.weight + "）" : "");
+        row.style.cursor = "pointer";
+        row.addEventListener("click", () => {
+          if (edge.other_id) {
+            webState.graph.focus(edge.other_id);
+            webLoadDetail(edge.other_id);
+          }
+        });
+        list.appendChild(row);
+      });
+      box.appendChild(list);
+    }
+    if (detail.sources && detail.sources.length) {
+      box.appendChild(el("div", "web-detail-title", "来源（" + detail.sources.length + "）"));
+      const list = el("div", "web-detail-list");
+      detail.sources.slice(0, 14).forEach((source) => {
+        list.appendChild(el("div", "web-detail-edge", source.title || source.ref));
+      });
+      box.appendChild(list);
     }
   }
 
-  // 让 bot 自己改这条记忆：把节点现状 + 你的要求发给它，它调 memory_edit 动手
-  async function forestAskBot(node) {
-    const want = await askPrompt({
-      title: "让 bot 改这条记忆",
-      fields: [
-        { key: "note", label: "你想让它怎么改",
-          value: "", multiline: true,
-          placeholder: "例：这条记错了，其实我早就不学 Rust 了，现在在写 Go" },
-      ],
-      okText: "交给它改",
-    });
-    if (!want || !String(want.note || "").trim()) return;
+  async function webLoadDetail(nodeId) {
     try {
-      toast("已交给它，稍等…", "ok");
-      const out = await post("memory_edit_by_bot", scopeParams({
-        node_id: node.id, label: node.label || "", hint: node.hint || "",
-        instruction: String(want.note).trim(),
-      }));
-      toast(out && out.changed ? "它已经改好了" : "它看过后没改（理由见提示）", "ok");
-      if (out && out.reply) {
-        await askConfirm({ title: "它说", message: String(out.reply).slice(0, 600),
-                           okText: "知道了", cancelText: "" });
-      }
-      loadForest();
+      const detail = await get("memory_web_node", { node_id: nodeId });
+      webRenderDetail(detail);
+    } catch (error) {
+      toast(String(error.message || error), "error");
+    }
+  }
+
+  function webUpdatePruneBar() {
+    const bar = $("web-prune-bar");
+    bar.hidden = !webState.pruneMode;
+    if (!webState.pruneMode) return;
+    const count = webState.pruneSelection.length;
+    $("web-prune-info").textContent = "剪枝：已选 " + count + " 个节点"
+      + "（沿路径丢弃低价值节点、把必要摘要向上压缩；压缩程度跟随「上下文详细程度」）";
+    $("btn-web-prune-run").disabled = count < 2;
+  }
+
+  async function loadWeb() {
+    const box = $("forest-graph");
+    if (!window.SparkingWeb || !box) {
+      toast("记忆网渲染器未加载", "error");
+      return;
+    }
+    const params = { include_archived: webState.showArchived ? 1 : 0 };
+    const scope = $("web-scope").value;
+    if (scope) params.scope = scope;
+    const snapshot = await get("memory_web", params);
+    webState.snapshot = snapshot;
+    const select = $("web-scope");
+    const current = select.value;
+    select.textContent = "";
+    const all = el("option", "", "全部会话");
+    all.value = "";
+    select.appendChild(all);
+    (snapshot.scopes || []).forEach((item) => {
+      const option = el("option", "", item.display_name || item.conversation_id);
+      option.value = item.scope_id;
+      select.appendChild(option);
+    });
+    select.value = current;
+    webRenderStats();
+    webRenderBranches();
+    if (!webState.graph) {
+      webState.graph = window.SparkingWeb.mount(box, {
+        onSelect: (node) => {
+          if (webState.pruneMode) return;
+          if (node) webLoadDetail(node.id);
+          else webRenderDetail(null);
+        },
+        onMultiSelect: (nodes) => {
+          webState.pruneSelection = nodes.map((node) => node.id);
+          webUpdatePruneBar();
+        },
+      });
+    }
+    webApplyKindFilter();
+    webUpdatePruneBar();
+  }
+
+  function webSearchHighlight() {
+    const keyword = ($("web-search").value || "").trim().toLowerCase();
+    if (!webState.snapshot || !webState.graph) return;
+    if (!keyword) { webState.graph.setSelection([]); return; }
+    const matches = webState.snapshot.nodes.filter(
+      (node) => String(node.label || "").toLowerCase().includes(keyword));
+    webState.graph.setSelection(matches.map((node) => node.id));
+    if (matches.length) {
+      webState.graph.focus(matches[0].id, 1.3);
+      toast("命中 " + matches.length + " 个节点", "ok");
+    } else {
+      toast("没有匹配的节点", "error");
+    }
+  }
+
+  async function webRunPrune() {
+    if (webState.pruneSelection.length < 2) return;
+    const okay = await askConfirm({
+      title: "执行剪枝",
+      message: "沿所选节点之间的路径：低价值叶子节点会被丢弃（不再出现在网与检索里），"
+        + "必要摘要会被向上压缩。压缩程度跟随「上下文详细程度」配置。",
+      okText: "剪枝", danger: true,
+    });
+    if (!okay) return;
+    toast("剪枝中……");
+    try {
+      const out = await post("web_prune", { node_ids: webState.pruneSelection });
+      toast("剪枝完成：路径 " + out.path_count + " 个节点，丢弃 " + out.pruned
+        + "，压缩 " + (out.merged || []).length + " 次"
+        + (out.notes && out.notes.length ? "（" + out.notes[0] + "）" : ""), "ok");
+      webState.pruneMode = false;
+      webState.pruneSelection = [];
+      $("btn-web-prune").classList.remove("active");
+      webState.graph.setMulti(false);
+      webUpdatePruneBar();
+      await loadWeb();
     } catch (error) { toast(String(error.message || error), "error"); }
   }
 
-  let forestEditing = { nodeId: "" };
-
-  async function forestEdit(node, parent) {
-    forestEditing = { nodeId: node ? node.id : "" };
-    const subject = await askPrompt({
-      title: node ? "编辑记忆" : "新增记忆",
-      fields: [
-        { key: "subject", label: "标题/对象", value: node ? node.label : "" },
-        { key: "value", label: "内容", value: node ? node.hint : "", multiline: true },
-      ],
-      okText: node ? "保存" : "新增",
+  async function webRunRebuild() {
+    const okay = await askConfirm({
+      title: "重建记忆网",
+      message: "按当前全部记忆（摘要/账本/话题/印象）清空并重建整张网。分支会保留。",
+      okText: "重建", danger: true,
     });
-    if (!subject) return;
+    if (!okay) return;
+    toast("重建中……");
     try {
-      await post("memory_node_save", scopeParams({
-        node_id: forestEditing.nodeId, subject: subject.subject,
-        value: subject.value, kind: (node && node.kind) || "fact",
-      }));
-      toast(forestEditing.nodeId ? "已保存" : "已新增", "ok");
-      loadForest();
+      const out = await post("web_rebuild", {});
+      toast("重建完成：来源 " + (out.sources || 0) + "，节点 " + ((out.stats || {}).nodes || 0), "ok");
+      await loadWeb();
+    } catch (error) { toast(String(error.message || error), "error"); }
+  }
+
+  async function webNewMemory() {
+    const out = await askPrompt({
+      title: "新增记忆",
+      fields: [
+        { key: "group_id", label: "归属群号（可选，留空=第一个会话）", value: "" },
+        { key: "subject", label: "标题/对象", value: "" },
+        { key: "value", label: "内容", value: "", multiline: true },
+      ],
+      okText: "新增",
+    });
+    if (!out || (!out.subject && !out.value)) return;
+    try {
+      await post("memory_node_save", { group_id: out.group_id, subject: out.subject,
+                                       value: out.value, kind: "fact" });
+      toast("已新增（稍后自动入网）", "ok");
+      await loadWeb();
     } catch (error) { toast(String(error.message || error), "error"); }
   }
 
@@ -2156,7 +2436,36 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
         loadInjections();
       } catch (error) { toast(String(error.message || error), "error"); }
     });
-    $("btn-forest-refresh").addEventListener("click", loadForest);
+    $("btn-web-refresh").addEventListener("click", () => loadWeb().catch((error) => toast(String(error.message || error), "error")));
+    $("btn-web-archived").addEventListener("click", () => {
+      webState.showArchived = !webState.showArchived;
+      $("btn-web-archived").classList.toggle("active", webState.showArchived);
+      loadWeb().catch((error) => toast(String(error.message || error), "error"));
+    });
+    $("btn-web-branches").addEventListener("click", () => {
+      const drawer = $("web-branches");
+      drawer.hidden = !drawer.hidden;
+    });
+    $("btn-web-prune").addEventListener("click", () => {
+      webState.pruneMode = !webState.pruneMode;
+      $("btn-web-prune").classList.toggle("active", webState.pruneMode);
+      webState.pruneSelection = [];
+      if (webState.graph) { webState.graph.setMulti(webState.pruneMode); webState.graph.setSelection([]); }
+      webUpdatePruneBar();
+      toast(webState.pruneMode ? "剪枝模式：点选若干节点" : "已退出剪枝", "ok");
+    });
+    $("btn-web-prune-cancel").addEventListener("click", () => {
+      webState.pruneMode = false;
+      webState.pruneSelection = [];
+      $("btn-web-prune").classList.remove("active");
+      if (webState.graph) webState.graph.setMulti(false);
+      webUpdatePruneBar();
+    });
+    $("btn-web-prune-run").addEventListener("click", webRunPrune);
+    $("btn-web-rebuild").addEventListener("click", webRunRebuild);
+    $("btn-web-new").addEventListener("click", webNewMemory);
+    $("web-scope").addEventListener("change", () => loadWeb().catch((error) => toast(String(error.message || error), "error")));
+    $("web-search").addEventListener("input", webSearchHighlight);
     $("btn-ext-refresh").addEventListener("click", loadCaps);
     $("btn-ext-upload").addEventListener("click", runExtensionUpload);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
@@ -2168,8 +2477,6 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     $("btn-export-server").addEventListener("click", () => runExport(false));
     $("btn-backup-refresh").addEventListener("click", loadBackup);
     $("btn-import-memory").addEventListener("click", runMemoryImport);
-    $("forest-filter").addEventListener("input", loadForest);
-    $("btn-forest-new").addEventListener("click", () => forestEdit(null, null));
     $("btn-imp-save").addEventListener("click", async () => {
       const userId = $("imp-user").value.trim();
       if (!userId) return toast("先填 QQ 号", "error");

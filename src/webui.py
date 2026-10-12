@@ -48,10 +48,12 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("config", "配置"),
     ("personas", "可用人格"),
     ("backups", "备份"),
-    ("memory_tree", "记忆森林"),
+    ("memory_tree", "记忆节点（数据面）"),
     ("tasks", "任务队列"),
     ("injections", "提示词注入"),
     ("context_detail", "上下文详细程度"),
+    ("memory_web", "记忆网（MemoryWeb）"),
+    ("memory_web_node", "记忆网节点详情"),
     ("culture", "群风格与心理"),
     ("imports", "快速学习"),
     ("backup_memory", "记忆导出与导入"),
@@ -88,6 +90,10 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("injection_toggle", "开关提示词注入"),
     ("injection_delete", "删除自定义注入"),
     ("context_detail_set", "切换上下文详细程度（压缩档次）"),
+    ("web_rebuild", "重建记忆网"),
+    ("web_branch_create", "创建记忆分支"),
+    ("web_branch_revert", "回溯到记忆分支（压缩归档并删回该点）"),
+    ("web_prune", "剪枝：沿路径丢弃低价值节点并压缩必要节点"),
     ("mood_set", "设置情绪"),
     ("plan_add", "加日程"),
     ("plan_drop", "撤日程"),
@@ -528,6 +534,44 @@ class PageAPI:
             "note": "注入会以【强制规则】的形式追加到系统提示；自带预设立即可用，可改内容。",
         }
 
+    async def _read_memory_web(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """记忆网快照：节点 + 聚合连线 + 统计 + 分支 + 会话列表。"""
+        host = self.host
+        web = getattr(host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        kinds: list[str] = []
+        raw_kinds = str(query.get("kinds") or "").strip()
+        if raw_kinds:
+            kinds = [item for item in raw_kinds.split(",") if item.strip()]
+        try:
+            limit_nodes = max(20, min(int(query.get("limit_nodes") or 260), 600))
+            limit_edges = max(50, min(int(query.get("limit_edges") or 900), 2000))
+        except (TypeError, ValueError):
+            raise WebUIError("limit 参数无效")
+        include_archived = str(query.get("include_archived") or "").strip() in {
+            "1", "true", "yes", "on"}
+        return await web.snapshot(
+            scope_id=str(query.get("scope") or "").strip(),
+            kinds=kinds,
+            include_archived=include_archived,
+            limit_nodes=limit_nodes,
+            limit_edges=limit_edges,
+        )
+
+    async def _read_memory_web_node(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        host = self.host
+        web = getattr(host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        node_id = str(query.get("node_id") or "").strip()
+        if not node_id:
+            raise WebUIError("缺少 node_id")
+        try:
+            return await web.node_detail(node_id)
+        except ValueError as error:
+            raise WebUIError(str(error))
+
     async def _read_context_detail(self, query: Mapping[str, Any]) -> dict[str, Any]:
         """上下文详细程度（压缩档次）：当前档位、缩放后的注入规模。"""
         host = self.host
@@ -535,6 +579,78 @@ class PageAPI:
         if not callable(getter):
             raise WebUIError("上下文详细程度不可用")
         return getter()
+
+    async def _do_web_rebuild(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """清空记忆网并按当前记忆重建（分支保留）。"""
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        try:
+            report = await web.rebuild()
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200])
+        return {"ok": True, **report}
+
+    async def _do_web_branch_create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        node_id = str(body.get("node_id") or "").strip()
+        if not node_id:
+            raise WebUIError("缺少 node_id")
+        try:
+            branch = await web.create_branch(node_id, note=str(body.get("note") or ""))
+        except ValueError as error:
+            raise WebUIError(str(error))
+        return {"ok": True, "branch": branch}
+
+    async def _do_web_branch_revert(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """回溯：压缩归档分支点之后的记忆、删除原件、封住消息区间。"""
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        branch_id = str(body.get("branch_id") or "").strip()
+        if not branch_id:
+            raise WebUIError("缺少 branch_id")
+        try:
+            report = await web.revert_branch(branch_id)
+        except ValueError as error:
+            raise WebUIError(str(error))
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200])
+        return {"ok": True, **report}
+
+    async def _do_web_prune(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """剪枝：沿所选节点路径丢弃低价值节点、把必要摘要向上压缩。
+
+        压缩程度跟随「上下文详细程度」档位：档位越低压得越狠
+        （1=最多向上滚 3 轮，4=只做最小合并）。
+        """
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        raw_ids = body.get("node_ids")
+        if not isinstance(raw_ids, list):
+            raise WebUIError("node_ids 必须是数组")
+        node_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if len(node_ids) < 2:
+            raise WebUIError("剪枝至少要选择两个节点")
+        level = 3
+        getter = getattr(self.host, "_detail_level", None)
+        if callable(getter):
+            try:
+                level = int(getter())
+            except Exception:
+                level = 3
+        rounds = {1: 3, 2: 2, 3: 1, 4: 1}.get(level, 1)
+        min_batch = 3 if level >= 4 else 2
+        try:
+            report = await web.prune(node_ids, rounds=rounds, min_batch=min_batch)
+        except ValueError as error:
+            raise WebUIError(str(error))
+        except Exception as error:
+            raise WebUIError(f"{type(error).__name__}: {error}"[:200])
+        return {"ok": True, "detail_level": level, "rounds": rounds, **report}
 
     async def _do_context_detail_set(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """切换档位：调低时先立即压缩一次记忆，再按更短的上下文运行。"""
@@ -828,7 +944,7 @@ class PageAPI:
                             "name": str(getattr(item, "name", "") or "")})
         return out
 
-    # ------------------------------------------------------------ 记忆森林
+    # ------------------------------------------------------------ 记忆节点数据面
     @staticmethod
     def _time_text(value: Any, granularity: str) -> str:
         """按层级给时间粒度：越具体的记忆显示得越精确（明确要求）。"""
@@ -860,7 +976,7 @@ class PageAPI:
         return text[:19]
 
     async def _read_memory_tree(self, query: Mapping[str, Any]) -> dict[str, Any]:
-        """记忆森林：群 → 类目 → 条目 → 证据；`node=` 懒加载某一层的子节点。"""
+        """记忆节点数据面：群 → 类目 → 条目 → 证据；`node=` 懒加载某一层的子节点。"""
         node = str(query.get("node") or "").strip()
         if node:
             return {"children": await self._tree_children(node)}
