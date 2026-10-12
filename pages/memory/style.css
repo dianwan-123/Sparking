@@ -353,7 +353,7 @@ textarea { width: 100%; resize: vertical; line-height: 1.65; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-/* ---------------------------------------------------------------- 记忆森林（节点图） */
+/* ---------------------------------------------------------------- 记忆网（画布） */
 .graph {
   position: relative; height: 62vh; min-height: 380px;
   border: 1px solid var(--hair); border-radius: var(--radius-lg);
@@ -395,6 +395,68 @@ textarea { width: 100%; resize: vertical; line-height: 1.65; }
 }
 .forest-menu-item:hover { background: var(--primary-soft); color: var(--primary-strong); }
 .forest-empty { color: var(--ink-3); font-size: 13px; padding: 24px; text-align: center; }
+
+/* ---------------------------------------------------------------- 记忆网（MemoryWeb） */
+.web-kinds { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; }
+.chip {
+  all: unset; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 12px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--hair);
+  font-size: 12.5px; color: var(--ink-2);
+  box-shadow: var(--shadow-1);
+}
+.chip .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.chip.off { opacity: .45; text-decoration: line-through; }
+.web-stage { position: relative; }
+.web-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.web-canvas:active { cursor: grabbing; }
+.web-tip {
+  position: absolute; max-width: 300px;
+  background: var(--surface); border: 1px solid var(--hair);
+  border-radius: var(--radius); padding: 6px 10px;
+  font-size: 12.5px; color: var(--ink);
+  pointer-events: none; z-index: 8; box-shadow: var(--shadow-2);
+}
+.web-detail {
+  position: absolute; top: 12px; right: 12px; width: min(340px, 42%);
+  max-height: calc(100% - 24px); overflow: auto;
+  background: var(--surface); border: 1px solid var(--hair);
+  border-radius: var(--radius-lg); padding: 14px 16px;
+  box-shadow: var(--shadow-2); z-index: 6;
+}
+.web-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.web-detail-head strong { flex: 1; min-width: 0; font-size: 14px; }
+.web-detail-head .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.web-detail-title { font-size: 12.5px; color: var(--ink-2); margin: 12px 0 6px; font-weight: 600; }
+.web-detail-list { display: flex; flex-direction: column; gap: 4px; }
+.web-detail-edge {
+  font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface-2); border-radius: 6px; padding: 5px 9px;
+  word-break: break-word;
+}
+.web-drawer {
+  position: absolute; top: 12px; left: 12px; width: min(380px, 46%);
+  max-height: calc(100% - 24px); overflow: auto;
+  background: var(--surface); border: 1px solid var(--hair);
+  border-radius: var(--radius-lg); padding: 14px 16px;
+  box-shadow: var(--shadow-2); z-index: 6;
+}
+.web-drawer-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.branch-card {
+  border: 1px solid var(--hair); border-radius: var(--radius);
+  padding: 10px 12px; margin-bottom: 10px; background: var(--surface-2);
+}
+.branch-card.reverted { opacity: .72; }
+.branch-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; word-break: break-word; }
+.branch-card .btn { margin-top: 8px; height: 30px; padding: 0 12px; font-size: 12.5px; }
+.prune-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px; padding: 10px 14px;
+  background: var(--surface); border: 1px solid var(--hair);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-1);
+  font-size: 13px; color: var(--ink-2);
+}
 
 /* ---------------------------------------------------------------- 窄屏 */
 @media (max-width: 860px) {

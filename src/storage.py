@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS usage_stats(day TEXT NOT NULL,scope_id TEXT NOT NULL 
 CREATE INDEX IF NOT EXISTS idx_revision_sender_time ON message_revisions(sender_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_summary_scope_level ON summary_nodes(scope_id,level,status,start_seq,end_seq);
 CREATE INDEX IF NOT EXISTS idx_catalog_scope_updated ON catalog_entries(scope_id,updated_at);
+CREATE TABLE IF NOT EXISTS web_nodes(node_id TEXT PRIMARY KEY,node_key TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,label TEXT NOT NULL,canonical TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',weight REAL NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'active',meta_json TEXT NOT NULL DEFAULT '{}',first_seen TEXT NOT NULL,last_seen TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_web_nodes_kind ON web_nodes(kind,status);
+CREATE INDEX IF NOT EXISTS idx_web_nodes_canonical ON web_nodes(canonical);
+CREATE TABLE IF NOT EXISTS web_edges(edge_id TEXT PRIMARY KEY,edge_key TEXT NOT NULL UNIQUE,src_id TEXT NOT NULL REFERENCES web_nodes(node_id) ON DELETE CASCADE,dst_id TEXT NOT NULL REFERENCES web_nodes(node_id) ON DELETE CASCADE,relation TEXT NOT NULL,weight REAL NOT NULL DEFAULT 1,confidence REAL NOT NULL DEFAULT 0.8,source_ref TEXT NOT NULL DEFAULT '',scope_id TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',meta_json TEXT NOT NULL DEFAULT '{}',first_seen TEXT NOT NULL,last_seen TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_web_edges_src ON web_edges(src_id,status);
+CREATE INDEX IF NOT EXISTS idx_web_edges_dst ON web_edges(dst_id,status);
+CREATE INDEX IF NOT EXISTS idx_web_edges_ref ON web_edges(source_ref);
+CREATE TABLE IF NOT EXISTS web_node_sources(node_id TEXT NOT NULL REFERENCES web_nodes(node_id) ON DELETE CASCADE,source_ref TEXT NOT NULL,PRIMARY KEY(node_id,source_ref));
+CREATE TABLE IF NOT EXISTS web_sources(source_ref TEXT PRIMARY KEY,kind TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',ingested_at TEXT NOT NULL,meta_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS web_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS web_branches(branch_id TEXT PRIMARY KEY,node_id TEXT NOT NULL DEFAULT '',node_key TEXT NOT NULL DEFAULT '',label TEXT NOT NULL DEFAULT '',scope_id TEXT NOT NULL DEFAULT '',cut_at TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',archive_ref TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,reverted_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS memory_marks(mark_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL,start_seq INTEGER NOT NULL,end_seq INTEGER NOT NULL,kind TEXT NOT NULL DEFAULT 'reverted',ref TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,UNIQUE(scope_id,start_seq,end_seq,kind));
+CREATE INDEX IF NOT EXISTS idx_memory_marks_scope ON memory_marks(scope_id,kind,start_seq,end_seq);
 """
 
 
@@ -461,8 +474,10 @@ class Storage:
         return [_stored(row) for row in rows]
 
     async def first_uncovered_seq(self, scope_id: str) -> int | None:
+        # 封口区间（memory_marks kind='reverted'）里的消息不再进压缩管线：
+        # 回溯把它们"盖住"了，不盖就会在下一轮被重新压成新记忆（回溯白做）。
         row = await self._fetchone(
-            "SELECT MIN(mc.scope_seq) AS n FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id WHERE mi.scope_id=? AND mc.is_deleted=0 AND NOT EXISTS(SELECT 1 FROM summary_nodes sn WHERE sn.scope_id=mi.scope_id AND sn.level=1 AND sn.status='active' AND mc.scope_seq BETWEEN sn.start_seq AND sn.end_seq)",
+            "SELECT MIN(mc.scope_seq) AS n FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id WHERE mi.scope_id=? AND mc.is_deleted=0 AND NOT EXISTS(SELECT 1 FROM summary_nodes sn WHERE sn.scope_id=mi.scope_id AND sn.level=1 AND sn.status='active' AND mc.scope_seq BETWEEN sn.start_seq AND sn.end_seq) AND NOT EXISTS(SELECT 1 FROM memory_marks mm WHERE mm.scope_id=mi.scope_id AND mm.kind='reverted' AND mc.scope_seq BETWEEN mm.start_seq AND mm.end_seq)",
             (scope_id,),
         )
         return int(row["n"]) if row and row["n"] is not None else None
@@ -474,7 +489,7 @@ class Storage:
         boundary = await self._fetchone("SELECT MIN(start_seq) AS n FROM summary_nodes WHERE scope_id=? AND level=1 AND status='active' AND start_seq>?", (scope_id, start))
         end = int(boundary["n"]) if boundary and boundary["n"] is not None else None
         rows = await self._fetchall(
-            "SELECT mi.message_id,mr.revision_id,mi.scope_id,mc.scope_seq,mi.upstream_message_id,mr.sender_id,mr.sender_name,mr.text,mr.occurred_at,mr.parts_json,mr.reply_to FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id JOIN message_revisions mr ON mr.revision_id=mc.revision_id WHERE mi.scope_id=? AND mc.is_deleted=0 AND mc.scope_seq>=? AND (? IS NULL OR mc.scope_seq<?) ORDER BY mc.scope_seq LIMIT ?",
+            "SELECT mi.message_id,mr.revision_id,mi.scope_id,mc.scope_seq,mi.upstream_message_id,mr.sender_id,mr.sender_name,mr.text,mr.occurred_at,mr.parts_json,mr.reply_to FROM message_current mc JOIN message_identities mi ON mi.message_id=mc.message_id JOIN message_revisions mr ON mr.revision_id=mc.revision_id WHERE mi.scope_id=? AND mc.is_deleted=0 AND mc.scope_seq>=? AND (? IS NULL OR mc.scope_seq<?) AND NOT EXISTS(SELECT 1 FROM memory_marks mm WHERE mm.scope_id=mi.scope_id AND mm.kind='reverted' AND mc.scope_seq BETWEEN mm.start_seq AND mm.end_seq) ORDER BY mc.scope_seq LIMIT ?",
             (scope_id, start, end, end, _limit(limit, 200)),
         )
         return [_stored(row) for row in rows]

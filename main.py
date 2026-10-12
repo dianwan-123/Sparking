@@ -68,6 +68,7 @@ from .src.json_utils import (compact_json, parse_json_object,
                             parse_json_object_containing, parse_json_value)
 from .src.media_archive import MediaArchive, MediaArchiveError, default_aiohttp_fetch, extract_urls, fetch_bounded
 from .src.memory_ledger import MemoryLedger
+from .src.memory_web import MemoryWeb
 from .src.models import Decision
 from .src.task_queue import (
     ALL_KINDS,
@@ -278,7 +279,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.16"
+PLUGIN_VERSION = "1.1.0"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -570,12 +571,17 @@ class LongMemoryAgentPlugin(Star):
         await self._seed_prompt_injections()   # 自带注入预设入库（已改过的不覆盖）
         self.ledger = MemoryLedger(self.storage)
         self.retrieval = RetrievalService(self.storage, embedding=await self._embedding_adapter())
+        self.memory_web = MemoryWeb(self.storage)
         self.context_builder = ContextBuilder(
-            self.storage, self.retrieval, self.ledger, self.settings.context_char_budget
+            self.storage, self.retrieval, self.ledger, self.settings.context_char_budget,
+            memory_web=self.memory_web,
         )
         self.compression = CompressionService(
             self.storage, self._summary_llm, self.ledger, self.settings.summary_provider_id
         )
+        self.memory_web.set_compressor(self.compression)
+        # 加载时检查记忆版本：旧版（只有摘要/账本）自动转换为记忆网
+        self._spawn(self._memory_web_bootstrap())
         self.decision = DecisionEngine(
             self._judge_llm,
             timeout_seconds=self.settings.llm_timeout_seconds,
@@ -1825,6 +1831,29 @@ class LongMemoryAgentPlugin(Star):
             req.system_prompt = (req.system_prompt or "") + "\n\n" + MEMORY_TRUST_POLICY
         req.extra_user_content_parts.append(TextPart(text=payload).mark_as_temp())
 
+    async def _memory_web_bootstrap(self) -> None:
+        """加载时检查记忆是否为旧版：是则跑一遍转换流程（摘要/账本/话题/印象 → 记忆网）。
+
+        转换是幂等的（按来源打标），中断了下次接着转；转完把状态记进 web_meta，
+        之后只做增量同步（心跳里带着跑）。
+        """
+        if self.memory_web is None or self.storage is None:
+            return
+        try:
+            state = await self.memory_web.migration_state()
+            if state.get("needs_migration"):
+                logger.info("长程记忆：检测到旧版记忆（%s 条来源），开始转换为记忆网……",
+                            state.get("legacy_sources", 0))
+                report = await self.memory_web.migrate_legacy()
+                logger.info(
+                    "长程记忆：旧版记忆已转换为记忆网（%s 条来源，节点 %s / 连线 %s）",
+                    report["sources"], report["stats"]["nodes"],
+                    report["stats"]["edges"])
+            else:
+                await self.memory_web.sync_pending()
+        except Exception as error:
+            logger.warning("长程记忆：记忆网初始化失败：%s", str(error)[:200])
+
     async def _compress_if_ready(self, scope_id: str) -> None:
         """Cheap gate: only reacts every `compression_batch_size` messages.
 
@@ -1879,6 +1908,9 @@ class LongMemoryAgentPlugin(Star):
             logger.warning("长程记忆：L2/L3 聚合失败：%s", error)
         if created:
             logger.info("长程记忆：%s 分层压缩产出%d个 L1", scope_id[:8], created)
+            if self.memory_web is not None:
+                # 新记忆立即织进网（检索/面板马上能看到）
+                self._spawn(self.memory_web.sync_pending())
         return created
 
     async def _compress_all_scopes(self, rounds: int = 2) -> None:
@@ -6237,6 +6269,11 @@ class LongMemoryAgentPlugin(Star):
             await self._compress_all_scopes()
         except Exception as error:
             logger.warning("长程记忆：心跳压缩异常：%s", str(error)[:150])
+        if self.memory_web is not None:
+            try:
+                await self.memory_web.sync_pending()
+            except Exception as error:
+                logger.warning("长程记忆：记忆网同步异常：%s", str(error)[:150])
         # 1) 自我规划到期：把未来几小时排成日程
         if time.monotonic() >= self._next_plan_at:
             self._next_plan_at = time.monotonic() + max(1, self.settings.plan_interval_hours) * 3600
@@ -6610,6 +6647,25 @@ class LongMemoryAgentPlugin(Star):
         current = self._embedding_model_name()
         embed_ok, note = memory_export.embedding_verdict(manifest, current)
         report = await self.storage.import_memory(tables, embed_ok=embed_ok, embed_note=note)
+        # 旧版记忆系统适配层：导入完成后把新数据同步进记忆网
+        # （旧版本导出的包没有记忆网数据，这里同样按"来源转换"补齐）
+        web_report: dict[str, Any] = {"converted": 0, "nodes": 0, "edges": 0,
+                                      "pending": 0}
+        if self.memory_web is not None:
+            try:
+                sync = await self.memory_web.sync_pending(limit=1500)
+                stats = await self.memory_web.stats()
+                pending = sum((await self.memory_web.pending_count()).values())
+                web_report = {"converted": int(sync["total"]),
+                              "nodes": int(stats["nodes"]),
+                              "edges": int(stats["edges"]),
+                              "pending": int(pending)}
+                if pending:
+                    # 大批量导入：剩余来源交给后台转换
+                    self._spawn(self.memory_web.migrate_legacy())
+            except Exception as error:
+                logger.warning("长程记忆：导入后记忆网转换失败：%s", str(error)[:200])
+        report["memory_web"] = web_report
         report.update({
             "file": str(filename or part.name),
             "package": {

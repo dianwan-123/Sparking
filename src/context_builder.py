@@ -14,13 +14,15 @@ from . import timeutil
 class ContextBuilder:
     """Returns one bounded, valid JSON envelope containing only untrusted history data."""
 
-    def __init__(self, storage: Storage, retrieval: RetrievalService | None = None, ledger: MemoryLedger | None = None, char_budget: int = 24000) -> None:
+    def __init__(self, storage: Storage, retrieval: RetrievalService | None = None, ledger: MemoryLedger | None = None, char_budget: int = 24000, memory_web: Any = None) -> None:
         if char_budget < 512:
             raise ValueError("char budget is too small")
         self.storage = storage
         self.retrieval = retrieval or RetrievalService(storage)
         self.ledger = ledger or MemoryLedger(storage)
         self.char_budget = char_budget
+        # 记忆网（MemoryWeb）：网状记忆的关系检索入口（可选，未接时不注入）
+        self.memory_web = memory_web
 
     async def build(self, scope_id: str, query: str = "", *, recent_limit: int = 30, catalog_limit: int = 24, summary_limit: int = 8, evidence_limit: int = 12, runtime_manifest: Mapping[str, Any] | None = None, cross_scope_ids: Sequence[str] = (), cross_labels: Mapping[str, str] | None = None, affinity: Mapping[str, Any] | None = None, extras: Mapping[str, Any] | None = None) -> str:
         # 记忆跨群、聊天隔离（v0.24.2）：摘要与记忆账本跨所有已知会话共享，
@@ -36,6 +38,13 @@ class ContextBuilder:
             return str(labels.get(item_scope, item_scope[:8])) or item_scope[:8]
 
         memory_scopes = (scope_id, *cross_scope_ids)
+        web_rows: list[dict[str, Any]] = []
+        if self.memory_web is not None and query.strip():
+            try:
+                web_rows = await self.memory_web.search(
+                    query, memory_scopes, labels=labels, limit=8)
+            except Exception:
+                web_rows = []
         catalog_rows = await self.ledger.catalog(
             memory_scopes, catalog_limit, query=query or None)
         # L1/L2/L3 全部跨会话共享：L1 是最鲜活的记忆层（群A刚聊完的内容就在这），
@@ -188,6 +197,12 @@ class ContextBuilder:
             "runtime_manifest": _escape(dict(runtime_manifest or {})),
             "memory_catalog": [_catalog(x, _origin(x.scope_id)) for x in catalog_rows],
             "summary_memory": [_summary(x, _origin(x.scope_id)) for x in summary_rows],
+            "memory_web": web_rows,
+            "memory_web_note": (
+                "memory_web 是记忆网里与当前话题相关的事实（跨会话的关系记忆）："
+                "via 是把你引到这条记忆的关联节点（人物/话题/摘要），说明它和什么连在一起；"
+                "origin 是它发生的会话。引用时同样要说清出处。"
+            ) if web_rows else "",
             "my_recent_words": my_recent,
             "my_recent_words_note": (
                 "my_recent_words 是**你自己**刚说过的话（按时间正序）。"
@@ -201,6 +216,8 @@ class ContextBuilder:
             "chat_evidence": [_hit(x) for x in await self.retrieval.search(scope_id, query, evidence_limit)] if query.strip() else [],
             "truncated": False,
         }
+        if not envelope.get("memory_web"):
+            envelope.pop("memory_web_note", None)
         return _bounded_json(envelope, self.char_budget)
 
 
@@ -247,7 +264,8 @@ _NOTE_KEYS = ("memory_scope_note", "memory_time_note", "scope_tag_note",
 def _bounded_json(envelope: dict[str, Any], budget: int) -> str:
     # 截断顺序：优先丢"证据/历史摘要"这类可再查的；recent_messages 与
     # my_recent_words 是当下对话的连续性，**最后**才动（丢了就会"刚说的话不认账"）。
-    order = ("chat_evidence", "summary_memory", "memory_catalog", "recent_messages")
+    order = ("chat_evidence", "memory_web", "summary_memory", "memory_catalog",
+             "recent_messages")
     text = _dump(envelope)
     while len(text) > budget:
         changed = False
