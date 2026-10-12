@@ -157,6 +157,16 @@ _PAGE_PREFIX = f"/{_PLUGIN_NAME}/page"
 _PREFETCH_KEY = "long_memory_agent.prefetched_context"
 _SKIP_KEY = "long_memory_agent.skip_injection"
 
+# 上下文详细程度（压缩档次）：注入的记忆上下文与工具清单随档次整体缩放。
+# 倍数作用在各项上下文配置上（是缩放不是覆盖）——单项配置照常可调，
+# 档次负责"整体压缩/展开"：1 紧凑 2 精简 3 标准 4 详细。
+CONTEXT_DETAIL_LEVELS: dict[int, tuple[str, float]] = {
+    1: ("紧凑", 0.5),
+    2: ("精简", 0.75),
+    3: ("标准", 1.0),
+    4: ("详细", 1.5),
+}
+
 
 @dataclass(slots=True)
 class _BatchedMessage:
@@ -268,7 +278,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.0.14"
+PLUGIN_VERSION = "1.0.16"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -409,12 +419,15 @@ class LongMemoryAgentPlugin(Star):
         signature = self._config_signature()
         if not signature or signature == self._config_signature_seen:
             return False
+        previous_level = self._detail_level()
         self._config_signature_seen = signature
         try:
             self.settings = PluginConfig.from_mapping(self.raw_config)
             logger.info("长程记忆：检测到配置热更新，已重建运行参数")
             self._apply_auto_install_setting()
             self._invalidate_injections()
+            # 详细程度被调低 → 先立即压缩一次记忆，再按更短的上下文运行
+            self._apply_detail_level_change(previous_level)
             # 后补的 SSH 配置：把 paramiko 安装/环境探测补跑一次
             try:
                 if self._ssh_config().configured and not self._ssh_env.get("checked"):
@@ -1134,6 +1147,98 @@ class LongMemoryAgentPlugin(Star):
             return start <= hour < end
         return hour >= start or hour < end          # 跨零点（如 23-7）
 
+    # ------------------------------------------------ 上下文详细程度（压缩档次）
+    def _detail_level(self) -> int:
+        """当前档次（1~4；配置坏了就按标准走）。"""
+        try:
+            level = int(getattr(self.settings, "context_detail_level", 3) or 3)
+        except (TypeError, ValueError):
+            level = 3
+        return level if level in CONTEXT_DETAIL_LEVELS else 3
+
+    def _detail_factor(self) -> float:
+        return CONTEXT_DETAIL_LEVELS[self._detail_level()][1]
+
+    def _context_limits(self) -> dict[str, int]:
+        """本轮注入的记忆规模：档次 × 各项配置（只缩放注入量，不改配置本身）。"""
+        factor = self._detail_factor()
+
+        def scaled(value: Any, minimum: int, maximum: int) -> int:
+            try:
+                result = int(round(float(value) * factor))
+            except (TypeError, ValueError):
+                result = minimum
+            return max(minimum, min(result, maximum))
+
+        return {
+            "recent_limit": scaled(self.settings.recent_message_limit, 6, 200),
+            "catalog_limit": scaled(self.settings.catalog_limit, 5, 100),
+            "summary_limit": scaled(self.settings.summary_limit, 3, 60),
+            "evidence_limit": scaled(self.settings.evidence_limit, 2, 80),
+        }
+
+    def _context_char_budget(self) -> int:
+        """记忆上下文的字符预算（随档次缩放）。"""
+        try:
+            base = int(self.settings.context_char_budget)
+        except (TypeError, ValueError):
+            base = 16000
+        return max(4000, min(int(round(base * self._detail_factor())), 240000))
+
+    def _detail_level_info(self) -> dict[str, Any]:
+        level = self._detail_level()
+        name, factor = CONTEXT_DETAIL_LEVELS[level]
+        return {
+            "level": level,
+            "name": name,
+            "factor": factor,
+            "levels": [
+                {"level": key, "name": value[0], "factor": value[1]}
+                for key, value in sorted(CONTEXT_DETAIL_LEVELS.items())
+            ],
+            "limits": self._context_limits(),
+            "char_budget": self._context_char_budget(),
+            "note": "档次越高注入越详细；调低会先压缩一次记忆。提示词注入不受影响。",
+        }
+
+    def _apply_detail_level_change(self, previous_level: int) -> None:
+        """切换档次后的动作：调低时**先立即压缩一次记忆**，再按更短的上下文运行。
+
+        调低后能看到的原始消息与摘要条数都变少——先把积压的消息压成摘要，
+        信息不会因为"看不清了"而丢；调高只是以后多带细节，不用动记忆。
+        """
+        current = self._detail_level()
+        if current == previous_level:
+            return
+        if current < previous_level:
+            logger.info("长程记忆：上下文详细程度 %s → %s，先立即压缩一次记忆再缩短上下文",
+                        CONTEXT_DETAIL_LEVELS[previous_level][0],
+                        CONTEXT_DETAIL_LEVELS[current][0])
+            try:
+                self._spawn(self._compress_all_scopes(rounds=6))
+            except RuntimeError:
+                pass
+        else:
+            logger.info("长程记忆：上下文详细程度 %s → %s，之后的上下文会带上更多细节",
+                        CONTEXT_DETAIL_LEVELS[previous_level][0],
+                        CONTEXT_DETAIL_LEVELS[current][0])
+
+    def _set_detail_level(self, level: int) -> dict[str, Any]:
+        """切换上下文详细程度（控制台快捷入口）：改配置本身，立即生效。"""
+        level = int(level)
+        if level not in CONTEXT_DETAIL_LEVELS:
+            raise ValueError("详细程度只能是 1~4")
+        previous = self._detail_level()
+        self.raw_config["context_detail_level"] = level
+        self.settings = PluginConfig.from_mapping(self.raw_config)
+        self._config_signature_seen = self._config_signature()
+        self._persist_raw_config()
+        self._apply_detail_level_change(previous)
+        info = self._detail_level_info()
+        info["previous"] = previous
+        info["compressed"] = self._detail_level() < previous
+        return info
+
     def _shared_scope_ids(self, current: str | None = None) -> tuple[str, ...]:
         """Memory-sharing set: whitelisted-group and private scopes share one
         memory space (摘要/账本/印象跨群，每条带 origin 出处标注). Raw chat
@@ -1682,10 +1787,7 @@ class LongMemoryAgentPlugin(Star):
                 memory = await self.context_builder.build(
                     scope,
                     event.get_message_str(),
-                    recent_limit=self.settings.recent_message_limit,
-                    catalog_limit=self.settings.catalog_limit,
-                    summary_limit=self.settings.summary_limit,
-                    evidence_limit=self.settings.evidence_limit,
+                    **self._context_limits(),
                     cross_scope_ids=self._shared_scope_ids(scope),
                     cross_labels=await self._scope_labels(),
                     extras=await self._culture_extras(scope, str(event.get_sender_id() or "")),
@@ -1707,6 +1809,7 @@ class LongMemoryAgentPlugin(Star):
                     async with asyncio.timeout(1.5):
                         memory = await self.context_builder.build(
                             scope, event.get_message_str(), runtime_manifest=manifest,
+                            **self._context_limits(),
                             cross_scope_ids=self._shared_scope_ids(scope),
                             cross_labels=await self._scope_labels(),
                             extras=await self._culture_extras(
@@ -1716,7 +1819,7 @@ class LongMemoryAgentPlugin(Star):
                     memory = None
         payload = compact_json(
             {"runtime_manifest": manifest, "retrieved_memory": parse_json_object(memory or "{}") or {}},
-            self.settings.context_char_budget,
+            self._context_char_budget(),
         )
         if MEMORY_TRUST_POLICY not in req.system_prompt:
             req.system_prompt = (req.system_prompt or "") + "\n\n" + MEMORY_TRUST_POLICY
@@ -1778,15 +1881,18 @@ class LongMemoryAgentPlugin(Star):
             logger.info("长程记忆：%s 分层压缩产出%d个 L1", scope_id[:8], created)
         return created
 
-    async def _compress_all_scopes(self) -> None:
-        """Heartbeat hook: keep every known scope's memory layers current."""
+    async def _compress_all_scopes(self, rounds: int = 2) -> None:
+        """Heartbeat hook: keep every known scope's memory layers current.
+
+        调低上下文档次时用更大的 rounds 先跑一轮，把积压彻底压掉。
+        """
         if not self.compression or not self.storage:
             return
         for scope_id in list(dict.fromkeys(self._known_scopes.values())):
             if not scope_id:
                 continue
             try:
-                await self._compress_scope(scope_id, rounds=2)
+                await self._compress_scope(scope_id, rounds=rounds)
             except Exception as error:
                 logger.warning("长程记忆：记忆压缩巡检失败：%s", str(error)[:150])
 
@@ -1870,7 +1976,7 @@ class LongMemoryAgentPlugin(Star):
         context = await self.context_builder.build(
             scope_id,
             event.get_message_str(),
-            recent_limit=self.settings.recent_message_limit,
+            **self._context_limits(),
             runtime_manifest={
                 "platform": "aiocqhttp",
                 "group_id": str(event.get_group_id()),
@@ -2174,7 +2280,7 @@ class LongMemoryAgentPlugin(Star):
                 "用户明确@/唤醒了你，正在直接和你说话。除非明显不适合，应当回应。"
             )
         if batch_items or image_only or wake or tech_enriched:
-            context = compact_json(context_data, self.settings.context_char_budget)
+            context = compact_json(context_data, self._context_char_budget())
         direct = not any(token in event.get_message_str() for token in ("?", "？", "他说", "建议"))
         admin = event.is_admin()
         if asyncio.iscoroutine(admin):
@@ -2603,7 +2709,7 @@ class LongMemoryAgentPlugin(Star):
         if image_only:
             payload["message_type"] = "image"
             payload["note"] = "你看不到这张图片的内容；只做符合当前情绪的最简短回应，或改用表情/戳一戳表达。"
-        prompt = compact_json(payload, self.settings.context_char_budget)
+        prompt = compact_json(payload, self._context_char_budget())
         # agent 循环走专用系统提示词（不强制 JSON、不重复注入工具清单）；
         # 旧 _compose_reply_prompt 的【最终输出】JSON 只服务无工具两段式。
         # 最终回应的形状：模型循环里可以直接说话，也可能带计划 JSON——
@@ -4576,9 +4682,10 @@ class LongMemoryAgentPlugin(Star):
         # 已知问题：清单越滚越长（AstrBot 内置 + 各插件 + 拓展），每轮都重复灌进上下文，
         # 模型反而抓不住重点、还挤掉了记忆与任务说明。
         lines: list[str] = []
-        budget = 1600
+        factor = self._detail_factor()
+        budget = int(1600 * factor)
         used = 0
-        for tool in tools[:60]:
+        for tool in tools[:max(20, int(60 * factor))]:
             name = str(getattr(tool, "name", "") or "")
             if not name:
                 continue
@@ -4594,7 +4701,7 @@ class LongMemoryAgentPlugin(Star):
             pairs = self._extensions.dynamic_tools()
             if pairs:
                 lines.append("【已装拓展（用 extension_call 调用）】")
-                for extension, tool in pairs[:6]:
+                for extension, tool in pairs[:max(3, int(6 * factor))]:
                     lines.append(
                         f"- {extension.id}.{tool.name}：{tool.description[:60]}"
                     )
@@ -4602,7 +4709,7 @@ class LongMemoryAgentPlugin(Star):
         script_tools = self._script_manager().tool_catalog()
         if script_tools:
             lines.append("【scripts 拓展工具（用 script_call(script, tool, params_json) 调用）】")
-            for row in script_tools[:8]:
+            for row in script_tools[:max(4, int(8 * factor))]:
                 params = "、".join(
                     f"{key}:{value}" for key, value in
                     (row.get("params") or {}).items()) if row.get("params") else "无参数"
@@ -6026,6 +6133,7 @@ class LongMemoryAgentPlugin(Star):
             if scope and self.context_builder:
                 memory = await self.context_builder.build(
                     scope, instruction, runtime_manifest={"mood": mood},
+                    **self._context_limits(),
                     cross_scope_ids=self._shared_scope_ids(scope),
                     cross_labels={v: k for k, v in self._known_scopes.items()},
                 )
@@ -6059,7 +6167,7 @@ class LongMemoryAgentPlugin(Star):
             if loop_warning:
                 payload_data["loop_warning"] = loop_warning
                 loop_warning = ""
-            payload = compact_json(payload_data, self.settings.context_char_budget)
+            payload = compact_json(payload_data, self._context_char_budget())
             provider = self.settings.reply_provider_id or ""
             persona = await self._persona_prompt()
             script_block = self._script_prompts_block()
@@ -8911,7 +9019,7 @@ class LongMemoryAgentPlugin(Star):
             topics = await self.storage.recent_topics(scope_id, 6)
             temperature = self.mood.reply_temperature() if self.mood else {"tier": "neutral"}
             context = await self.context_builder.build(
-                scope_id, "", recent_limit=self.settings.recent_message_limit,
+                scope_id, "", **self._context_limits(),
                 runtime_manifest={
                     "mood": self.mood.get().as_prompt() if self.mood else "",
                     "reply_temperature": temperature,

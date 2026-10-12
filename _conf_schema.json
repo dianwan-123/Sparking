@@ -71,6 +71,11 @@
     "description": "动态记忆最大字符预算（默认 16000：够用又省 token；调大更聪明但更贵）",
     "default": 16000
   },
+  "context_detail_level": {
+    "type": "int",
+    "description": "上下文详细程度（压缩档次）：1=紧凑 2=精简 3=标准 4=详细。档次越高，注入的工具清单、记忆摘要、最近消息与证据越多（更聪明也更费 token）；越低越省。调低档次会先立即压缩一次记忆，再按更短的上下文运行；调高从下一轮起生效。提示词注入不受此档次影响。",
+    "default": 3
+  },
   "compression_batch_size": {
     "type": "int",
     "description": "L1压缩消息批次",

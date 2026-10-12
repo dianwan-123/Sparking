@@ -374,7 +374,7 @@
     { id: "groups", icon: "groups", title: "群与会话", desc: "会话列表、白名单与群话题" },
     { id: "schedule", icon: "schedule", title: "日程与任务", desc: "任务队列、待办与事件条件指令" },
     { id: "caps", icon: "caps", title: "能力与拓展", desc: "bot 实际可调用的工具与已装载技能" },
-    { id: "inject", icon: "inject", title: "提示词注入", desc: "以【强制规则】形式追加到系统提示，勾选即生效" },
+    { id: "inject", icon: "inject", title: "注入与压缩", desc: "强制规则注入（不受压缩影响）+ 上下文详细程度" },
     { id: "culture", icon: "culture", title: "群风格与心理", desc: "它学到的说话习惯、群内黑话、对你的了解与情绪记忆" },
     { id: "learn", icon: "learn", title: "快速学习", desc: "导入导出的群聊天记录，让它一次学会这些群" },
     { id: "gallery", icon: "gallery", title: "表情与媒体", desc: "表情包库与媒体归档：看、改描述、删" },
@@ -697,7 +697,7 @@
       case "groups": return loadGroups();
       case "schedule": return loadSchedule();
       case "caps": return loadCaps();
-      case "inject": return loadInjections();
+      case "inject": return Promise.all([loadInjections(), loadContextDetail()]);
       case "culture": return loadCulture();
       case "learn": return loadLearn();
       case "backup": return loadBackup();
@@ -1704,6 +1704,38 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     }, "还没有情绪起伏的记录");
   }
 
+  // 上下文详细程度（压缩档次）：调低会先压缩一次记忆，再按更短的上下文运行
+  async function loadContextDetail() {
+    const select = $("detail-level");
+    const hint = $("detail-hint");
+    try {
+      const data = await get("context_detail");
+      if (select) select.value = String(data.level || 3);
+      if (hint) {
+        const limits = data.limits || {};
+        hint.textContent = "当前：" + (data.name || "")
+          + "（记忆预算约 " + (data.char_budget || 0) + " 字符 / 最近消息 "
+          + (limits.recent_limit || 0) + " 条 / 摘要 " + (limits.summary_limit || 0)
+          + " 条 / 证据 " + (limits.evidence_limit || 0) + " 条）";
+      }
+    } catch (error) {
+      if (hint) hint.textContent = String(error.message || error);
+    }
+  }
+
+  async function saveContextDetail() {
+    const select = $("detail-level");
+    if (!select) return;
+    try {
+      const out = await post("context_detail_set", { level: Number(select.value) });
+      toast("已切到「" + (out.name || "") + "」"
+        + (out.compressed ? "，并先压缩了一次记忆" : ""), "ok");
+      loadContextDetail();
+    } catch (error) {
+      toast(String(error.message || error), "error");
+    }
+  }
+
   async function loadInjections() {
     const box = $("injections");
     if (!box) return;
@@ -2128,6 +2160,7 @@ ${(node.hint || "").slice(0, 80)}` }))) return;
     $("btn-ext-refresh").addEventListener("click", loadCaps);
     $("btn-ext-upload").addEventListener("click", runExtensionUpload);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
+    $("btn-detail-save").addEventListener("click", saveContextDetail);
     $("btn-refresh-culture").addEventListener("click", loadCulture);
     $("btn-learn-run").addEventListener("click", runImport);
     $("btn-learn-refresh").addEventListener("click", loadLearn);

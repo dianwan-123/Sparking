@@ -211,6 +211,22 @@
 
       <section class="panel" id="panel-inject" hidden>
         <div class="card">
+          <h2>上下文详细程度 <span class="muted">每轮注入多少细节（压缩档次）</span></h2>
+          <p class="muted">档次越高，注入的工具清单、记忆摘要、最近消息与证据越多，更聪明也更费 token；越低越省。
+            调低档次会<b>先立即压缩一次记忆</b>，然后按更短的上下文运行；调高从下一轮起生效。
+            <b>下面的提示词注入不受档次影响</b>——无论哪一档都完整注入。</p>
+          <div class="row wrap">
+            <select id="detail-level">
+              <option value="1">1 · 紧凑（最省）</option>
+              <option value="2">2 · 精简</option>
+              <option value="3">3 · 标准</option>
+              <option value="4">4 · 详细（最全）</option>
+            </select>
+            <button class="btn primary" id="btn-detail-save">应用</button>
+            <span class="muted" id="detail-hint"></span>
+          </div>
+        </div>
+        <div class="card">
           <h2>提示词注入 <span class="muted">勾选即生效，以【强制规则】追加到系统提示</span></h2>
           <p class="muted">自带预设可以直接启用、也可以改内容；自己的规则点「新增」。
             注入内容写成硬性要求（「每条消息必须 ≤15 字」）效果最好——它们会以

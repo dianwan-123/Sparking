@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.0.14-orange.svg" alt="v1.0.14">
+  <img src="https://img.shields.io/badge/version-v1.0.16-orange.svg" alt="v1.0.16">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -98,6 +98,7 @@
   还能**上传自定义拓展**（选一个 zip，里面要有 `extension.json`）——
   **只有自己上传的拓展能删**，插件自带与 bot 自学习的技能不允许删除。
 - **表情与媒体**：表情包库与媒体归档的缩略图网格，可看、可改描述/备注、可单条删除。
+- **注入与压缩**：提示词注入（强制规则，勾选即生效）与**上下文详细程度**——每轮注入的上下文规模四档可调（越高越详细、越费 token），调低会先把积压的消息压缩成记忆再按更短的上下文运行；注入的规则不受档次影响。
 - **快速学习**：导入导出的群聊天记录，一次学会这些群（见下节）。
 - **记忆备份**：把它的记忆导出成一个 zip 下载走，也能导入回来（换机器/换 bot 用它）；导入时**要用同一个嵌入模型**，对不上就只搬文本与记忆、跳过向量。
 - **配置**：所有配置项在线改，**改完即时生效**，不用重载插件。
@@ -183,7 +184,7 @@ manifest 里的 `name`，按 `manual.md` 里的注释填内容即可。控制台
 ## 📑 常用配置
 
 <details>
-<summary><b>最常用的 21 项</b></summary>
+<summary><b>最常用的 23 项</b></summary>
 
 | 配置 | 默认 | 说明 |
 | :--- | :--- | :--- |
@@ -197,6 +198,7 @@ manifest 里的 `name`，按 `manual.md` 里的注释填内容即可。控制台
 | `group_cooldown_seconds` | `180` | 同群自主互动冷却 |
 | `max_actions_per_hour` | `8` | 每群每小时自主动作上限 |
 | `memory_sync_minutes` | `5` | 记忆同步间隔：新消息积压超过这么久就先压成摘要（0=只在攒够批次时压缩） |
+| `context_detail_level` | `3` | 上下文详细程度（压缩档次）：1 紧凑 / 2 精简 / 3 标准 / 4 详细；越高注入越详细、越费 token，调低会先压缩一次记忆；提示词注入不受影响 |
 | `quiet_start_hour` / `quiet_end_hour` | `1` / `7` | 夜间静默 |
 | `proactive_interval_minutes` | `15` | 短巡查：通知/话题/私聊（0=关） |
 | `self_reflect_interval_hours` | `6` | 长打理：总结/说说/资料（0=关） |

@@ -51,6 +51,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("memory_tree", "记忆森林"),
     ("tasks", "任务队列"),
     ("injections", "提示词注入"),
+    ("context_detail", "上下文详细程度"),
     ("culture", "群风格与心理"),
     ("imports", "快速学习"),
     ("backup_memory", "记忆导出与导入"),
@@ -86,6 +87,7 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("injection_save", "存提示词注入（新增/改内容）"),
     ("injection_toggle", "开关提示词注入"),
     ("injection_delete", "删除自定义注入"),
+    ("context_detail_set", "切换上下文详细程度（压缩档次）"),
     ("mood_set", "设置情绪"),
     ("plan_add", "加日程"),
     ("plan_drop", "撤日程"),
@@ -525,6 +527,30 @@ class PageAPI:
             "enabled": [row["injection_id"] for row in rows if row.get("enabled")],
             "note": "注入会以【强制规则】的形式追加到系统提示；自带预设立即可用，可改内容。",
         }
+
+    async def _read_context_detail(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """上下文详细程度（压缩档次）：当前档位、缩放后的注入规模。"""
+        host = self.host
+        getter = getattr(host, "_detail_level_info", None)
+        if not callable(getter):
+            raise WebUIError("上下文详细程度不可用")
+        return getter()
+
+    async def _do_context_detail_set(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """切换档位：调低时先立即压缩一次记忆，再按更短的上下文运行。"""
+        host = self.host
+        setter = getattr(host, "_set_detail_level", None)
+        if not callable(setter):
+            raise WebUIError("上下文详细程度不可用")
+        try:
+            level = int(body.get("level"))
+        except (TypeError, ValueError):
+            raise WebUIError("level 要是 1~4 的整数")
+        try:
+            info = setter(level)
+        except ValueError as error:
+            raise WebUIError(str(error)[:120])
+        return {"ok": True, **info}
 
     async def _read_todos(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         group = str(query.get("group_id") or "").strip()
