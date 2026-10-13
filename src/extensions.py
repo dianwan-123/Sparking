@@ -164,7 +164,7 @@ BUILTIN_PACKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
     "workspace": (
         "工作区文件",
-        "对 AstrBot 数据目录/各插件数据目录/插件 workspace 做文件增删改查与搜索，"
+        "对插件自身数据目录与 AstrBot 会话工作区（data/workspaces）做文件增删改查与搜索，"
         "并运行工作区内的脚本（.py/.js/.sh/.bat/.ps1）；还可把本地图片/文件/视频/音频直发聊天",
         ("fs_list", "fs_read", "fs_write", "fs_delete", "fs_move", "fs_search",
          "run_script", "send_local_file", "read_tabular"),

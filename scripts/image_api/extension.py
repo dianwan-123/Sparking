@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -61,8 +62,11 @@ def _endpoint(base_url: str) -> str:
     return base + "/v1/images/generations"
 
 
-def _extract_image(payload: dict) -> bytes | None:
-    """从响应里抠出图片字节：认 b64_json 与 url 两种（各家写法不一）。"""
+async def _extract_image(payload: dict) -> bytes | None:
+    """从响应里抠出图片字节：认 b64_json 与 url 两种（各家写法不一）。
+
+    url 下载放进线程执行：拓展工具跑在事件循环上，同步 urlopen 会阻塞整个循环。
+    """
     items = payload.get("data")
     if not isinstance(items, list) or not items:
         return None
@@ -75,13 +79,16 @@ def _extract_image(payload: dict) -> bytes | None:
             return None
     url = _clean(first.get("url"))
     if url.startswith("http"):
-        try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0 longmem-script"})
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return response.read()
-        except Exception:
-            return None
+        def _download() -> bytes | None:
+            try:
+                request = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0 longmem-script"})
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return response.read()
+            except Exception:
+                return None
+
+        return await asyncio.to_thread(_download)
     return None
 
 
@@ -151,7 +158,7 @@ async def call_tool(api, name: str, params: dict) -> str:
         payload = json.loads(text)
     except json.JSONDecodeError:
         return f"{UNFINISHED_NOTE}：接口返回的不是 JSON：{text[:200]}"
-    image = _extract_image(payload if isinstance(payload, dict) else {})
+    image = await _extract_image(payload if isinstance(payload, dict) else {})
     if image is None:
         return (f"{UNFINISHED_NOTE}：响应里没找到图片（要 b64_json 或 url 字段）："
                 f"{text[:200]}")

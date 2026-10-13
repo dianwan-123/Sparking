@@ -4965,16 +4965,24 @@ class LongMemoryAgentPlugin(Star):
 
     # ---------------------------------------------------- 工作区（OpenClaw 文件/exec 移植）
     def _workspace(self) -> Workspace:
-        """受限工作区：AstrBot 数据目录（含各插件数据目录）+ 插件 workspace 子目录。
-        相对路径以 workspace 为基准；所有操作 resolve 后必须在允许根内。"""
+        """受限工作区：插件自身数据目录 + AstrBot 会话工作区（data/workspaces）。
+
+        相对路径以插件 workspace 为基准；所有操作 resolve 后必须在允许根内。
+        范围**不含** AstrBot 数据目录本体——文件工具够不到配置与数据库文件。
+        """
         if self._workspace_obj is None:
             data_root = Path(get_astrbot_data_path())
             if self.storage is not None:
-                workspace_dir = self.storage.path.parent / "workspace"
+                plugin_dir = self.storage.path.parent
             else:
-                workspace_dir = (data_root / "plugin_data"
-                                 / "astrbot_plugin_long_memory_agent" / "workspace")
-            self._workspace_obj = Workspace([data_root, workspace_dir])
+                plugin_dir = (data_root / "plugin_data"
+                              / "astrbot_plugin_long_memory_agent")
+            workspace_dir = plugin_dir / "workspace"
+            self._workspace_obj = Workspace([
+                data_root / "workspaces",   # AstrBot 自带文件工具的会话工作区
+                plugin_dir,                 # 插件自身数据目录（workspace/脚本/拓展/导出等）
+                workspace_dir,              # 相对路径的主目录
+            ])
         return self._workspace_obj
 
     async def _dispatch_workspace_action(self, tool: str,
@@ -5016,7 +5024,7 @@ class LongMemoryAgentPlugin(Star):
 
     @filter.llm_tool(name="fs_list")
     async def fs_list_tool(self, event: AstrMessageEvent, path: str = "."):
-        """列出工作区里的文件与子目录（AstrBot 数据目录/各插件数据目录/workspace）。
+        """列出工作区里的文件与子目录（插件数据目录与 AstrBot 会话工作区）。
         相对路径以插件 workspace 目录为基准。
 
         Args:
