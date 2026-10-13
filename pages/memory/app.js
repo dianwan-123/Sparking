@@ -591,18 +591,44 @@ window.SparkingWeb = (() => {
     return unwrap(payload, "HTTP " + response.status);
   }
 
-  async function get(endpoint, params) {
-    const query = new URLSearchParams();
-    Object.keys(params || {}).forEach((key) => {
-      const value = params[key];
-      if (value !== undefined && value !== null) query.set(key, String(value));
-    });
-    const bridge = await bridgeReady();
-    if (bridge) {
-      return unwrap(await bridge.apiGet(endpointOf(endpoint), params || {}), "请求失败");
+  // 插件重载的瞬间路由会短暂消失（旧实例注销 → 新实例注册之间）：遇到
+  // "未找到该路由"自动重试几次，别把重载窗口当故障；重试仍失败给出明确指引。
+  const ROUTE_MISSING_HINT = "未找到该路由";
+
+  async function _withReloadRetry(run) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await run();
+      } catch (error) {
+        lastError = error;
+        const message = String((error && error.message) || error);
+        if (!message.includes(ROUTE_MISSING_HINT) || attempt >= 2) break;
+        toast("插件可能正在重载，正在重试…");
+        await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
+      }
     }
-    const suffix = query.toString() ? "?" + query.toString() : "";
-    return sameOrigin(endpoint + suffix);
+    const message = String((lastError && lastError.message) || lastError || "");
+    if (message.includes(ROUTE_MISSING_HINT)) {
+      throw new Error("插件似乎还没重载完成：在插件列表点一次「重载」，或稍等几秒刷新页面即可");
+    }
+    throw lastError;
+  }
+
+  async function get(endpoint, params) {
+    return _withReloadRetry(async () => {
+      const query = new URLSearchParams();
+      Object.keys(params || {}).forEach((key) => {
+        const value = params[key];
+        if (value !== undefined && value !== null) query.set(key, String(value));
+      });
+      const bridge = await bridgeReady();
+      if (bridge) {
+        return unwrap(await bridge.apiGet(endpointOf(endpoint), params || {}), "请求失败");
+      }
+      const suffix = query.toString() ? "?" + query.toString() : "";
+      return sameOrigin(endpoint + suffix);
+    });
   }
 
   async function post(action, data) {

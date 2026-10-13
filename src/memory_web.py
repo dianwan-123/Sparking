@@ -205,26 +205,85 @@ class MemoryWeb:
                        edges: Sequence[Mapping[str, Any]],
                        *, node_status: str = "active",
                        edge_status: str = "active") -> dict[str, str]:
-        """一个来源一个事务：节点 upsert（权重按来源计）、连线插入、来源打标。"""
+        """一个来源一个事务：节点 upsert（权重按来源计）、连线插入、来源打标。
+
+        批量做：节点先一条 SELECT 取齐已有项、连线走 executemany——
+        逐条往返在"首次转换几万条来源"时会慢到分钟级（迁移是后台任务，
+        但没必要慢）。
+        """
         db = self.storage._conn()
         now = utc_now()
+        # 同键节点先去重（后出现的覆盖标签/元数据，与逐条 upsert 的净效果一致）
+        unique_nodes: dict[str, Mapping[str, Any]] = {}
+        for spec in nodes:
+            key = str(spec.get("key") or "")
+            if key:
+                unique_nodes[key] = spec
         node_ids: dict[str, str] = {}
         async with self.storage._write_lock:
             await self.storage._begin_write(db)
             try:
-                for spec in nodes:
-                    key = str(spec.get("key") or "")
-                    if not key:
-                        continue
-                    node_ids[key] = await self._upsert_node(
-                        db, spec, scope_id, source_ref, now, node_status)
+                existing: dict[str, str] = {}
+                for chunk in _chunks(list(unique_nodes), 300):
+                    marks = ",".join("?" for _ in chunk)
+                    rows = await self.storage._fetchall(
+                        "SELECT node_id, node_key FROM web_nodes "
+                        f"WHERE node_key IN ({marks})", tuple(chunk))
+                    for row in rows:
+                        existing[str(row["node_key"])] = str(row["node_id"])
+                for key, spec in unique_nodes.items():
+                    label = str(spec.get("label") or "")[:200]
+                    meta = _json(dict(spec.get("meta") or {}))
+                    node_id = existing.get(key)
+                    if node_id:
+                        await db.execute(
+                            "UPDATE web_nodes SET label=CASE WHEN ?<>'' THEN ? ELSE label END, "
+                            "last_seen=?, meta_json=?, scope_id=CASE WHEN scope_id='' AND ?<>'' "
+                            "THEN ? ELSE scope_id END WHERE node_id=?",
+                            (label, label, now, meta, str(scope_id or ""),
+                             str(scope_id or ""), node_id))
+                    else:
+                        node_id = uuid.uuid4().hex
+                        # 权重从 0 起：紧跟的 node_sources 插入会把它加到 1（"被几个来源提到"）。
+                        # 若这里写 1，单来源节点会变成 2——权重全表偏大，剪枝/排序都会判错。
+                        await db.execute(
+                            "INSERT INTO web_nodes(node_id,node_key,kind,label,canonical,"
+                            "scope_id,weight,status,meta_json,first_seen,last_seen) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (node_id, key, str(spec.get("kind") or "fact"), label,
+                             str(spec.get("canonical") or "")[:200], str(scope_id or ""),
+                             0.0, node_status, meta, now, now))
+                        existing[key] = node_id
+                    node_ids[key] = node_id
+                    cursor = await db.execute(
+                        "INSERT OR IGNORE INTO web_node_sources(node_id,source_ref) "
+                        "VALUES(?,?)", (node_id, source_ref))
+                    if cursor.rowcount:
+                        await db.execute(
+                            "UPDATE web_nodes SET weight=weight+1 WHERE node_id=?",
+                            (node_id,))
+                edge_rows: list[tuple[Any, ...]] = []
                 for spec in edges:
                     src = node_ids.get(str(spec.get("src") or ""))
                     dst = node_ids.get(str(spec.get("dst") or ""))
                     if not src or not dst or src == dst:
                         continue
-                    await self._insert_edge(db, src, dst, spec, scope_id,
-                                            source_ref, now, edge_status)
+                    relation = str(spec.get("relation") or "related")[:40]
+                    edge_key = f"{spec.get('src')}|{relation}|{spec.get('dst')}|{source_ref}"
+                    try:
+                        confidence = float(spec.get("confidence", 0.8))
+                    except (TypeError, ValueError):
+                        confidence = 0.8
+                    edge_rows.append((
+                        uuid.uuid4().hex, edge_key, src, dst, relation, 1.0,
+                        max(0.0, min(1.0, confidence)), source_ref,
+                        str(scope_id or ""), edge_status,
+                        _json(dict(spec.get("meta") or {})), now, now))
+                for chunk in _chunks(edge_rows, 200):
+                    await db.executemany(
+                        "INSERT OR IGNORE INTO web_edges(edge_id,edge_key,src_id,dst_id,"
+                        "relation,weight,confidence,source_ref,scope_id,status,meta_json,"
+                        "first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", chunk)
                 await db.execute(
                     "INSERT OR IGNORE INTO web_sources(source_ref,kind,scope_id,"
                     "ingested_at,meta_json) VALUES(?,?,?,?,?)",
@@ -234,57 +293,6 @@ class MemoryWeb:
                 await db.rollback()
                 raise
         return node_ids
-
-    async def _upsert_node(self, db: Any, spec: Mapping[str, Any], scope_id: str,
-                           source_ref: str, now: str, status: str) -> str:
-        key = str(spec["key"])
-        row = await self.storage._fetchone(
-            "SELECT node_id FROM web_nodes WHERE node_key=?", (key,))
-        label = str(spec.get("label") or "")[:200]
-        meta = _json(dict(spec.get("meta") or {}))
-        if row is not None:
-            node_id = str(row["node_id"])
-            await db.execute(
-                "UPDATE web_nodes SET label=CASE WHEN ?<>'' THEN ? ELSE label END, "
-                "last_seen=?, meta_json=?, scope_id=CASE WHEN scope_id='' AND ?<>'' "
-                "THEN ? ELSE scope_id END WHERE node_id=?",
-                (label, label, now, meta, str(scope_id or ""), str(scope_id or ""),
-                 node_id))
-        else:
-            node_id = uuid.uuid4().hex
-            # 权重从 0 起：紧跟的 node_sources 插入会把它加到 1（"被几个来源提到"）。
-            # 若这里写 1，单来源节点会变成 2——权重全表偏大，剪枝/排序都会判错。
-            await db.execute(
-                "INSERT INTO web_nodes(node_id,node_key,kind,label,canonical,"
-                "scope_id,weight,status,meta_json,first_seen,last_seen) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (node_id, key, str(spec.get("kind") or "fact"), label,
-                 str(spec.get("canonical") or "")[:200], str(scope_id or ""),
-                 0.0, status, meta, now, now))
-        cursor = await db.execute(
-            "INSERT OR IGNORE INTO web_node_sources(node_id,source_ref) VALUES(?,?)",
-            (node_id, source_ref))
-        if cursor.rowcount:
-            await db.execute(
-                "UPDATE web_nodes SET weight=weight+1 WHERE node_id=?", (node_id,))
-        return node_id
-
-    async def _insert_edge(self, db: Any, src_id: str, dst_id: str,
-                           spec: Mapping[str, Any], scope_id: str,
-                           source_ref: str, now: str, status: str) -> None:
-        relation = str(spec.get("relation") or "related")[:40]
-        edge_key = f"{spec.get('src')}|{relation}|{spec.get('dst')}|{source_ref}"
-        try:
-            confidence = float(spec.get("confidence", 0.8))
-        except (TypeError, ValueError):
-            confidence = 0.8
-        await db.execute(
-            "INSERT OR IGNORE INTO web_edges(edge_id,edge_key,src_id,dst_id,"
-            "relation,weight,confidence,source_ref,scope_id,status,meta_json,"
-            "first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (uuid.uuid4().hex, edge_key, src_id, dst_id, relation, 1.0,
-             max(0.0, min(1.0, confidence)), source_ref, str(scope_id or ""),
-             status, _json(dict(spec.get("meta") or {})), now, now))
 
     async def ingest_summary(self, record: SummaryRecord) -> dict[str, Any]:
         """把一条分层摘要织进网：摘要节点 + 要点事实 + 话题 + 参与者 + 压缩来源。"""
