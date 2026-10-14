@@ -88,7 +88,7 @@ window.SparkingWeb = (() => {
     function step() {
       const nodes = data.nodes || [];
       const edges = data.edges || [];
-      const cell = 150;
+      const cell = 130;
       const grid = new Map();
       const cellKey = (x, y) => Math.round(x / cell) + "|" + Math.round(y / cell);
       nodes.forEach((node) => {
@@ -111,28 +111,28 @@ window.SparkingWeb = (() => {
               if (other.id === node.id) return;
               const target = positions.get(other.id);
               if (!target) return;
-              let dx = pos.x - target.x, dy = pos.y - target.y;
-              let distance = Math.sqrt(dx * dx + dy * dy) || 1;
-              if (distance > cell * 1.6) return;
-              const force = 1400 / (distance * distance);
+              const dx = pos.x - target.x, dy = pos.y - target.y;
+              const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+              if (distance > cell * 1.9) return;
+              const force = 2400 / (distance * distance);
               fx += (dx / distance) * force;
               fy += (dy / distance) * force;
             });
           }
         }
-        fx += (W / 2 - pos.x) * 0.012;
-        fy += (H / 2 - pos.y) * 0.012;
-        pos.vx = (pos.vx + fx) * 0.82;
-        pos.vy = (pos.vy + fy) * 0.82;
+        fx += (W / 2 - pos.x) * 0.006;
+        fy += (H / 2 - pos.y) * 0.006;
+        pos.vx = (pos.vx + fx) * 0.84;
+        pos.vy = (pos.vy + fy) * 0.84;
       });
       edges.forEach((edge) => {
         const a = positions.get(edge.source);
         const b = positions.get(edge.target);
         if (!a || !b) return;
-        let dx = b.x - a.x, dy = b.y - a.y;
+        const dx = b.x - a.x, dy = b.y - a.y;
         const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-        const target = 96;
-        const strength = 0.018 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
+        const target = 112;
+        const strength = 0.02 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
         const force = (distance - target) * strength;
         const ux = dx / distance, uy = dy / distance;
         a.vx += ux * force; a.vy += uy * force;
@@ -142,10 +142,48 @@ window.SparkingWeb = (() => {
         const pos = positions.get(node.id);
         if (!pos) return;
         if (node.id === (dragNode && dragNode.id)) return;
-        pos.x += Math.max(-12, Math.min(12, pos.vx));
-        pos.y += Math.max(-12, Math.min(12, pos.vy));
+        pos.x += Math.max(-14, Math.min(14, pos.vx));
+        pos.y += Math.max(-14, Math.min(14, pos.vy));
         pos.x = Math.max(24, Math.min(W - 24, pos.x));
         pos.y = Math.max(24, Math.min(H - 24, pos.y));
+      });
+      // 防重叠：半径和之内直接推开——没有这一步，节点会挤成一团看不出结构
+      const gcell = 170;
+      const g2 = new Map();
+      const key2 = (x, y) => Math.round(x / gcell) + "|" + Math.round(y / gcell);
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const key = key2(pos.x, pos.y);
+        if (!g2.has(key)) g2.set(key, []);
+        g2.get(key).push(node);
+      });
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const cx = Math.round(pos.x / gcell), cy = Math.round(pos.y / gcell);
+        const r1 = radiusOf(node);
+        for (let gx = cx - 1; gx <= cx + 1; gx += 1) {
+          for (let gy = cy - 1; gy <= cy + 1; gy += 1) {
+            const bucket = g2.get(gx + "|" + gy);
+            if (!bucket) continue;
+            bucket.forEach((other) => {
+              if (other.id <= node.id) return;
+              if (other.id === (dragNode && dragNode.id)) return;
+              if (node.id === (dragNode && dragNode.id)) return;
+              const target = positions.get(other.id);
+              if (!target) return;
+              const dx = target.x - pos.x, dy = target.y - pos.y;
+              const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
+              const minimum = r1 + radiusOf(other) + 4;
+              if (distance >= minimum) return;
+              const push = (minimum - distance) * 0.5;
+              const ux = dx / distance, uy = dy / distance;
+              pos.x -= ux * push; pos.y -= uy * push;
+              target.x += ux * push; target.y += uy * push;
+            });
+          }
+        }
       });
     }
 
@@ -169,8 +207,8 @@ window.SparkingWeb = (() => {
         const b = positions.get(edge.target);
         if (!a || !b) return;
         const weight = Math.max(1, Number(edge.weight) || 1);
-        ctx.strokeStyle = edge.archived ? "rgba(148,163,184,0.35)" : "rgba(100,116,139,0.34)";
-        ctx.lineWidth = Math.min(3.2, 0.8 + Math.log2(weight + 1) * 0.9) / view.scale;
+        ctx.strokeStyle = edge.archived ? "rgba(148,163,184,0.42)" : "rgba(100,116,139,0.45)";
+        ctx.lineWidth = Math.min(3.2, 1.0 + Math.log2(weight + 1) * 0.9) / view.scale;
         if (edge.archived) ctx.setLineDash([5, 5]);
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
@@ -211,24 +249,43 @@ window.SparkingWeb = (() => {
           ctx.stroke();
         }
       });
+      // 标签：按重要度限流 + 防叠字（选中的、悬停的优先，其次按权重）
       const showLabels = view.scale > 1.1;
+      ctx.font = "11px 'Segoe UI', 'Microsoft YaHei', sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const candidates = [];
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
         if (!pos) return;
-        const important = (Number(node.weight) || 1) >= 3 || selection.has(node.id)
-          || (hover && hover.id === node.id);
+        const pinned = selection.has(node.id) || (hover && hover.id === node.id);
+        const important = (Number(node.weight) || 1) >= 3 || pinned;
         if (!important && !showLabels) return;
-        const label = String(node.label || "").slice(0, 14);
-        ctx.font = "11px 'Segoe UI', 'Microsoft YaHei', sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "top";
-        const y = pos.y + radiusOf(node) + 3;
+        candidates.push({ node, pos, pinned });
+      });
+      candidates.sort((a, b) => (Number(b.pinned) - Number(a.pinned))
+        || ((Number(b.node.weight) || 1) - (Number(a.node.weight) || 1)));
+      const labelBudget = showLabels ? 90 : 48;
+      const placed = [];
+      let drawn = 0;
+      for (const item of candidates) {
+        if (drawn >= labelBudget) break;
+        const label = String(item.node.label || "").slice(0, 14);
+        const width = ctx.measureText(label).width;
+        const y = item.pos.y + radiusOf(item.node) + 3;
+        const box = { x: item.pos.x - width / 2 - 2, y: y - 1, w: width + 4, h: 13 };
+        const overlaps = placed.some((other) =>
+          box.x < other.x + other.w && box.x + box.w > other.x
+          && box.y < other.y + other.h && box.y + box.h > other.y);
+        if (overlaps && !item.pinned) continue;
+        placed.push(box);
+        drawn += 1;
         ctx.strokeStyle = "rgba(255,255,255,0.85)";
         ctx.lineWidth = 3 / view.scale;
-        ctx.strokeText(label, pos.x, y);
+        ctx.strokeText(label, item.pos.x, y);
         ctx.fillStyle = "#0f172a";
-        ctx.fillText(label, pos.x, y);
-      });
+        ctx.fillText(label, item.pos.x, y);
+      }
       ctx.restore();
     }
 
@@ -416,7 +473,7 @@ window.SparkingWeb = (() => {
         data = { nodes: nextNodes, edges: nextEdges };
         const alive = new Set(nextNodes.map((node) => node.id));
         Array.from(selection).forEach((id) => { if (!alive.has(id)) selection.delete(id); });
-        schedule(90);
+        schedule(240);
       },
       setSelection(ids) {
         selection.clear();

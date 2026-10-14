@@ -810,11 +810,11 @@ class MemoryWeb:
                        limit_nodes: int = 260,
                        limit_edges: int = 900) -> dict[str, Any]:
         """给面板用的图快照：节点（按权重取前 N）+ 聚合后的连线 + 统计。"""
-        statuses = ["'active'"]
+        statuses = ["active"]
         if include_archived:
-            statuses.append("'archived'")
-        conditions = [f"n.status IN ({','.join(statuses)})"]
-        args: list[Any] = []
+            statuses.append("archived")
+        conditions = ["n.status IN (" + ",".join("?" for _ in statuses) + ")"]
+        args: list[Any] = list(statuses)
         wanted = [str(kind) for kind in kinds if str(kind) in KINDS]
         if wanted:
             conditions.append("n.kind IN (" + ",".join("?" for _ in wanted) + ")")
@@ -830,25 +830,39 @@ class MemoryWeb:
             (*args, max(20, int(limit_nodes))))
         nodes = [_node_view(row) for row in rows]
         node_ids = {node["id"] for node in nodes}
-        edge_rows = await self.storage._fetchall(
-            "SELECT src_id,dst_id,relation,weight,confidence,scope_id,status,"
-            "source_ref FROM web_edges WHERE status IN (" + ",".join(statuses) +
-            ") ORDER BY weight DESC LIMIT ?", (max(50, int(limit_edges) * 3),))
+        # 连线按"当前这批节点"取：每块先捞两端任一端命中的边，再过滤两端都在集合里，
+        # 同一对节点按出现次数聚合（sources = 有多少条来源提到这条关系）。
+        # 注意去重：跨块的一条边会被两个块各捞到一次。
         aggregated: dict[tuple[str, str, str], dict[str, Any]] = {}
-        for row in edge_rows:
-            src, dst = str(row["src_id"]), str(row["dst_id"])
-            if src not in node_ids or dst not in node_ids:
-                continue
-            key = (src, dst, str(row["relation"]))
-            slot = aggregated.setdefault(key, {
-                "source": src, "target": dst, "relation": str(row["relation"]),
-                "weight": 0.0, "sources": 0, "archived": True,
-            })
-            slot["weight"] += float(row["weight"])
-            slot["sources"] += 1
-            if str(row["status"]) == "active":
-                slot["archived"] = False
-        edges = sorted(aggregated.values(), key=lambda item: item["weight"],
+        seen_edges: set[str] = set()
+        if node_ids:
+            status_marks = ",".join("?" for _ in statuses)
+            for chunk in _chunks(list(node_ids), 200):
+                marks = ",".join("?" for _ in chunk)
+                edge_rows = await self.storage._fetchall(
+                    "SELECT edge_id,src_id,dst_id,relation,weight,status FROM web_edges "
+                    f"WHERE status IN ({status_marks}) AND (src_id IN ({marks}) "
+                    f"OR dst_id IN ({marks})) ORDER BY rowid DESC LIMIT ?",
+                    (*statuses, *chunk, *chunk, 6000))
+                for row in edge_rows:
+                    edge_id = str(row["edge_id"])
+                    if edge_id in seen_edges:
+                        continue
+                    seen_edges.add(edge_id)
+                    src, dst = str(row["src_id"]), str(row["dst_id"])
+                    if src not in node_ids or dst not in node_ids:
+                        continue
+                    key = (src, dst, str(row["relation"]))
+                    slot = aggregated.setdefault(key, {
+                        "source": src, "target": dst, "relation": str(row["relation"]),
+                        "weight": 0.0, "sources": 0, "archived": True,
+                    })
+                    slot["weight"] += float(row["weight"])
+                    slot["sources"] += 1
+                    if str(row["status"]) == "active":
+                        slot["archived"] = False
+        edges = sorted(aggregated.values(),
+                       key=lambda item: (item["weight"], item["sources"]),
                        reverse=True)[:max(50, int(limit_edges))]
         scopes = await self.storage._fetchall(
             "SELECT scope_id,conversation_id,display_name FROM scopes "
