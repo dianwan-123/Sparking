@@ -53,6 +53,36 @@ window.SparkingWeb = (() => {
     let view = { x: 0, y: 0, scale: 1 };
     let running = 0;
     let raf = 0;
+    let componentOf = new Map();
+
+    function computeComponents(nodes, edges) {
+      // 并查集：把有连线的节点归成一个个"群落"——布点与内聚力都按群落来
+      const parent = new Map();
+      nodes.forEach((node) => parent.set(node.id, node.id));
+      const find = (value) => {
+        let root = value;
+        while (parent.get(root) !== root) root = parent.get(root);
+        while (parent.get(value) !== root) {
+          const next = parent.get(value);
+          parent.set(value, root);
+          value = next;
+        }
+        return root;
+      };
+      edges.forEach((edge) => {
+        if (!parent.has(edge.source) || !parent.has(edge.target)) return;
+        const a = find(edge.source);
+        const b = find(edge.target);
+        if (a !== b) parent.set(a, b);
+      });
+      const groups = new Map();
+      nodes.forEach((node) => {
+        const root = find(node.id);
+        if (!groups.has(root)) groups.set(root, []);
+        groups.get(root).push(node);
+      });
+      return Array.from(groups.values());
+    }
 
     function resize() {
       const rect = container.getBoundingClientRect();
@@ -88,6 +118,17 @@ window.SparkingWeb = (() => {
     function step() {
       const nodes = data.nodes || [];
       const edges = data.edges || [];
+      // 群落重心：每个"群落"朝自己的重心收——比全局引力更有结构感
+      const centroids = new Map();
+      nodes.forEach((node) => {
+        const pos = positions.get(node.id);
+        if (!pos) return;
+        const key = componentOf.get(node.id) ?? -1;
+        const slot = centroids.get(key) || { x: 0, y: 0, n: 0 };
+        slot.x += pos.x; slot.y += pos.y; slot.n += 1;
+        centroids.set(key, slot);
+      });
+      centroids.forEach((slot) => { slot.x /= slot.n; slot.y /= slot.n; });
       const cell = 130;
       const grid = new Map();
       const cellKey = (x, y) => Math.round(x / cell) + "|" + Math.round(y / cell);
@@ -120,8 +161,13 @@ window.SparkingWeb = (() => {
             });
           }
         }
-        fx += (W / 2 - pos.x) * 0.006;
-        fy += (H / 2 - pos.y) * 0.006;
+        const centroid = centroids.get(componentOf.get(node.id) ?? -1);
+        if (centroid) {
+          fx += (centroid.x - pos.x) * 0.006;
+          fy += (centroid.y - pos.y) * 0.006;
+        }
+        fx += (W / 2 - pos.x) * 0.0015;
+        fy += (H / 2 - pos.y) * 0.0015;
         pos.vx = (pos.vx + fx) * 0.84;
         pos.vy = (pos.vy + fy) * 0.84;
       });
@@ -131,8 +177,8 @@ window.SparkingWeb = (() => {
         if (!a || !b) return;
         const dx = b.x - a.x, dy = b.y - a.y;
         const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-        const target = 112;
-        const strength = 0.02 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
+        const target = 104;
+        const strength = 0.045 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
         const force = (distance - target) * strength;
         const ux = dx / distance, uy = dy / distance;
         a.vx += ux * force; a.vy += uy * force;
@@ -175,7 +221,7 @@ window.SparkingWeb = (() => {
               if (!target) return;
               const dx = target.x - pos.x, dy = target.y - pos.y;
               const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
-              const minimum = r1 + radiusOf(other) + 4;
+              const minimum = r1 + radiusOf(other) + 6;
               if (distance >= minimum) return;
               const push = (minimum - distance) * 0.5;
               const ux = dx / distance, uy = dy / distance;
@@ -207,12 +253,19 @@ window.SparkingWeb = (() => {
         const b = positions.get(edge.target);
         if (!a || !b) return;
         const weight = Math.max(1, Number(edge.weight) || 1);
+        // 曲线边：中点沿法线偏一个"随机的拐弯"（按边名取散列，稳定不闪）
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const length = Math.sqrt(dx * dx + dy * dy) || 1;
+        const bend = (hashUnit(edge.source + edge.relation + edge.target, 1) - 0.5)
+          * 2 * Math.min(46, length * 0.22);
+        const midX = (a.x + b.x) / 2 - (dy / length) * bend;
+        const midY = (a.y + b.y) / 2 + (dx / length) * bend;
         ctx.strokeStyle = edge.archived ? "rgba(148,163,184,0.42)" : "rgba(100,116,139,0.45)";
         ctx.lineWidth = Math.min(3.2, 1.0 + Math.log2(weight + 1) * 0.9) / view.scale;
         if (edge.archived) ctx.setLineDash([5, 5]);
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
+        ctx.quadraticCurveTo(midX, midY, b.x, b.y);
         ctx.stroke();
         ctx.setLineDash([]);
       });
@@ -234,6 +287,10 @@ window.SparkingWeb = (() => {
           ctx.lineWidth = 1.4 / view.scale;
           ctx.stroke();
           ctx.setLineDash([]);
+        } else {
+          ctx.strokeStyle = "rgba(15, 23, 42, 0.25)";
+          ctx.lineWidth = 1.2 / view.scale;
+          ctx.stroke();
         }
         if (selection.has(node.id)) {
           ctx.beginPath();
@@ -456,24 +513,43 @@ window.SparkingWeb = (() => {
         // 保留已有节点的位置：切换类别过滤 / 刷新时不重排（只给新节点排位置）
         const previous = new Map(positions);
         positions.clear();
-        nextNodes.forEach((node, index) => {
-          const old = previous.get(node.id);
-          if (old) {
-            positions.set(node.id, old);
-          } else {
-            const angle = index * 2.399963;
-            const radius = 40 + Math.sqrt(index + 1) * 26;
+        const components = computeComponents(nextNodes, nextEdges);
+        componentOf = new Map();
+        components.forEach((members, index) => {
+          members.forEach((node) => componentOf.set(node.id, index));
+        });
+        // 群落布点：大群落靠中心，小群落绕外圈——布局有"块"有留白，不是均匀铺满
+        const ordered = components
+          .map((members, index) => ({ members, index }))
+          .sort((a, b) => b.members.length - a.members.length);
+        const fresh = new Set(nextNodes.map((node) => node.id)
+          .filter((id) => !previous.has(id)));
+        ordered.forEach(({ members }, rank) => {
+          const freshMembers = members.filter((node) => fresh.has(node.id));
+          if (!freshMembers.length) return;
+          const angle = rank * 2.399963;
+          const ring = 70 + Math.sqrt(rank + 1) * 76;
+          const cx = W / 2 + Math.cos(angle) * ring * 0.75;
+          const cy = H / 2 + Math.sin(angle) * ring * 0.55;
+          freshMembers.forEach((node, inner) => {
+            const a2 = inner * 2.399963;
+            const radius = Math.min(150, 24 + Math.sqrt(inner + 1) * 15);
             positions.set(node.id, {
-              x: W / 2 + Math.cos(angle) * radius,
-              y: H / 2 + Math.sin(angle) * radius,
+              x: cx + Math.cos(a2) * radius,
+              y: cy + Math.sin(a2) * radius,
               vx: 0, vy: 0,
             });
-          }
+          });
+        });
+        nextNodes.forEach((node) => {
+          if (positions.has(node.id)) return;
+          const old = previous.get(node.id);
+          positions.set(node.id, old || { x: W / 2, y: H / 2, vx: 0, vy: 0 });
         });
         data = { nodes: nextNodes, edges: nextEdges };
         const alive = new Set(nextNodes.map((node) => node.id));
         Array.from(selection).forEach((id) => { if (!alive.has(id)) selection.delete(id); });
-        schedule(240);
+        schedule(260);
       },
       setSelection(ids) {
         selection.clear();

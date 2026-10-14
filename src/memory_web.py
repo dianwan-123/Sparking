@@ -835,6 +835,7 @@ class MemoryWeb:
         # 注意去重：跨块的一条边会被两个块各捞到一次。
         aggregated: dict[tuple[str, str, str], dict[str, Any]] = {}
         seen_edges: set[str] = set()
+        connected: set[str] = set()
         if node_ids:
             status_marks = ",".join("?" for _ in statuses)
             for chunk in _chunks(list(node_ids), 200):
@@ -852,6 +853,8 @@ class MemoryWeb:
                     src, dst = str(row["src_id"]), str(row["dst_id"])
                     if src not in node_ids or dst not in node_ids:
                         continue
+                    connected.add(src)
+                    connected.add(dst)
                     key = (src, dst, str(row["relation"]))
                     slot = aggregated.setdefault(key, {
                         "source": src, "target": dst, "relation": str(row["relation"]),
@@ -861,6 +864,10 @@ class MemoryWeb:
                     slot["sources"] += 1
                     if str(row["status"]) == "active":
                         slot["archived"] = False
+        # 这批节点里"一个连线都没有"的孤立点不画：满屏孤零零的圆点看着像"没连上"。
+        # （用原始扫描的 connected 判断，不受 limit_edges 截断影响。）
+        if connected:
+            nodes = [node for node in nodes if node["id"] in connected]
         edges = sorted(aggregated.values(),
                        key=lambda item: (item["weight"], item["sources"]),
                        reverse=True)[:max(50, int(limit_edges))]
