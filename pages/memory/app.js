@@ -1161,7 +1161,14 @@ window.SparkingWeb = (() => {
     const alive = new Set(nodes.map((node) => node.id));
     const edges = webState.snapshot.edges.filter(
       (edge) => alive.has(edge.source) && alive.has(edge.target));
-    webState.graph.setData({ nodes, edges });
+    // 藏掉某类节点后，连着它的线也没了——剩下的节点里不留"孤零零的点"：
+    // 没有可见连线的节点不画（和快照的口径一致）。
+    const linked = new Set();
+    edges.forEach((edge) => { linked.add(edge.source); linked.add(edge.target); });
+    webState.graph.setData({
+      nodes: nodes.filter((node) => linked.has(node.id)),
+      edges,
+    });
   }
 
   function webRenderStats() {
