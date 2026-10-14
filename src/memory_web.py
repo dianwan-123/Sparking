@@ -830,47 +830,65 @@ class MemoryWeb:
             (*args, max(20, int(limit_nodes))))
         nodes = [_node_view(row) for row in rows]
         node_ids = {node["id"] for node in nodes}
-        # 连线按"当前这批节点"取：每块先捞两端任一端命中的边，再过滤两端都在集合里，
-        # 同一对节点按出现次数聚合（sources = 有多少条来源提到这条关系）。
-        # 注意去重：跨块的一条边会被两个块各捞到一次。
-        aggregated: dict[tuple[str, str, str], dict[str, Any]] = {}
-        seen_edges: set[str] = set()
-        connected: set[str] = set()
+        # 连线按"当前这批节点"聚合：两端都在这批里的原始行做分组求和——
+        # sources = 有多少条来源提到这条关系，weight = 这些行权重之和。
+        # 必须全量分组：任何"按时间截断取样"都会漏掉较老的行，某些关系的权重
+        # 被算小甚至算没（图上就是孤立的点、连错的线）。
+        # 参数规模控制：src 分块、dst 全量——一条连线只会被它 src 所在的那一块捞到一次。
+        aggregated: list[dict[str, Any]] = []
         if node_ids:
             status_marks = ",".join("?" for _ in statuses)
-            for chunk in _chunks(list(node_ids), 200):
+            all_ids = list(node_ids)
+            dst_marks = ",".join("?" for _ in all_ids)
+            budget = max(40, 900 - len(all_ids) - len(statuses))
+            for chunk in _chunks(all_ids, min(150, budget)):
                 marks = ",".join("?" for _ in chunk)
                 edge_rows = await self.storage._fetchall(
-                    "SELECT edge_id,src_id,dst_id,relation,weight,status FROM web_edges "
-                    f"WHERE status IN ({status_marks}) AND (src_id IN ({marks}) "
-                    f"OR dst_id IN ({marks})) ORDER BY rowid DESC LIMIT ?",
-                    (*statuses, *chunk, *chunk, 6000))
+                    "SELECT src_id,dst_id,relation,SUM(weight) AS weight,"
+                    "COUNT(*) AS sources,"
+                    "MAX(CASE WHEN status='active' THEN 1 ELSE 0 END) AS has_active "
+                    f"FROM web_edges WHERE status IN ({status_marks}) "
+                    f"AND src_id IN ({marks}) AND dst_id IN ({dst_marks}) "
+                    "GROUP BY src_id,dst_id,relation",
+                    (*statuses, *chunk, *all_ids))
                 for row in edge_rows:
-                    edge_id = str(row["edge_id"])
-                    if edge_id in seen_edges:
-                        continue
-                    seen_edges.add(edge_id)
-                    src, dst = str(row["src_id"]), str(row["dst_id"])
-                    if src not in node_ids or dst not in node_ids:
-                        continue
-                    connected.add(src)
-                    connected.add(dst)
-                    key = (src, dst, str(row["relation"]))
-                    slot = aggregated.setdefault(key, {
-                        "source": src, "target": dst, "relation": str(row["relation"]),
-                        "weight": 0.0, "sources": 0, "archived": True,
+                    aggregated.append({
+                        "source": str(row["src_id"]), "target": str(row["dst_id"]),
+                        "relation": str(row["relation"]),
+                        "weight": float(row["weight"] or 0.0),
+                        "sources": int(row["sources"] or 0),
+                        "archived": not bool(row["has_active"]),
                     })
-                    slot["weight"] += float(row["weight"])
-                    slot["sources"] += 1
-                    if str(row["status"]) == "active":
-                        slot["archived"] = False
-        # 这批节点里"一个连线都没有"的孤立点不画：满屏孤零零的圆点看着像"没连上"。
-        # （用原始扫描的 connected 判断，不受 limit_edges 截断影响。）
-        if connected:
-            nodes = [node for node in nodes if node["id"] in connected]
-        edges = sorted(aggregated.values(),
-                       key=lambda item: (item["weight"], item["sources"]),
-                       reverse=True)[:max(50, int(limit_edges))]
+        # 截断到 limit_edges：先按权重顺序给"还没连上"的节点各留一条线，再用剩下的
+        # 名额按权重补满——图里不会出现孤零零的圆点（名额实在不够时宁可少画节点）。
+        ordered = sorted(aggregated,
+                         key=lambda item: (item["weight"], item["sources"]),
+                         reverse=True)
+        cap = max(50, int(limit_edges))
+        edges: list[dict[str, Any]] = []
+        kept: set[int] = set()
+        seen_nodes: set[str] = set()
+        for item in ordered:
+            if len(edges) >= cap:
+                break
+            if item["source"] in seen_nodes and item["target"] in seen_nodes:
+                continue
+            edges.append(item)
+            kept.add(id(item))
+            seen_nodes.update((item["source"], item["target"]))
+        for item in ordered:
+            if len(edges) >= cap:
+                break
+            if id(item) in kept:
+                continue
+            edges.append(item)
+        edges.sort(key=lambda item: (item["weight"], item["sources"]), reverse=True)
+        # 只画"至少有一条可见连线"的节点：一个连线都没有的节点（它的邻居没进图）
+        # 散落着看像"没连上"。
+        covered = {value for item in edges
+                   for value in (item["source"], item["target"])}
+        if covered:
+            nodes = [node for node in nodes if node["id"] in covered]
         scopes = await self.storage._fetchall(
             "SELECT scope_id,conversation_id,display_name FROM scopes "
             "ORDER BY display_name LIMIT 200")
