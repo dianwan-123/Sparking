@@ -194,6 +194,13 @@ window.SparkingWeb = (() => {
         pos.y = Math.max(24, Math.min(H - 24, pos.y));
       });
       // 防重叠：半径和之内直接推开——没有这一步，节点会挤成一团看不出结构
+      resolveCollisions(0.5);
+    }
+
+    // 防重叠：半径和之内直接推开——没有这一步，节点会挤成一团看不出结构。
+    // 返回本轮推开的对数（收尾松弛用它判断还有没有重叠）。
+    function resolveCollisions(strength) {
+      const nodes = data.nodes || [];
       const gcell = 170;
       const g2 = new Map();
       const key2 = (x, y) => Math.round(x / gcell) + "|" + Math.round(y / gcell);
@@ -204,6 +211,7 @@ window.SparkingWeb = (() => {
         if (!g2.has(key)) g2.set(key, []);
         g2.get(key).push(node);
       });
+      let pushed = 0;
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
         if (!pos) return;
@@ -223,14 +231,30 @@ window.SparkingWeb = (() => {
               const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
               const minimum = r1 + radiusOf(other) + 6;
               if (distance >= minimum) return;
-              const push = (minimum - distance) * 0.5;
+              const push = (minimum - distance) * strength;
               const ux = dx / distance, uy = dy / distance;
               pos.x -= ux * push; pos.y -= uy * push;
               target.x += ux * push; target.y += uy * push;
+              pushed += 1;
             });
           }
         }
       });
+      return pushed;
+    }
+
+    // 收尾去重叠：动画停稳后做几轮"只推开、不加力"的松弛——弹簧挤压下
+    // 残留的顽固重叠（挤成一团的观感来源）在这里彻底解开，且不越出画布。
+    function relaxCollisions() {
+      for (let round = 0; round < 90; round += 1) {
+        if (!resolveCollisions(0.6)) break;
+        (data.nodes || []).forEach((node) => {
+          const pos = positions.get(node.id);
+          if (!pos) return;
+          pos.x = Math.max(24, Math.min(W - 24, pos.x));
+          pos.y = Math.max(24, Math.min(H - 24, pos.y));
+        });
+      }
     }
 
     function toScreen(point) {
@@ -354,6 +378,7 @@ window.SparkingWeb = (() => {
         const batch = Math.min(14, running);
         for (let i = 0; i < batch; i += 1) step();
         running -= batch;
+        if (running <= 0) relaxCollisions();
         render();
         if (running > 0) raf = requestAnimationFrame(loop);
       };
@@ -549,7 +574,7 @@ window.SparkingWeb = (() => {
         data = { nodes: nextNodes, edges: nextEdges };
         const alive = new Set(nextNodes.map((node) => node.id));
         Array.from(selection).forEach((id) => { if (!alive.has(id)) selection.delete(id); });
-        schedule(260);
+        schedule(420);
       },
       setSelection(ids) {
         selection.clear();
