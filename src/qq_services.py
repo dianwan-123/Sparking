@@ -290,19 +290,23 @@ class QzoneService:
             payload = {"hostUin": session["uin"], "uin": session["uin"], "g_tk": session["g_tk"], **data}
             return await self._poster(path, session["cookie"], payload)
 
-    async def friend_feeds(self, count: int = 10, page: int = 1) -> dict[str, Any]:
+    async def friend_feeds(self, count: int = 10, page: int = 1,
+                           cursor: str = "") -> dict[str, Any]:
         """好友动态（`get_qzone_feeds`）：返回 feeds[]，每项含作者 uin/昵称/时间/key/html。
 
         注意：`key` 是 Qzone 的 feed 句柄，**不是 tid**——要对某条说说点赞/评论，
         得先 `friend_posts(uin)` 拿那条说说的 tid。这里把 html 去掉（太长），
         并把时间换算成可读文本，方便模型判断"这条是不是新的"。
+        深翻页用 `cursor`（上一次返回的 next_cursor 原样传回），比硬翻页码可靠。
         """
-        payload = await self.gateway.execute(
-            "get_qzone_feeds", page_num=max(1, int(page)),
-            count=min(max(int(count), 1), 20))
+        params: dict[str, Any] = {"page_num": max(1, int(page)),
+                                  "count": min(max(int(count), 1), 20)}
+        if str(cursor or "").strip():
+            params["cursor"] = str(cursor).strip()
+        payload = await self.gateway.execute("get_qzone_feeds", **params)
         data = payload.get("data", payload) if isinstance(payload, dict) else payload
         if not isinstance(data, dict):
-            return {"feeds": [], "has_more": False}
+            return {"feeds": [], "has_more": False, "next_cursor": ""}
         feeds = []
         for item in (data.get("feeds") or []):
             if not isinstance(item, dict):
@@ -315,7 +319,8 @@ class QzoneService:
                 "key": str(item.get("key") or "")[:200],
                 "is_taotao": int(item.get("appid") or 0) == 311,
             })
-        return {"feeds": feeds, "has_more": bool(data.get("has_more"))}
+        return {"feeds": feeds, "has_more": bool(data.get("has_more")),
+                "next_cursor": str(data.get("next_cursor") or "")}
 
     async def friend_posts(self, uin: str | int, count: int = 10,
                            pos: int = 0) -> list[dict[str, Any]]:
@@ -350,13 +355,72 @@ class QzoneService:
             pass
         return _json_safe(await self.gateway.execute("like_qzone", **params))
 
-    async def comment_friend_post(self, uin: str | int, tid: str, content: str) -> Any:
-        """评论**好友**的说说（要 tid + target_uin + content）。"""
+    async def comment_friend_post(self, uin: str | int, tid: str, content: str,
+                                  comment_id: str = "", comment_uin: int | str = 0,
+                                  reply_uin: int | str = 0,
+                                  reply_name: str = "") -> Any:
+        """评论**好友**的说说（要 tid + target_uin + content）。
+
+        带 `comment_id`+`comment_uin`（一级父评论的 ID 与作者）时变成**回复该评论**；
+        再带 `reply_uin`+`reply_name` 则精确到**楼中楼里的某个人**。楼中楼仅支持文字。
+        """
         text = str(content or "").strip()
         if not text or len(text) > 500:
             raise QzoneError("评论要 1-500 字")
-        return _json_safe(await self.gateway.execute(
-            "comment_qzone", tid=str(tid), content=text, target_uin=int(uin)))
+        params: dict[str, Any] = {"tid": str(tid), "content": text,
+                                  "target_uin": int(uin)}
+        parent_id = str(comment_id or "").strip()
+        parent_uin = int(comment_uin or 0)
+        if bool(parent_id) != bool(parent_uin):
+            raise QzoneError("回复评论要同时给 comment_id 和 comment_uin（一级父评论）")
+        if parent_id:
+            params["comment_id"] = parent_id
+            params["comment_uin"] = parent_uin
+            target_uin = int(reply_uin or 0)
+            target_name = str(reply_name or "").strip()
+            if bool(target_uin) != bool(target_name):
+                raise QzoneError("楼中楼回复要同时给 reply_uin 和 reply_name")
+            if target_uin:
+                params["reply_uin"] = target_uin
+                params["reply_name"] = target_name
+        return _json_safe(await self.gateway.execute("comment_qzone", **params))
+
+    async def msg_detail(self, tid: str, target_uin: int | str | None = None,
+                         pos: int = 0, num: int = 20) -> dict[str, Any]:
+        """说说详情与一页评论（`get_qzone_msg_detail`）——楼中楼回复的参数从这里拿。
+
+        返回说说的正文/时间/统计与评论列表；每条评论带 id（comment_id）、
+        uin（comment_uin）与 name（reply_name 的来源）。replies 只有服务端
+        内联返回的二级回复，不保证完整。
+        """
+        params: dict[str, Any] = {"tid": str(tid), "pos": max(0, int(pos)),
+                                  "num": min(max(int(num), 1), 20)}
+        if target_uin is not None and int(target_uin) > 0:
+            params["target_uin"] = int(target_uin)
+        payload = await self.gateway.execute("get_qzone_msg_detail", **params)
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            return {"comments": [], "total": 0}
+        comments = []
+        rows = (data.get("comments") or data.get("commentlist")
+                or data.get("comment_list") or [])
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            comments.append({
+                "id": str(item.get("id") or item.get("comment_id") or ""),
+                "uin": item.get("uin") or item.get("comment_uin"),
+                "name": str(item.get("name") or item.get("nickname") or "")[:40],
+                "content": str(item.get("content") or "")[:200],
+                "time": item.get("time") or item.get("create_time"),
+                "replies": item.get("replies") or [],
+            })
+        return {"tid": str(tid),
+                "content": str(data.get("content") or data.get("message") or "")[:400],
+                "time": data.get("created_time") or data.get("time"),
+                "total": data.get("total") or data.get("comment_count"),
+                "comments": comments,
+                "has_more": bool(data.get("has_more"))}
 
     async def list_feeds(self, count: int = 10, uin: str | None = None) -> Any:
         try:

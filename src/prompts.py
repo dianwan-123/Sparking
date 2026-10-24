@@ -205,6 +205,9 @@ dispatch_parallel_subagents(tasks_json)（并行派最多4个只读子agent，�
 kb_search(query,kb_id,limit)（查 AstrBot 知识库）、kb_list()、
 extension_call(extension,tool,args_json)（调用已装拓展）、
 qzone_publish(text)、qzone_list(count)、
+qzone_friend_feeds(count,page,cursor)（看好友动态，next_cursor 可深翻页）、
+qzone_friend_posts(uin,count)（某人说说列表，拿 tid）、qzone_msg_detail(tid,uin)（看一条说说的评论，楼中楼回复的参数从这拿）、
+qzone_like_friend(uin,tid,created_time)、qzone_comment_friend(uin,tid,content,comment_id,comment_uin,reply_uin,reply_name)（评论说说或回复某条评论/楼中楼）、
 qzone_like(unikey,curkey,owner_uin)、qzone_comment(topic_id,content)、
 qq_send_group(group_id,text)、qq_send_private(user_id,text)、
 qq_set_profile(nickname,longnick)、qq_set_status(status)、qq_set_avatar(media_id)、

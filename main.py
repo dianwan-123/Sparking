@@ -279,7 +279,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -3128,8 +3128,9 @@ class LongMemoryAgentPlugin(Star):
         """把模型自拼的节点数组解析成内部节点结构。
 
         形如 ``[{"name": "长公主", "uin": "364962863", "text": "原话"}]``；
-        也可以给 ``segments`` 直接放 OneBot 段数组。署名按"名字(QQ号)"拼
-        （需要的"包含qq号和名字"就是这种客户端里能一眼看到的形式），
+        也可以给 ``segments`` 直接放 OneBot 段数组；节点带 ``reply``（一句话）时，
+        这条在合并转发里带一条自定义引用预览（SnowLuma 的 reply.data.message）。
+        署名按"名字(QQ号)"拼（需要的"包含qq号和名字"就是这种客户端里能一眼看到的形式），
         name/uin 缺一个就用另一个。
         """
         text = str(raw or "").strip()
@@ -3151,8 +3152,12 @@ class LongMemoryAgentPlugin(Star):
                 if not body:
                     continue
                 segments = [{"type": "text", "data": {"text": body}}]
-            nodes.append({"uin": uin, "name": label,
-                          "segments": [dict(s) for s in segments if isinstance(s, Mapping)]})
+            node = {"uin": uin, "name": label,
+                    "segments": [dict(s) for s in segments if isinstance(s, Mapping)]}
+            reply = str(item.get("reply") or item.get("reply_text") or "").strip()
+            if reply:
+                node["reply"] = reply[:200]
+            nodes.append(node)
         return nodes
 
     async def _inline_media_segment(self, segment: dict[str, Any]) -> dict[str, Any]:
@@ -3309,6 +3314,10 @@ class LongMemoryAgentPlugin(Star):
                     segments.append(dict(segment))
             if not segments:
                 segments = [{"type": "text", "data": {"text": "[空消息]"}}]
+            reply = str(item.get("reply") or "").strip()
+            if reply:
+                # 自定义引用预览：reply.data.message 直接给一段文字（SnowLuma 1.14.21+）
+                segments = [{"type": "reply", "data": {"message": reply[:200]}}] + segments
             nodes.append({"type": "node", "data": {
                 "user_id": str(item.get("uin") or "10000"),
                 "nickname": self._clean_forward_name(item.get("name")) or "群友",
@@ -3335,6 +3344,8 @@ class LongMemoryAgentPlugin(Star):
             nodes_json(string): 自拼节点数组 JSON，如
                 [{"name": "长公主", "uin": "364962863", "text": "不是我这bug怎么这么多"}]
                 （name/uin 会被拼成发送者署名"长公主(364962863)"）。
+                节点可多给一个 "reply": "被引用的原话"——这条在合并记录里会带一条
+                自定义引用预览（像"回复了某人的一句话"），适合还原"某人回复某条"的场景。
             target_group_id(string): 目标群号（留空=当前会话）。
             target_user_id(string): 目标 QQ（与群号二选一）。
             summary(string): 外层摘要，留空自动取第一条内容。
@@ -9419,7 +9430,7 @@ class LongMemoryAgentPlugin(Star):
                                  answer: str = ""):
         """关于"加入群聊"的**能力说明**（先读这里，别硬试）。
 
-        SnowLuma / OneBot 的 193 个动作里**没有"主动加群"这个接口**——
+        SnowLuma / OneBot 的动作表里**没有"主动加群"这个接口**——
         只有：`set_group_add_option`（设置本群的加群选项）、
         `set_group_add_request`（处理**别人**发给你的加群请求/邀请，见 qq_handle_group_invite）、
         `get_group_ignore_add_request`（看被忽略的入群请求）。
@@ -9435,7 +9446,7 @@ class LongMemoryAgentPlugin(Star):
         """
         return compact_json({
             "can_join_proactively": False,
-            "reason": ("SnowLuma/OneBot 没有提供「主动加群」的动作（已核对 193 个动作与 openapi）；"
+            "reason": ("SnowLuma/OneBot 没有提供「主动加群」的动作（已核对动作表与 openapi）；"
                        "协议层只能处理别人发来的邀请/申请。"),
             "what_you_can_do": [
                 "别人邀请你进群 → qq_handle_group_invite(flag, approve=true)（同意）",
@@ -9659,7 +9670,7 @@ class LongMemoryAgentPlugin(Star):
     @filter.llm_tool(name="napcat_catalog")
     async def napcat_catalog_tool(self, event: AstrMessageEvent, category: str = "",
                                   action: str = ""):
-        """查阅 QQ 动作表（193 个 OneBot/SnowLuma 动作，含中文说明与参数 schema）。
+        """查阅 QQ 动作表（OneBot/SnowLuma 全量动作，含中文说明与参数 schema）。
         两种用法：给 category 列出一类动作；给 action 查这一个动作的完整参数说明。
         拿不准参数名时先查这里，再 napcat_call。
 
@@ -9708,7 +9719,7 @@ class LongMemoryAgentPlugin(Star):
     @filter.llm_tool(name="napcat_call")
     async def napcat_call_tool(self, event: AstrMessageEvent, action: str = "",
                                params_json: str = "{}"):
-        """调用任意 QQ 动作（OneBot/SnowLuma 全量 193 个，先用 napcat_catalog 查参数表）。
+        """调用任意 QQ 动作（OneBot/SnowLuma 全量动作表，先用 napcat_catalog 查参数表）。
         参数名必须用动作表里的名字；数字/布尔写成字符串也会被自动转换。
 
         Args:
@@ -9828,7 +9839,8 @@ class LongMemoryAgentPlugin(Star):
         收藏表情：fetch_custom_face(看库存)、add_custom_face(加)、delete_custom_face(删)、
           modify_custom_face(改备注)、move_custom_face_to_front、send_custom_face(发出去)
         表情回应：get_msg_emoji_likes、set_msg_emoji_like、fetch_emoji_like
-        群内扩展：get_group_detail_info、get_group_msg_history、get_group_shut_list(禁言名单)、
+        群内扩展：get_group_detail_info、get_group_share_link(群分享/邀请链接)、
+          get_group_msg_history、get_group_shut_list(禁言名单)、
           get_group_signed_list(打卡名单)、set_essence_msg / delete_essence_msg /
           get_essence_msg_list(精华消息)、set_group_todo / get_group_todo_list /
           complete_group_todo / cancel_group_todo(群待办)、set_group_reaction、
@@ -11128,20 +11140,24 @@ class LongMemoryAgentPlugin(Star):
 
     @filter.llm_tool(name="qzone_friend_feeds")
     async def qzone_friend_feeds_tool(self, event: AstrMessageEvent, count: int = 10,
-                                      page: int = 1):
+                                      page: int = 1, cursor: str = ""):
         """看**好友空间动态**（谁发了什么）——逛空间从这里开始。
 
         返回每位作者的 QQ 号/昵称/时间/key（key 只是 feed 句柄）。
-        想对某条**说说**点赞或评论，要先 qzone_friend_posts(uin) 拿到那条的 tid。
+        想对某条**说说**点赞或评论，要先 qzone_friend_posts(uin) 拿到那条的 tid；
+        想看某条的评论（楼中楼回复要用）用 qzone_msg_detail(tid)。
+        深翻页：把上一次结果里的 next_cursor 原样传给 cursor，比翻页码可靠。
 
         Args:
             count(number): 本页条数，默认 10（最大 20）。
-            page(number): 页码，默认 1（只有首页可靠）。
+            page(number): 页码，默认 1。
+            cursor(string): 上一次返回的 next_cursor；给了它就以它为准。
         """
         self._require_qzone(event)
         return compact_json(
             await self.qzone.friend_feeds(count=min(max(int(count), 1), 20),
-                                          page=max(1, int(page))), 12000)
+                                          page=max(1, int(page)),
+                                          cursor=str(cursor or "")), 12000)
 
     @filter.llm_tool(name="qzone_friend_posts")
     async def qzone_friend_posts_tool(self, event: AstrMessageEvent, uin: str,
@@ -11155,7 +11171,32 @@ class LongMemoryAgentPlugin(Star):
         self._require_qzone(event)
         posts = await self.qzone.friend_posts(uin, count=min(max(int(count), 1), 20))
         return compact_json({"uin": str(uin), "posts": posts,
-                             "hint": "对某条点赞用 qzone_like_friend(uin,tid)；评论用 qzone_comment_friend"}, 10000)
+                             "hint": "对某条点赞用 qzone_like_friend(uin,tid)；评论用 qzone_comment_friend；"
+                                     "看某条的评论用 qzone_msg_detail(tid)"}, 10000)
+
+    @filter.llm_tool(name="qzone_msg_detail")
+    async def qzone_msg_detail_tool(self, event: AstrMessageEvent, tid: str,
+                                    uin: str = "", pos: int = 0, num: int = 20):
+        """看**一条说说**的详情与评论列表（楼中楼回复的参数从这里拿）。
+
+        返回说说正文/时间/统计与一页评论；每条评论带 id、uin、name——
+        回复某条评论就把它的 id+uin 当 comment_id+comment_uin 传给 qzone_comment_friend，
+        要精确到楼中楼里的某人再加 reply_uin+reply_name。
+
+        Args:
+            tid(string): 说说 tid（qzone_friend_posts / qzone_list 结果里拿）。
+            uin(string): 说说所属 QQ 号；留空=自己空间的说说。
+            pos(number): 一级评论起始偏移，默认 0。
+            num(number): 本页一级评论条数，默认 20。
+        """
+        self._require_qzone(event)
+        detail = await self.qzone.msg_detail(
+            tid, target_uin=int(uin) if str(uin or "").strip().isdigit() else None,
+            pos=max(0, int(pos)), num=min(max(int(num), 1), 20))
+        return compact_json(
+            {**detail,
+             "hint": "回复某条评论：qzone_comment_friend(uin,tid,content,comment_id,comment_uin)，"
+                     "楼中楼再加 reply_uin/reply_name（取自评论的 uin/name）"}, 12000)
 
     @filter.llm_tool(name="qzone_like_friend")
     async def qzone_like_friend_tool(self, event: AstrMessageEvent, uin: str,
@@ -11175,16 +11216,32 @@ class LongMemoryAgentPlugin(Star):
 
     @filter.llm_tool(name="qzone_comment_friend")
     async def qzone_comment_friend_tool(self, event: AstrMessageEvent, uin: str,
-                                        tid: str, content: str):
-        """评论**好友**的说说（tid 从 qzone_friend_posts 拿）。
+                                        tid: str, content: str,
+                                        comment_id: str = "", comment_uin: str = "",
+                                        reply_uin: str = "", reply_name: str = ""):
+        """评论**好友**的说说（tid 从 qzone_friend_posts 拿）；也能回复某条评论。
+
+        普通评论只给 uin/tid/content。要回复某条评论（楼中楼）：
+        先 qzone_msg_detail(tid) 拿那条评论的 id/uin/name，然后
+        comment_id+comment_uin 填它；要精确到楼中楼里的某人，
+        再加 reply_uin+reply_name（也来自评论详情）。楼中楼仅支持文字。
 
         Args:
             uin(string): 说说所属好友 QQ 号。
             tid(string): 说说 tid。
             content(string): 评论内容，1-500 字（像真人说话，别客服腔）。
+            comment_id(string): 要回复的一级评论 ID（来自 qzone_msg_detail）；普通评论留空。
+            comment_uin(string): 那条一级评论作者的 QQ 号；与 comment_id 一起填。
+            reply_uin(string): 楼中楼里要回复的用户 QQ 号；需先给 comment_id。
+            reply_name(string): 要回复的用户昵称（评论详情里的 name）；与 reply_uin 一起填。
         """
         self._require_qzone(event)
-        result = await self.qzone.comment_friend_post(uin, tid, content)
+        result = await self.qzone.comment_friend_post(
+            uin, tid, content,
+            comment_id=str(comment_id or "").strip(),
+            comment_uin=str(comment_uin or "").strip(),
+            reply_uin=str(reply_uin or "").strip(),
+            reply_name=str(reply_name or "").strip())
         return compact_json({"ok": True, "result": result, "uin": str(uin),
                              "tid": str(tid)}, 2000)
 

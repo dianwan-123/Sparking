@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.1.1-orange.svg" alt="v1.1.1">
+  <img src="https://img.shields.io/badge/version-v1.1.2-orange.svg" alt="v1.1.2">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -279,7 +279,7 @@ QQ 只在服务端缓存转发资源一小段时间。Sparking 在**消息到达
 <details>
 <summary><b>能让它主动加群吗</b></summary>
 
-不能——QQ 协议层没有「主动加群」这个接口（已核对 SnowLuma 的全部 193 个动作与 openapi）。
+不能——QQ 协议层没有「主动加群」这个接口（已核对 SnowLuma 动作表与 openapi）。
 它能做的是：处理别人发来的**群邀请**与**入群申请**（默认同意），以及查看群资料。
 想让它进某个群，请群管理员邀请它，或自己手动拉它进去。
 </details>

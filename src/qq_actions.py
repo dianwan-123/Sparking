@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """SnowLuma / OneBot v11 全量动作表（由 tools/gen_qq_actions.py 生成，勿手改）。
 
-来源：SnowLuma 文档站 catalog.json，共 198 个动作。
+来源：SnowLuma 文档站 catalog.json，共 200 个动作。
 每个动作带：分类、中文说明、只读标记、风险级别、参数表（含类型/必填/默认/说明）。
 """
 from __future__ import annotations
@@ -100,7 +100,7 @@ _register(QQAction(
     category='信息',
     read_only=True,
     risk='read',
-    returns='运行状态。`online` 表示账号在线；`good` 表示已确认的收发链路健康状态。',
+    returns='运行状态。`online` 表示账号在线；`good` 表示已确认的收发链路健康状态；`time` 为当前账号服务实例运行秒数，与 #sl 同源。',
 ))
 _register(QQAction(
     name='get_version_info',
@@ -138,7 +138,7 @@ _register(QQAction(
     params=(
         QQParam(name='user_id', type='uint', required=True, desc='QQ 号', default=None, role='user_id'),
     ),
-    returns='用户资料：QQ 号、昵称、好友备注、性别、年龄与个性签名，命中资料时另含等级、企点标志与企业名称。',
+    returns='用户资料，含账号标识、等级别名和可用的注册时间、会员信息。注册时间或会员信息未返回时省略对应字段；登录天数暂无可靠来源，不返回占位值。',
 ))
 _register(QQAction(
     name='.get_word_slices',
@@ -179,7 +179,7 @@ _register(QQAction(
     params=(
         QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
     ),
-    returns='普通公告与新成员公告的合并数组；send_to_new_members 标识后者',
+    returns='普通公告与新成员公告的合并数组；send_to_new_members 标识后者；图片含 id、url、宽高',
 ))
 _register(QQAction(
     name='_get_model_show',
@@ -634,7 +634,7 @@ _register(QQAction(
         QQParam(name='id', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='message_id', type='string', required=False, desc='', default=None, role=''),
     ),
-    returns='{ messages }：转发内的消息节点数组（每项为 OneBot 消息事件，内部字段不固定）。',
+    returns='{ messages }：转发内的消息节点数组（每项为 OneBot 消息事件）；reply 保留 id，有内嵌引用内容时附带 message 和可用的 qq/time/seq，可作为转发节点 content 再次发送。',
 ))
 _register(QQAction(
     name='get_friend_msg_history',
@@ -848,6 +848,7 @@ _register(QQAction(
         QQParam(name='file_id', type='string', required=False, desc='', default='', role='file_id'),
         QQParam(name='out_format', type='enum', required=False, desc='', default=None, role=''),
     ),
+    returns='语音信息（file/url 为向 QQ 获取的当前下载地址）；资源元数据缺失或远端获取失败时返回错误。out_format 指定时附带转码后的 base64。',
 ))
 _register(QQAction(
     name='get_rkey',
@@ -1039,8 +1040,8 @@ _register(QQAction(
     read_only=False,
     risk='send',
     params=(
-        QQParam(name='messages', type='message', required=False, desc='', default=None, role=''),
-        QQParam(name='message', type='message', required=False, desc='', default=None, role=''),
+        QQParam(name='messages', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
+        QQParam(name='message', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
         QQParam(name='message_type', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='group_id', type='int', required=False, desc='', default=None, role=''),
         QQParam(name='user_id', type='int', required=False, desc='', default=None, role=''),
@@ -1084,8 +1085,8 @@ _register(QQAction(
     risk='send',
     params=(
         QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
-        QQParam(name='messages', type='message', required=False, desc='', default=None, role=''),
-        QQParam(name='message', type='message', required=False, desc='', default=None, role=''),
+        QQParam(name='messages', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
+        QQParam(name='message', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
         QQParam(name='source', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='summary', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='prompt', type='string', required=False, desc='', default=None, role=''),
@@ -1136,8 +1137,8 @@ _register(QQAction(
     risk='send',
     params=(
         QQParam(name='user_id', type='uint', required=True, desc='', default=None, role='user_id'),
-        QQParam(name='messages', type='message', required=False, desc='', default=None, role=''),
-        QQParam(name='message', type='message', required=False, desc='', default=None, role=''),
+        QQParam(name='messages', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
+        QQParam(name='message', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
         QQParam(name='source', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='summary', type='string', required=False, desc='', default=None, role=''),
         QQParam(name='prompt', type='string', required=False, desc='', default=None, role=''),
@@ -1407,8 +1408,8 @@ _register(QQAction(
     read_only=False,
     risk='send',
     params=(
-        QQParam(name='messages', type='message', required=False, desc='', default=None, role=''),
-        QQParam(name='message', type='message', required=False, desc='', default=None, role=''),
+        QQParam(name='messages', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
+        QQParam(name='message', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
         QQParam(name='group_id', type='uint', required=False, desc='', default=None, role='group_id'),
     ),
 ))
@@ -1419,8 +1420,8 @@ _register(QQAction(
     read_only=False,
     risk='send',
     params=(
-        QQParam(name='messages', type='message', required=False, desc='', default=None, role=''),
-        QQParam(name='message', type='message', required=False, desc='', default=None, role=''),
+        QQParam(name='messages', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
+        QQParam(name='message', type='message', required=False, desc='转发节点数组；节点 content 内的 reply.data.message 可提供自定义引用内容（字符串或消息段），qq/time/seq 可选；仅用于转发内引用预览。', default=None, role=''),
         QQParam(name='group_id', type='uint', required=False, desc='', default=None, role='group_id'),
     ),
 ))
@@ -1522,7 +1523,7 @@ _register(QQAction(
     params=(
         QQParam(name='message_id', type='messageId', required=True, desc='', default=None, role='message_id'),
     ),
-    returns='消息事件对象（首次收到时存储的副本，已去除 post_type/self_id、附带 real_id 字段并刷新图片 URL）。',
+    returns='消息事件对象（去除 post_type/self_id，附带 real_id）；逐个尝试刷新图片、语音和视频 URL，成功使用新地址，失败保留该段原地址并继续返回消息；地址更新时同步 raw_message。',
 ))
 _register(QQAction(
     name='send_custom_face',
@@ -1531,12 +1532,12 @@ _register(QQAction(
     read_only=False,
     risk='social',
     params=(
-        QQParam(name='emoji_id', type='string', required=True, desc='收藏表情的完整 ID 或 32 位 MD5', default=None, role=''),
+        QQParam(name='emoji_id', type='string', required=True, desc='当前账号收藏表情的完整 ID 或 32 位 MD5', default=None, role=''),
         QQParam(name='group_id', type='uint', required=False, desc='目标群号；与 user_id 二选一', default=None, role='group_id'),
-        QQParam(name='user_id', type='uint', required=False, desc='目标 QQ 号；与 group_id 二选一', default=None, role='member_id'),
-        QQParam(name='reply_to', type='messageId', required=False, desc='可选回复消息 ID', default=None, role=''),
+        QQParam(name='user_id', type='uint', required=False, desc='目标 QQ 号；与 group_id 二选一', default=None, role='user_id'),
+        QQParam(name='reply_to', type='messageId', required=False, desc='可选回复消息 ID', default=None, role='message_id'),
     ),
-    returns='{ message_id }',
+    returns='{ message_id: number }',
 ))
 _register(QQAction(
     name='send_group_msg',
@@ -1582,7 +1583,7 @@ _register(QQAction(
 ))
 _register(QQAction(
     name='comment_qzone',
-    summary='评论一条说说（QQ 空间，支持纯文字或带图；传 images 自动上传）',
+    summary='评论说说或回复指定评论（普通评论支持带图，楼中楼仅支持文字）',
     category='空间',
     read_only=False,
     risk='social',
@@ -1590,8 +1591,13 @@ _register(QQAction(
         QQParam(name='tid', type='string', required=True, desc='说说 tid', default=None, role=''),
         QQParam(name='content', type='string', required=True, desc='评论内容', default=None, role=''),
         QQParam(name='target_uin', type='uint', required=False, desc='说说所属 QQ 号，省略则为机器人自己', default=None, role='user_id'),
+        QQParam(name='comment_id', type='string', required=False, desc='一级父评论 ID，与 comment_uin 同时提供；编号 0 有效，不能传二级回复自身的 ID', default=None, role=''),
+        QQParam(name='comment_uin', type='uint', required=False, desc='一级父评论作者 QQ 号，与 comment_id 同时提供；不是说说所属账号', default=None, role='user_id'),
+        QQParam(name='reply_uin', type='uint', required=False, desc='楼中楼中要回复的用户 QQ 号，与 reply_name 同时提供，需指定父评论', default=None, role='user_id'),
+        QQParam(name='reply_name', type='string', required=False, desc='要回复的用户昵称，来自评论详情的 name；与 reply_uin 同时提供', default=None, role=''),
         QQParam(name='images', type='string[]', required=False, desc='图片数组（可选），支持 file:// http:// base64://；自动上传', default=None, role=''),
     ),
+    invariants=('all or none of: comment_id, comment_uin', 'all or none of: reply_uin, reply_name', 'reply_uin/reply_name require comment_id/comment_uin', 'images are not supported for comment replies', 'comment_id, reply_name and reply content must not be blank', 'comment_uin and reply_uin must be safe integers',),
 ))
 _register(QQAction(
     name='delete_qzone_msg',
@@ -1605,15 +1611,30 @@ _register(QQAction(
 ))
 _register(QQAction(
     name='get_qzone_feeds',
-    summary='获取 QQ 空间好友动态（feed）；page_num 仅首页可靠，深翻页需时间游标（暂未实现）',
+    summary='获取 QQ 空间好友动态，支持结构化正文与游标分页',
     category='空间',
     read_only=True,
     risk='read',
     params=(
-        QQParam(name='page_num', type='int', required=False, desc='页码（1 起；仅首页可靠）', default=1, role=''),
+        QQParam(name='page_num', type='int', required=False, desc='页码（1 起）；不传 cursor 时从首页顺序定位，较深页可能耗时较长', default=1, role=''),
         QQParam(name='count', type='int', required=False, desc='本页数量', default=10, role=''),
+        QQParam(name='cursor', type='string', required=False, desc='上一次返回的 next_cursor；原样传递，省略 page_num 或传入对应页码', default=None, role=''),
     ),
-    returns='好友动态对象，含本页 feed 数组与是否有更多页。',
+    returns='好友动态、可提取的正文与图片、统计值及下一页游标；未知内容或统计为 null，HTML 保留。',
+))
+_register(QQAction(
+    name='get_qzone_msg_detail',
+    summary='获取 QQ 空间说说详情与一页评论（含服务端内联回复，需有访问权限）',
+    category='空间',
+    read_only=True,
+    risk='read',
+    params=(
+        QQParam(name='tid', type='string', required=True, desc='说说 tid（来自 get_qzone_msg_list / send_qzone_msg）', default=None, role=''),
+        QQParam(name='target_uin', type='uint', required=False, desc='说说所属 QQ 号，省略则取机器人自己', default=None, role='user_id'),
+        QQParam(name='pos', type='int', required=False, desc='一级评论起始偏移', default=0, role=''),
+        QQParam(name='num', type='int', required=False, desc='请求的一级评论数量，实际数量受服务端限制', default=20, role=''),
+    ),
+    returns='说说详情、服务端报告的评论总数与本页评论；replies 仅含服务端内联返回的二级回复，不保证完整。',
 ))
 _register(QQAction(
     name='get_qzone_msg_list',
@@ -1795,6 +1816,20 @@ _register(QQAction(
         QQParam(name='no_cache', type='bool', required=False, desc='', default=False, role=''),
     ),
     returns='群成员信息对象数组。',
+))
+_register(QQAction(
+    name='get_group_share_link',
+    summary='获取群分享链接',
+    category='群信息',
+    read_only=True,
+    risk='read',
+    params=(
+        QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
+        QQParam(name='need_short_url', type='bool', required=False, desc='是否获取短链接', default=True, role=''),
+        QQParam(name='src_id', type='int', required=False, desc='来源标识（兼容参数）', default=73, role=''),
+        QQParam(name='additional_param', type='string', required=False, desc='附加参数', default='', role=''),
+    ),
+    returns='用于分享或邀请加群的链接，可作为群二维码内容。',
 ))
 _register(QQAction(
     name='get_group_system_msg',
@@ -2073,9 +2108,9 @@ _register(QQAction(
         QQParam(name='group_id', type='uint', required=True, desc='群号', default=None, role='group_id'),
         QQParam(name='album_id', type='string', required=True, desc='相册 id', default=None, role=''),
         QQParam(name='album_name', type='string', required=True, desc='相册名称', default=None, role=''),
-        QQParam(name='file', type='string', required=True, desc='视频文件', default=None, role=''),
+        QQParam(name='file', type='string', required=True, desc='视频文件', default=None, role='video'),
     ),
-    returns='{ id }',
+    returns='{ id: string }',
 ))
 _register(QQAction(
     name='add_group_tag',
