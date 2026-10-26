@@ -73,6 +73,9 @@ class PluginConfig:
     max_sequence_segments: int
     sequence_char_limit: int
     typing_chars_per_second: float
+    max_typing_delay_seconds: float
+    inter_segment_delay_seconds: float
+    max_sequences_per_hour: int
     media_max_file_mb: int
     media_total_mb: int
     web_fetch_max_mb: int
@@ -159,7 +162,7 @@ class PluginConfig:
             wake_merge_max_seconds=wake_merge_max,
             group_cooldown_seconds=_int(d.get("group_cooldown_seconds"), 180, 0, 86400),
             user_cooldown_seconds=_int(d.get("user_cooldown_seconds"), 300, 0, 86400),
-            max_actions_per_hour=_int(d.get("max_actions_per_hour"), 8, 1, 100),
+            max_actions_per_hour=_int(d.get("max_actions_per_hour"), 8, 1, 10000),
             max_random_wait_seconds=_int(d.get("max_random_wait_seconds"), 15, 0, 120),
             quiet_start_hour=_int(d.get("quiet_start_hour"), 1, 0, 23),
             quiet_end_hour=_int(d.get("quiet_end_hour"), 7, 0, 23),
@@ -182,6 +185,9 @@ class PluginConfig:
             max_sequence_segments=_int(d.get("max_sequence_segments"), 5, 1, 5),
             sequence_char_limit=_int(d.get("sequence_char_limit"), 2000, 100, 8000),
             typing_chars_per_second=_float(d.get("typing_chars_per_second"), 8.0, 1.0, 60.0),
+            max_typing_delay_seconds=_float(d.get("max_typing_delay_seconds"), 8.0, 0.0, 60.0),
+            inter_segment_delay_seconds=_float(d.get("inter_segment_delay_seconds"), 0.4, 0.0, 10.0),
+            max_sequences_per_hour=_int(d.get("max_sequences_per_hour"), 120, 1, 10000),
             media_max_file_mb=_int(d.get("media_max_file_mb"), 15, 1, 200),
             media_total_mb=_int(d.get("media_total_mb"), 1024, 16, 51200),
             web_fetch_max_mb=_int(d.get("web_fetch_max_mb"), 5, 1, 50),

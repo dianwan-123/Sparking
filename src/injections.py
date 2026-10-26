@@ -8,8 +8,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from .prompts import PERSONA_DEFAULT
+
+# 拟人提示词那条注入的固定 id（渲染时跳过，改由 reply_system_prompt 拼进系统提示词）
+PERSONA_ID = "persona.language"
+
 # id 稳定不变（用于去重/升级），中文名给人看
 PRESETS: tuple[dict[str, Any], ...] = (
+    {
+        # 拟人提示词本体：改这里等于改 bot 的人设与语言铁律（控制台可编辑、不可删）。
+        # 它不进「强制注入」块——渲染时跳过，改由 reply_system_prompt() 拼进系统提示词。
+        "id": PERSONA_ID,
+        "name": "拟人·人设与语言铁律（改这里调性格/说话方式）",
+        "kind": "persona",
+        "enabled": True,
+        "content": PERSONA_DEFAULT.strip(),
+    },
     {
         "id": "short-bubbles",
         "name": "短消息拟人（每条都短）",
@@ -80,8 +94,10 @@ def preset_by_id(injection_id: str) -> dict[str, Any] | None:
 
 def render_block(rows: list[dict[str, Any]]) -> str:
     """把启用的注入渲染成系统提示里的一段（强制框架 + 逐条规则）。"""
-    enabled = [row for row in rows if bool(row.get("enabled", True))
-               and str(row.get("content", "")).strip()]
+    enabled = [row for row in rows
+               if bool(row.get("enabled", True))
+               and str(row.get("content", "")).strip()
+               and not str(row.get("injection_id", "")).startswith("persona.")]
     if not enabled:
         return ""
     lines = [BLOCK_HEADER]

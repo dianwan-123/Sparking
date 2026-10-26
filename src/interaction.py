@@ -86,6 +86,50 @@ class InteractionController:
         else:
             self._group_limit[key] = max(1, int(max_actions_per_hour))
 
+    def update_limits(self, *, group_cooldown_seconds: float | None = None,
+                      user_cooldown_seconds: float | None = None,
+                      max_actions_per_hour: int | None = None,
+                      quiet_start_hour: int | None = None,
+                      quiet_end_hour: int | None = None) -> None:
+        """热更新全局限额（面板改配置后立刻生效，不清冷却/配额计数）。
+
+        控制器是启动时按当时配置构建的单例：只换 self.settings 不会改到这里，
+        于是"把冷却改成 0、限额改成 9999 还是被限流"（已知问题）。
+        """
+        if group_cooldown_seconds is not None:
+            self.group_cooldown_seconds = max(0.0, float(group_cooldown_seconds))
+        if user_cooldown_seconds is not None:
+            self.user_cooldown_seconds = max(0.0, float(user_cooldown_seconds))
+        if max_actions_per_hour is not None:
+            self.max_actions_per_hour = max(1, int(max_actions_per_hour))
+        if quiet_start_hour is not None:
+            self.quiet_start_hour = max(0, min(23, int(quiet_start_hour)))
+        if quiet_end_hour is not None:
+            self.quiet_end_hour = max(0, min(23, int(quiet_end_hour)))
+
+    def block_reason(self, group_id: str | int, user_id: str | int,
+                     *, bypass_quiet: bool = False) -> str:
+        """这次 begin() 会被哪一条卡住（写日志用）；没有卡住返回空串。"""
+        group, user = str(group_id), str(user_id)
+        now = self._clock()
+        self._prune(now)
+        group_cooldown, user_cooldown = self._cooldown_for(group)
+        group_left = group_cooldown - (now - self._last_group.get(group, float("-inf")))
+        if group_left > 0:
+            return f"本群冷却还剩 {int(group_left) + 1}s"
+        user_left = user_cooldown - (now - self._last_user.get(user, float("-inf")))
+        if user_left > 0:
+            return f"该用户冷却还剩 {int(user_left) + 1}s"
+        if len(self._hourly) >= int(self.max_actions_per_hour):
+            return (f"全局每小时限额已满"
+                    f"（{len(self._hourly)}/{self.max_actions_per_hour}）")
+        if len(self._hourly_by_group[group]) >= self._limit_for(group):
+            return (f"本会话每小时限额已满"
+                    f"（{len(self._hourly_by_group[group])}/{self._limit_for(group)}）")
+        if not bypass_quiet and self.is_quiet():
+            return f"静默时段（{self.quiet_start_hour}-{self.quiet_end_hour} 点）"
+        return ""
+
     def _limit_for(self, group: str) -> int:
         return int(self._group_limit.get(group, self.max_actions_per_hour))
 

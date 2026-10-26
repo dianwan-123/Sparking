@@ -249,6 +249,21 @@
     "description": "拟人打字速度（字符/秒）",
     "default": 8.0
   },
+  "max_typing_delay_seconds": {
+    "type": "float",
+    "description": "单个气泡最多等多少秒（打字模拟上限；设 0 完全不模拟打字）",
+    "default": 8.0
+  },
+  "inter_segment_delay_seconds": {
+    "type": "float",
+    "description": "连发气泡之间的间隔（秒）",
+    "default": 0.4
+  },
+  "max_sequences_per_hour": {
+    "type": "int",
+    "description": "全部会话每小时最多发多少串回复（防刷屏总闸，超了会静默丢回复）",
+    "default": 120
+  },
   "media_max_file_mb": {
     "type": "int",
     "description": "单个媒体/下载文件上限(MB)",

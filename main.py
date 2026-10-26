@@ -126,6 +126,7 @@ from .src.prompts import (
     REFLECTION_PROMPT,
     REQUEST_ANALYSIS_SYSTEM_PROMPT,
     REPLY_SYSTEM_PROMPT,
+    reply_system_prompt,
     SCHEDULED_TASK_PROMPT,
     AGENT_FINAL_OUTPUT_PROMPT,
     SSH_AGENT_SYSTEM_PROMPT,
@@ -279,7 +280,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.1.3"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -426,6 +427,7 @@ class LongMemoryAgentPlugin(Star):
             self.settings = PluginConfig.from_mapping(self.raw_config)
             logger.info("长程记忆：检测到配置热更新，已重建运行参数")
             self._apply_auto_install_setting()
+            self._apply_runtime_limits()
             self._invalidate_injections()
             # 详细程度被调低 → 先立即压缩一次记忆，再按更短的上下文运行
             self._apply_detail_level_change(previous_level)
@@ -439,6 +441,37 @@ class LongMemoryAgentPlugin(Star):
         except Exception as error:
             logger.warning("长程记忆：配置热更新失败：%s", str(error)[:150])
         return True
+
+    def _apply_runtime_limits(self) -> None:
+        """把节奏类配置同步进运行中的对象（它们只在 initialize 建过一次实例）。
+
+        已知问题：面板把冷却改成 0、限额改成 9999、打字速度调高后全都不生效——
+        InteractionController / HumanizationConfig / DecisionEngine 是启动时按旧值
+        构建的，改配置只换了 self.settings。这里逐个推一遍（控制器保留计数状态）。
+        """
+        try:
+            if self.interactions is not None:
+                self.interactions.update_limits(
+                    group_cooldown_seconds=self.settings.group_cooldown_seconds,
+                    user_cooldown_seconds=self.settings.user_cooldown_seconds,
+                    max_actions_per_hour=self.settings.max_actions_per_hour,
+                    quiet_start_hour=self.settings.quiet_start_hour,
+                    quiet_end_hour=self.settings.quiet_end_hour,
+                )
+            if self.decision is not None:
+                self.decision.max_wait_seconds = float(
+                    self.settings.max_random_wait_seconds)
+            if self._humanization is not None:
+                self._humanization = HumanizationConfig(
+                    max_segments=self.settings.max_sequence_segments,
+                    max_total_chars=self.settings.sequence_char_limit,
+                    typing_chars_per_second=self.settings.typing_chars_per_second,
+                    max_typing_delay_seconds=self.settings.max_typing_delay_seconds,
+                    auto_inter_segment_delay_seconds=self.settings.inter_segment_delay_seconds,
+                    max_sequences_per_hour=self.settings.max_sequences_per_hour,
+                )
+        except Exception as error:
+            logger.warning("长程记忆：节奏配置同步失败：%s", str(error)[:150])
 
     def _apply_auto_install_setting(self) -> None:
         """把"允许按需 pip 安装"的主人授权项同步给各模块（市场审查要求显式可关）。"""
@@ -620,7 +653,9 @@ class LongMemoryAgentPlugin(Star):
             max_segments=self.settings.max_sequence_segments,
             max_total_chars=self.settings.sequence_char_limit,
             typing_chars_per_second=self.settings.typing_chars_per_second,
-            max_sequences_per_hour=12,
+            max_typing_delay_seconds=self.settings.max_typing_delay_seconds,
+            auto_inter_segment_delay_seconds=self.settings.inter_segment_delay_seconds,
+            max_sequences_per_hour=self.settings.max_sequences_per_hour,
         )
         self.mood = MoodStore(root / "mood.json")
         if self.settings.enable_media_archive:
@@ -1984,6 +2019,7 @@ class LongMemoryAgentPlugin(Star):
         self.interactions.set_group_limits(
             str(event.get_group_id() or scope_id),
             cooldown_seconds=self.settings.group_cooldown_seconds * rates["cooldown_scale"],
+            user_cooldown_seconds=self.settings.user_cooldown_seconds * rates["cooldown_scale"],
             max_actions_per_hour=max(1, int(rates["max_actions"])),
         )
         permit = await self.interactions.begin(
@@ -1991,9 +2027,13 @@ class LongMemoryAgentPlugin(Star):
             bypass_quiet=wake, supersede=False,
         )
         if permit is None:
+            reason = self.interactions.block_reason(
+                str(event.get_group_id()), str(event.get_sender_id()),
+                bypass_quiet=wake,
+            ) or "原因未知"
             logger.info(
-                "长程记忆：群%s消息被限流跳过（静默时段/群或用户冷却/小时限额）",
-                event.get_group_id(),
+                "长程记忆：%s 本次跳过（%s）",
+                self._conversation_key(event), reason,
             )
             if wake:
                 event.stop_event()
@@ -2518,6 +2558,27 @@ class LongMemoryAgentPlugin(Star):
 
     def _invalidate_injections(self) -> None:
         self._injections_cache = None
+        self._persona_cache = None
+
+    async def _persona_rules(self) -> str:
+        """注入面板里改过的拟人提示词（persona.language）；没改/关掉返回空串用默认。"""
+        cached = getattr(self, "_persona_cache", None)
+        if cached is not None:
+            return cached
+        text = ""
+        if self.storage is not None:
+            try:
+                rows = await self.storage.list_prompt_injections()
+                for row in rows:
+                    if str(row.get("injection_id") or "") != prompt_injections.PERSONA_ID:
+                        continue
+                    if bool(row.get("enabled", True)):
+                        text = str(row.get("content") or "").strip()
+                    break
+            except Exception as error:
+                logger.info("长程记忆：读取拟人提示词失败：%s", str(error)[:120])
+        self._persona_cache = text
+        return text
 
     async def _seed_prompt_injections(self) -> None:
         """把自带预设补进库（已改过的不覆盖，只补缺的）。"""
@@ -2551,7 +2612,9 @@ class LongMemoryAgentPlugin(Star):
 
     async def _compose_reply_prompt(self) -> str:
         persona = await self._persona_prompt()
-        parts = [part for part in (persona, REPLY_SYSTEM_PROMPT.strip()) if part]
+        persona_rules = await self._persona_rules()
+        base_prompt = reply_system_prompt(persona_rules).strip()
+        parts = [part for part in (persona, base_prompt) if part]
         injected = await self._injections_block()
         if injected:
             parts.append(injected)
@@ -2683,7 +2746,9 @@ class LongMemoryAgentPlugin(Star):
         给计划文本（已知问题：判定=agent 却一次工具都没调、直接出 4 段纯文本）。
         工具 schema 已经在请求里传给模型，这里也不再重复注入工具清单文本
         （50+ 工具名列两遍只会挤劣化行为）。"""
-        parts = [part for part in (persona, REPLY_SYSTEM_PROMPT.strip()) if part]
+        persona_rules = await self._persona_rules()
+        base_prompt = reply_system_prompt(persona_rules).strip()
+        parts = [part for part in (persona, base_prompt) if part]
         # 控制台「注入」面板里勾了的规则必须真的到场：以前只有老的两段式
         # `_compose_reply_prompt` 渲染它，而那条路已经没人走了 —— 于是"五个都勾上
         # 了，bot 照样长句+markdown+客服味"。现在主回复路径（agent 循环）也带。
