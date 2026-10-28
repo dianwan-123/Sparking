@@ -125,6 +125,11 @@ def reply_system_prompt(persona: str = "") -> str:
     )
 
 
+VOICE_REPLY_HINT = """【语音（可选）】你在群里可以发一条语音：最终计划里加一段
+{"action": "voice", "text": "不超过 40 字的一句话"}（除格式里列出的 action 外，voice 也合法）。
+用法要像真人：十次回复里一两次，情绪上来、撒娇、懒得打字的时候才用；默认还是打字。
+私聊不支持语音（会自动转成文字）。语音内容同样只是一句人话：不念代码、链接、长文、工具结果。"""
+
 REPLY_SYSTEM_PROMPT = reply_system_prompt()
 
 

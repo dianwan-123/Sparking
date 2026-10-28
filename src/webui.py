@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from datetime import datetime, timedelta, timezone
 import pathlib
 from pathlib import Path
@@ -215,21 +216,57 @@ class PageAPI:
         return conv, known[conv]
 
     # ------------------------------------------------------------ 读
+    # 读缓存：控制台切页会反复拉同一批数据，而快照/统计要扫大表。
+    # 只缓存"全局、与 query 无关"的重路由（带参数的读仍直算），写操作后清空。
+    _CACHEABLE = {"overview": 20.0, "memory_web": 20.0, "scopes": 20.0,
+                  "stickers": 30.0, "capabilities": 30.0}
+
+    def _cache_bucket(self) -> dict[str, Any]:
+        bucket = getattr(self.host, "_webui_read_cache", None)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            setattr(self.host, "_webui_read_cache", bucket)
+        return bucket
+
+    def invalidate_read_cache(self) -> None:
+        self._cache_bucket().clear()
+
     async def read(self, route: str, query: Mapping[str, Any]) -> Any:
         handler = getattr(self, f"_read_{route}", None)
         if handler is None:
             raise WebUIError(f"未知的数据面：{route}")
-        return await handler(query)
+        ttl = self._CACHEABLE.get(route, 0.0)
+        key_args = tuple(sorted((str(k), str(v)) for k, v in (query or {}).items()))
+        if ttl <= 0 or key_args:
+            return await handler(query)
+        bucket = self._cache_bucket()
+        hit = bucket.get(route)
+        now = time.monotonic()
+        if isinstance(hit, tuple) and now - hit[0] < ttl:
+            return hit[1]
+        value = await handler(query)
+        bucket[route] = (now, value)
+        return value
 
     async def _read_overview(self, query: Mapping[str, Any]) -> dict[str, Any]:
         settings = getattr(self.host, "settings", None)
         storage = self.storage
-        stats = await storage.stats(None)
-        scopes = await storage.all_scopes("aiocqhttp")
-        usage = await storage.usage_summary(7)
+        marks: dict[str, float] = {}
+
+        async def timed(name: str, awaitable):
+            start = time.monotonic()
+            try:
+                return await awaitable
+            finally:
+                marks[name] = round(time.monotonic() - start, 2)
+
+        stats = await timed("stats", storage.stats(None))
+        scopes = await timed("scopes", storage.all_scopes("aiocqhttp"))
+        usage = await timed("usage", storage.usage_summary(7))
         mood = getattr(getattr(self.host, "mood", None), "get", lambda: None)()
-        plans = await storage.pending_plans(10)
+        plans = await timed("plans", storage.pending_plans(10))
         scripts = None
+        scripts_start = time.monotonic()
         try:
             manager = self._script_manager()
         except WebUIError:
@@ -244,6 +281,7 @@ class PageAPI:
                 }
             except Exception:
                 scripts = None
+        marks["scripts"] = round(time.monotonic() - scripts_start, 2)
         return {
             "version": getattr(self.host, "_version", "") or "",
             "enabled": bool(getattr(settings, "enabled", False)),
@@ -268,17 +306,39 @@ class PageAPI:
             "scripts": scripts,
             "capability_enabled": bool(getattr(settings, "enable_qq_tools", False)),
             "browser_env": dict(getattr(self.host, "_browser_env", {}) or {}),
+            "timings": marks,
         }
+
+    async def _scope_counts(self) -> dict[str, dict[str, int]]:
+        """一次分组把每个会话的三项计数算齐。
+
+        原实现每会话调 stats(scope)=7 个 COUNT：25 个会话就是 175 次查询，
+        整个「群与会话」页要十几秒。这里 3 条 GROUP BY 一次算完。
+        """
+        counts: dict[str, dict[str, int]] = {}
+        for table, field in (("message_identities", "messages"),
+                             ("summary_nodes", "summaries"),
+                             ("memory_items", "memories")):
+            try:
+                rows = await self.storage._fetchall(
+                    f"SELECT scope_id, COUNT(*) AS n FROM {table} GROUP BY scope_id")
+            except Exception:
+                continue
+            for row in rows:
+                slot = counts.setdefault(str(row["scope_id"]), {})
+                slot[field] = int(row["n"] or 0)
+        return counts
 
     async def _read_scopes(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows = await self.storage.all_scopes("aiocqhttp")
+        counts = await self._scope_counts()
         out: list[dict[str, Any]] = []
         for row in rows:
             conversation = str(row.get("conversation_id") or "")
             scope = str(row.get("scope_id") or "")
             if not conversation or not scope:
                 continue
-            stats = await self.storage.stats(scope)
+            stats = counts.get(scope, {})
             tail = await self.storage.recent_messages(scope, 1)
             config = await self.storage.get_group_config(scope)
             out.append({
@@ -292,9 +352,9 @@ class PageAPI:
                 "quiet_hours": config.get("quiet_hours", ""),
                 "max_actions_per_hour": config.get("max_actions_per_hour", -1),
                 "note": config.get("note", ""),
-                "messages": stats.get("message_identities", 0),
-                "summaries": stats.get("summary_nodes", 0),
-                "memories": stats.get("memory_items", 0),
+                "messages": stats.get("messages", 0),
+                "summaries": stats.get("summaries", 0),
+                "memories": stats.get("memories", 0),
                 "last_at": str(tail[0].occurred_at)[:19] if tail else "",
             })
         out.sort(key=lambda item: item["last_at"], reverse=True)
@@ -770,6 +830,10 @@ class PageAPI:
         except Exception:
             catalog = {}
         out = []
+        # 缩略图总量闸：贴纸面板原来把每个文件前 512KB 全塞进响应（实测 4.1MB），
+        # 手机端打开要等很久。现在最多带 12 张、总量 ≤1.2MB，超出的只给元数据。
+        thumb_left = 12
+        thumb_budget = 1_200_000
         for item in items or []:
             pick = (lambda name, default="": item.get(name, default)
                     if isinstance(item, Mapping) else getattr(item, name, default))
@@ -779,9 +843,14 @@ class PageAPI:
             thumb = ""
             try:
                 payload = path and pathlib.Path(path)
-                if payload and payload.is_file():
-                    encoded = base64.b64encode(payload.read_bytes()[:512 * 1024]).decode("ascii")
-                    thumb = f"data:{pick('media_type', 'image/png')};base64,{encoded}"
+                if (payload and payload.is_file() and thumb_left > 0
+                        and thumb_budget > 0):
+                    blob_size = payload.stat().st_size
+                    if blob_size <= 300_000 and blob_size <= thumb_budget:
+                        encoded = base64.b64encode(payload.read_bytes()).decode("ascii")
+                        thumb = f"data:{pick('media_type', 'image/png')};base64,{encoded}"
+                        thumb_budget -= blob_size
+                        thumb_left -= 1
             except Exception:
                 thumb = ""
             out.append({
@@ -1167,7 +1236,10 @@ class PageAPI:
         handler = getattr(self, f"_do_{action}", None)
         if handler is None:
             raise WebUIError(f"未知的操作：{action}")
-        return await handler(body)
+        try:
+            return await handler(body)
+        finally:
+            self.invalidate_read_cache()
 
     async def _do_config_set(self, body: Mapping[str, Any]) -> dict[str, Any]:
         host = self.host
@@ -1185,6 +1257,11 @@ class PageAPI:
         host.settings = PluginConfig.from_mapping(host.raw_config)
         host._config_signature_seen = host._config_signature()
         host._persist_raw_config()
+        # 面板保存走这条捷径（不会触发 _refresh_settings_if_changed），
+        # 限流器/打字速度等运行期对象必须在这里同步，否则又是"改了不生效"。
+        apply_limits = getattr(host, "_apply_runtime_limits", None)
+        if callable(apply_limits):
+            apply_limits()
         return {"ok": True, "key": key, "value": value}
 
     async def _do_whitelist_set(self, body: Mapping[str, Any]) -> dict[str, Any]:

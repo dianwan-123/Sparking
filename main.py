@@ -126,6 +126,7 @@ from .src.prompts import (
     REFLECTION_PROMPT,
     REQUEST_ANALYSIS_SYSTEM_PROMPT,
     REPLY_SYSTEM_PROMPT,
+    VOICE_REPLY_HINT,
     reply_system_prompt,
     SCHEDULED_TASK_PROMPT,
     AGENT_FINAL_OUTPUT_PROMPT,
@@ -280,7 +281,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.3"
+PLUGIN_VERSION = "1.1.4"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -2022,9 +2023,11 @@ class LongMemoryAgentPlugin(Star):
             user_cooldown_seconds=self.settings.user_cooldown_seconds * rates["cooldown_scale"],
             max_actions_per_hour=max(1, int(rates["max_actions"])),
         )
+        owner = self._is_owner(event)
         permit = await self.interactions.begin(
             scope_id, str(event.get_group_id()), str(event.get_sender_id()),
             bypass_quiet=wake, supersede=False,
+            bypass_limits=bool(wake and owner),
         )
         if permit is None:
             reason = self.interactions.block_reason(
@@ -2615,6 +2618,8 @@ class LongMemoryAgentPlugin(Star):
         persona_rules = await self._persona_rules()
         base_prompt = reply_system_prompt(persona_rules).strip()
         parts = [part for part in (persona, base_prompt) if part]
+        if getattr(self.settings, "enable_voice_reply", False):
+            parts.append(VOICE_REPLY_HINT.strip())
         injected = await self._injections_block()
         if injected:
             parts.append(injected)
@@ -2749,6 +2754,8 @@ class LongMemoryAgentPlugin(Star):
         persona_rules = await self._persona_rules()
         base_prompt = reply_system_prompt(persona_rules).strip()
         parts = [part for part in (persona, base_prompt) if part]
+        if getattr(self.settings, "enable_voice_reply", False):
+            parts.append(VOICE_REPLY_HINT.strip())
         # 控制台「注入」面板里勾了的规则必须真的到场：以前只有老的两段式
         # `_compose_reply_prompt` 渲染它，而那条路已经没人走了 —— 于是"五个都勾上
         # 了，bot 照样长句+markdown+客服味"。现在主回复路径（agent 循环）也带。
@@ -4494,8 +4501,60 @@ class LongMemoryAgentPlugin(Star):
         except Exception:
             return plan
 
+    async def _send_voice_segment(self, event: AstrMessageEvent,
+                                  descriptor: dict[str, Any]) -> None:
+        """把一段文字用 AI 语音（TTS）发出去；私聊/网关不支持时退化成文字。"""
+        if not getattr(self.settings, "enable_voice_reply", False):
+            # 开关关着时模型仍可能写 voice 段（提示词是软约束）：按文字发，别把整段丢掉
+            await self._send_segment(event, {"action": "text",
+                                             "text": descriptor.get("text", "")})
+            return
+        text = " ".join(self._sanitize_outgoing(str(descriptor.get("text") or "")).split())
+        text = text[:80]
+        if not text or is_plan_json_leak(text):
+            return
+        group = str(event.get_group_id() or "").strip()
+        self._ensure_gateway(event)
+        if self.gateway is None or not group.isdigit():
+            # 私聊没有 AI 语音（QQ 只在群里提供 AI 语音）——降级成文字
+            await self._send_segment(event, {"action": "text", "text": text})
+            return
+        try:
+            character = await self._voice_character(group)
+            await self.gateway.execute(
+                "send_group_ai_record", group_id=int(group),
+                character=character, text=text)
+            return
+        except Exception as error:
+            logger.info("长程记忆：AI 语音发送失败，改为文字：%s", str(error)[:150])
+        await self._send_segment(event, {"action": "text", "text": text})
+
+    async def _voice_character(self, group: str) -> str:
+        """AI 语音音色：配置优先；没配就取网关第一个可用音色（缓存）。"""
+        configured = str(getattr(self.settings, "voice_character", "") or "").strip()
+        if configured:
+            return configured
+        cached = getattr(self, "_voice_character_cache", "") or ""
+        if cached:
+            return cached
+        payload = await self.gateway.execute("get_ai_characters", group_id=int(group))
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        rows = data if isinstance(data, list) else (
+            (data or {}).get("characters") or (data or {}).get("list") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("character_id") or row.get("id") or "").strip()
+            if cid:
+                self._voice_character_cache = cid
+                return cid
+        raise RuntimeError("没有可用的 AI 音色")
+
     async def _send_segment(self, event: AstrMessageEvent, descriptor: dict[str, Any]) -> None:
         action = descriptor.get("action")
+        if action == "voice":
+            await self._send_voice_segment(event, descriptor)
+            return
         if action == "text":
             raw_text = str(descriptor.get("text", ""))
             # 已知问题：模型把 sticker_id 当文本发了出来（"[sticker: 36ae…]"）。
@@ -7111,6 +7170,11 @@ class LongMemoryAgentPlugin(Star):
         让我们情绪起伏——不是"一句话加一个数值"）。
         """
         extras: dict[str, Any] = {}
+        if user_id and self._is_owner(None, user_id):
+            extras["owner_note"] = (
+                "【主人】这条消息来自你的主人（owner_ids 里配置的 QQ）：TA 的直接要求优先照办"
+                "（在你的能力与安全范围内），不要推脱、不要反问「要不要我帮你做」；"
+                "要自查时可以用 owner_config 读/改自己的配置、用 owner_logs 看运行日志。")
         if self.storage is None or not scope_id:
             return extras
         try:
@@ -9380,6 +9444,20 @@ class LongMemoryAgentPlugin(Star):
             return
         return (compact_json(result, 12000) + "\n新Skill将在下一轮Agent自然生效。")
 
+    def _is_owner(self, event: Any = None, sender_id: str = "") -> bool:
+        """这个说话的人是不是主人（owner_ids）。主人直呼不吃冷却/限额。"""
+        owners = {str(x).strip() for x in (getattr(self.settings, "owner_ids", ()) or ())
+                  if str(x).strip()}
+        if not owners:
+            return False
+        sender = str(sender_id or "").strip()
+        if not sender and event is not None:
+            try:
+                sender = str(event.get_sender_id() or "").strip()
+            except Exception:
+                sender = ""
+        return bool(sender) and sender in owners
+
     def _require_qq(self, event: Any = None) -> None:
         if not self.settings.enable_qq_tools or self.gateway is None or self.qq is None:
             raise RuntimeError("QQ工具未启用或未就绪")
@@ -9808,6 +9886,117 @@ class LongMemoryAgentPlugin(Star):
         except QQGatewayError as error:
             return f"动作失败：{error}"
         return (compact_json(result, 12000))
+
+    # -------------------------------------------- 主人专用（自查配置 / 看日志）
+    @filter.llm_tool(name="owner_config")
+    async def owner_config_tool(self, event: AstrMessageEvent, action: str = "list",
+                                key: str = "", value: str = ""):
+        """主人专用：查看或修改**本插件自己**的配置（改完立刻生效并落盘）。
+
+        典型用法：主人说"回复太慢/被限流"→ 先 owner_logs 看日志里卡在哪一条，
+        再把对应的键改掉（例如 typing_chars_per_second 调大、user_cooldown_seconds 归零、
+        max_actions_per_hour 调大），改完即时生效，不用重载插件。
+
+        Args:
+            action(string): list（列出全部配置项，敏感项已打码）/ get（查单个键）/ set（改单个键）。
+            key(string): 配置键名（get/set 必填）。
+            value(string): 新值（set 必填）；布尔/数字/列表直接写 JSON 字面量，如 true、40、["123"]。
+        """
+        if not self._is_owner(event):
+            return "只有主人（配置里的 owner_ids）才能改我的配置。"
+        try:
+            api = self._page_api()
+            if action == "list":
+                rows = await api.read("config", {})
+                return compact_json({"items": rows}, 14000)
+            name = str(key or "").strip()
+            if not name:
+                return "需要 key（配置键名）。先 action=list 看有哪些键。"
+            if action == "get":
+                rows = await api.read("config", {})
+                hit = [row for row in (rows or []) if str(row.get("key")) == name]
+                if not hit:
+                    return f"没有这个配置键：{name}"
+                return compact_json(hit[0], 2000)
+            if action == "set":
+                parsed: Any = str(value)
+                try:
+                    parsed = json.loads(str(value))
+                except Exception:
+                    parsed = str(value)
+                result = await api.write("config_set", {"key": name, "value": parsed})
+                return compact_json(dict(result or {}, key=name), 2000)
+            return "action 只能是 list / get / set。"
+        except Exception as error:
+            return f"配置操作失败：{str(error)[:200]}"
+
+    @filter.llm_tool(name="owner_logs")
+    async def owner_logs_tool(self, event: AstrMessageEvent, tail: int = 120,
+                              keyword: str = ""):
+        """主人专用：看 AstrBot 最近运行日志（排障用：限流、报错、模型调用、插件异常）。
+
+        先按关键词过滤再取末尾若干行；找不到就返回原因（比如没开文件日志）。
+        日志里能直接看到"本次跳过（该用户冷却还剩 Ns）""每小时限额已满 N/N"这类原因。
+
+        Args:
+            tail(number): 取末尾多少行，默认 120（最多 500）。
+            keyword(string): 只保留包含该关键词的行（留空=不过滤）。
+        """
+        if not self._is_owner(event):
+            return "只有主人（配置里的 owner_ids）才能看日志。"
+        return await self._read_astrbot_logs(tail=tail, keyword=keyword)
+
+    async def _read_astrbot_logs(self, tail: int = 120, keyword: str = "") -> str:
+        """读最近日志：优先 AstrBot 内存环形缓冲，其次 data/logs 下的日志文件。"""
+        limit = min(max(int(tail or 120), 10), 500)
+        needle = str(keyword or "").strip().lower()
+        lines: list[str] = []
+        try:
+            from astrbot.core.log import LogManager
+
+            broker = getattr(LogManager, "_log_broker", None)
+            cache = list(getattr(broker, "log_cache", []) or []) if broker else []
+            for entry in cache:
+                if not isinstance(entry, dict):
+                    continue
+                body = str(entry.get("data") or "").strip()
+                if not body:
+                    continue
+                stamp = entry.get("time")
+                try:
+                    when = datetime.fromtimestamp(float(stamp)).strftime("%m-%d %H:%M:%S")
+                except (TypeError, ValueError, OSError):
+                    when = "--:--:--"
+                lines.append(f"[{when}][{str(entry.get('level') or '')}] {body}")
+        except Exception:
+            lines = []
+        source = "内存缓冲"
+        if not lines:
+            try:
+                root = Path(get_astrbot_data_path()) / "logs"
+                files = (sorted(root.glob("*.log*"),
+                                key=lambda item: item.stat().st_mtime, reverse=True)
+                         if root.is_dir() else [])
+                if files:
+                    payload = files[0]
+                    with payload.open("rb") as handle:
+                        handle.seek(0, 2)
+                        size = handle.tell()
+                        read_bytes = min(size, 800_000)
+                        handle.seek(size - read_bytes)
+                        blob = handle.read().decode("utf-8", "replace")
+                    lines = blob.splitlines()
+                    source = f"文件 {payload.name}"
+            except Exception:
+                lines = []
+        if needle:
+            lines = [line for line in lines if needle in line.lower()]
+        if not lines:
+            return ("没有可读的日志：内存缓冲为空，也没找到日志文件。"
+                    "如果你想要持久日志，在 AstrBot 的配置里打开 log_file_enable。")
+        picked = lines[-limit:]
+        header = f"（来源：{source}，共 {len(lines)} 行，取末尾 {len(picked)} 行）"
+        return header + "\n" + "\n".join(picked)
 
     # -------------------------------------------- QQ 分类动作工具（群管/群文件/扩展）
     async def _action_family_call(

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS web_edges(edge_id TEXT PRIMARY KEY,edge_key TEXT NOT 
 CREATE INDEX IF NOT EXISTS idx_web_edges_src ON web_edges(src_id,status);
 CREATE INDEX IF NOT EXISTS idx_web_edges_dst ON web_edges(dst_id,status);
 CREATE INDEX IF NOT EXISTS idx_web_edges_ref ON web_edges(source_ref);
+CREATE INDEX IF NOT EXISTS idx_web_edges_pair ON web_edges(src_id,dst_id,relation);
 CREATE TABLE IF NOT EXISTS web_node_sources(node_id TEXT NOT NULL REFERENCES web_nodes(node_id) ON DELETE CASCADE,source_ref TEXT NOT NULL,PRIMARY KEY(node_id,source_ref));
 CREATE TABLE IF NOT EXISTS web_sources(source_ref TEXT PRIMARY KEY,kind TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',ingested_at TEXT NOT NULL,meta_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS web_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -141,6 +142,9 @@ class Storage:
         """
         if getattr(db, "in_transaction", False):
             await db.rollback()
+        # 任何写入都让计数缓存失效：写后读到的必须是新数（面板显示差几秒可以，
+        # 但"刚导入完还是 0"就是 bug）。
+        self._stats_cache = {}
         await db.execute("BEGIN IMMEDIATE")
 
     def _conn(self) -> aiosqlite.Connection:
@@ -2297,12 +2301,27 @@ class Storage:
         return target
 
     async def stats(self, scope_id: str | None = None) -> dict[str, Any]:
+        """各表计数（全局统计缓存 15 秒）。
+
+        控制台 overview 与记忆网快照都会拉它；大库上 7 个 COUNT 反复全表扫不值当，
+        而面板显示差几秒没人看得出来。
+        """
+        cache = getattr(self, "_stats_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._stats_cache = cache
+        key = str(scope_id or "")
+        now = time.monotonic()
+        hit = cache.get(key)
+        if isinstance(hit, tuple) and now - hit[0] < 15.0:
+            return dict(hit[1])
         suffix, params = (" WHERE scope_id=?", (scope_id,)) if scope_id else ("", ())
         result: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "fts5": self.fts5_available}
         for name in ("scopes", "message_identities", "summary_nodes", "memory_items", "catalog_entries", "jobs", "embeddings"):
             where = suffix if name != "scopes" else ((" WHERE scope_id=?") if scope_id else "")
             row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {name}{where}", params)
             result[name] = int(row["n"])
+        cache[key] = (now, dict(result))
         return result
 
     async def _sync_search(self, message_id: str, scope_id: str, text: str, deleted: bool) -> None:

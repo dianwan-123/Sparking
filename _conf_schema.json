@@ -4,6 +4,21 @@
     "description": "启用插件",
     "default": true
   },
+  "owner_ids": {
+    "type": "list",
+    "description": "主人 QQ 号（可多个）：主人的要求优先执行；主人还能让 bot 自查/修改本插件配置、看运行日志",
+    "default": []
+  },
+  "enable_voice_reply": {
+    "type": "bool",
+    "description": "允许 bot 在群里发 AI 语音（TTS；需要 SnowLuma 的 AI 语音能力，默认关闭）",
+    "default": false
+  },
+  "voice_character": {
+    "type": "string",
+    "description": "AI 语音音色 id（留空=自动取第一个可用音色；可用 napcat_catalog 查 get_ai_characters）",
+    "default": ""
+  },
   "group_whitelist": {
     "type": "list",
     "description": "允许完整存储和自主聊天的QQ群号",

@@ -15,12 +15,12 @@ from datetime import datetime
 from typing import Any, Literal
 
 
-ActionKind = Literal["text", "sticker", "face", "poke", "reaction", "agent", "noop",
-                     "image", "file", "record", "video"]
+ActionKind = Literal["text", "voice", "sticker", "face", "poke", "reaction", "agent",
+                     "noop", "image", "file", "record", "video"]
 PlanMode = Literal["single", "sequence"]
 SendStatus = Literal["completed", "cancelled", "failed", "rate_limited", "rejected"]
-_ALLOWED_ACTIONS = frozenset({"text", "sticker", "face", "poke", "reaction", "agent", "noop",
-                              "image", "file", "record", "video"})
+_ALLOWED_ACTIONS = frozenset({"text", "voice", "sticker", "face", "poke", "reaction",
+                              "agent", "noop", "image", "file", "record", "video"})
 _MEDIA_ACTIONS = frozenset({"image", "file", "record", "video"})
 _SEGMENT_FIELDS = frozenset({
     "action", "text", "sticker_id", "face_id", "target_id", "emoji_id", "query",
@@ -588,14 +588,15 @@ def _parse_action(value: Any, config: HumanizationConfig) -> PlannedAction:
     text = value.get("text")
     if text is not None and not isinstance(text, str):
         raise PlanValidationError("text must be a string")
-    if action == "text":
+    if action in ("text", "voice"):
         text = (text or "").strip()
         if not text:
             raise PlanValidationError("text action cannot be empty")
-        if len(text) > config.max_segment_chars:
+        limit = config.max_segment_chars if action == "text" else min(config.max_segment_chars, 80)
+        if len(text) > limit:
             raise PlanValidationError("text segment is too long")
     elif text is not None:
-        raise PlanValidationError("text is only valid for text actions")
+        raise PlanValidationError("text is only valid for text and voice actions")
     reply_value = value.get("reply_to_message_id", value.get("reply_to"))
     if "reply_to_message_id" in value and "reply_to" in value:
         raise PlanValidationError("use only one reply field")

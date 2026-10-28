@@ -28,6 +28,9 @@ def _mode(value: Any, default: str = "auto") -> str:
 class PluginConfig:
     enabled: bool
     group_whitelist: frozenset[str]
+    owner_ids: frozenset[str]
+    enable_voice_reply: bool
+    voice_character: str
     judge_provider_id: str
     reply_provider_id: str
     summary_provider_id: str
@@ -131,6 +134,8 @@ class PluginConfig:
             if value is None:
                 d[key] = ""
         groups = frozenset(str(x).strip() for x in d.get("group_whitelist", []) if str(x).strip())
+        owners = frozenset(str(x).strip() for x in (d.get("owner_ids") or [])
+                           if str(x).strip())
         emojis = frozenset(str(x).strip() for x in d.get("allowed_emoji_ids", ["76", "124", "144"]) if str(x).strip())
         bw_min = _int(d.get("batch_window_min_seconds"), 15, 0, 3600)
         bw_max = max(_int(d.get("batch_window_max_seconds"), 60, 0, 3600), bw_min)
@@ -140,6 +145,9 @@ class PluginConfig:
         return cls(
             enabled=bool(d.get("enabled", True)),
             group_whitelist=groups,
+            owner_ids=owners,
+            enable_voice_reply=bool(d.get("enable_voice_reply", False)),
+            voice_character=str(d.get("voice_character") or "").strip(),
             judge_provider_id=str(d.get("judge_provider_id", "")).strip(),
             reply_provider_id=str(d.get("reply_provider_id", "")).strip(),
             summary_provider_id=str(d.get("summary_provider_id", "")).strip(),

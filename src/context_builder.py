@@ -166,6 +166,7 @@ class ContextBuilder:
                 "3. 判断「多久以前」一律以 now 为准，不要凭印象猜。"
             ),
             "current_scope_tag": str(dict(extras or {}).get("current_scope_tag") or ""),
+            "owner_note": str(dict(extras or {}).get("owner_note") or ""),
             "other_scope_tags": _escape(
                 dict(dict(extras or {}).get("other_scope_tags") or {})),
             "scope_tag_note": (

@@ -20,6 +20,7 @@ class InteractionPermit:
     group_id: str
     user_id: str
     bypass_quiet: bool = False
+    bypass_limits: bool = False
 
 
 class InteractionController:
@@ -157,7 +158,8 @@ class InteractionController:
         return hour >= start or hour < end
 
     async def begin(self, scope: Hashable, group_id: str | int, user_id: str | int,
-                    *, bypass_quiet: bool = False, supersede: bool = True) -> InteractionPermit | None:
+                    *, bypass_quiet: bool = False, supersede: bool = True,
+                    bypass_limits: bool = False) -> InteractionPermit | None:
         """Create a permit if current limits allow evaluation.
 
         With `supersede=False` the permit keeps the current generation, so
@@ -170,7 +172,9 @@ class InteractionController:
         async with self._lock:
             now = self._clock()
             self._prune(now)
-            if self._on_cooldown(group, user, now) or self._over_hourly(group):
+            # 主人直呼不受冷却/限额约束（bypass_limits）：TA 让 bot 修东西时不能把自己卡死。
+            if not bypass_limits and (
+                    self._on_cooldown(group, user, now) or self._over_hourly(group)):
                 return None
             if supersede:
                 self._generation[scope] += 1
@@ -179,7 +183,8 @@ class InteractionController:
                 generation = self._generation[scope]
         if self.debounce_seconds:
             await asyncio.sleep(self.debounce_seconds)
-        permit = InteractionPermit(scope, generation, group, user, bypass_quiet)
+        permit = InteractionPermit(scope, generation, group, user, bypass_quiet,
+                                 bypass_limits)
         return permit if self.is_current(permit) else None
 
     def is_current(self, permit: InteractionPermit) -> bool:
@@ -198,14 +203,16 @@ class InteractionController:
                 return False
             now = self._clock()
             self._prune(now)
-            if self._on_cooldown(permit.group_id, permit.user_id, now):
+            if not permit.bypass_limits and self._on_cooldown(
+                    permit.group_id, permit.user_id, now):
                 return False
-            if self._over_hourly(permit.group_id):
+            if not permit.bypass_limits and self._over_hourly(permit.group_id):
                 return False
-            self._last_group[permit.group_id] = now
-            self._last_user[permit.user_id] = now
-            self._hourly_by_group[permit.group_id].append(now)
-            self._hourly.append(now)
+            if not permit.bypass_limits:
+                self._last_group[permit.group_id] = now
+                self._last_user[permit.user_id] = now
+                self._hourly_by_group[permit.group_id].append(now)
+                self._hourly.append(now)
             return True
 
     async def wait_until_current(self, permit: InteractionPermit,
