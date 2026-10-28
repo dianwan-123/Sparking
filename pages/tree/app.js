@@ -184,22 +184,80 @@
   function renderKinds() {
     const box = $("kinds");
     box.textContent = "";
+    const nodes = (state.snapshot && state.snapshot.nodes) || [];
+    const counts = {};
+    nodes.forEach((node) => {
+      counts[node.kind] = (counts[node.kind] || 0) + 1;
+    });
+    const total = nodes.length;
+    $("kind-total").textContent = total ? total + " 个节点" : "";
+    const allChip = el("button", "chip" + (state.hiddenKinds.size ? "" : " off"));
+    allChip.appendChild(el("span", "name", "全部"));
+    allChip.appendChild(el("span", "n", String(total)));
+    allChip.addEventListener("click", () => {
+      state.hiddenKinds.clear();
+      renderKinds();
+      applyKindFilter();
+    });
+    box.appendChild(allChip);
     Object.keys(KIND_LABEL).forEach((kind) => {
+      const count = counts[kind] || 0;
       const chip = el("button", "chip" + (state.hiddenKinds.has(kind) ? " off" : ""));
       const dot = el("span", "dot");
       dot.style.background = KIND_COLOR[kind];
       chip.appendChild(dot);
-      chip.appendChild(el("span", "", KIND_LABEL[kind]));
+      chip.appendChild(el("span", "name", KIND_LABEL[kind]));
+      chip.appendChild(el("span", "n", String(count)));
       chip.addEventListener("click", () => {
-        if (state.hiddenKinds.has(kind)) state.hiddenKinds.delete(kind);
-        else state.hiddenKinds.add(kind);
+        // 点一下"只看这一类"（再点回到全部）——比原来的"隐藏这一类"更符合直觉
+        const onlyThis = state.hiddenKinds.size !== Object.keys(KIND_LABEL).length - 1
+          || state.hiddenKinds.has(kind);
+        state.hiddenKinds.clear();
+        if (onlyThis) {
+          Object.keys(KIND_LABEL).forEach((other) => {
+            if (other !== kind) state.hiddenKinds.add(other);
+          });
+        }
         renderKinds();
         applyKindFilter();
       });
       box.appendChild(chip);
     });
-    const note = el("span", "chips-note", "点色块可隐藏某类节点");
-    box.appendChild(note);
+  }
+
+  // 搜索命中列表（点一条就选中并聚焦它）
+  function renderSearchHits(keyword) {
+    const list = $("search-hits");
+    if (!list) return;
+    list.textContent = "";
+    const text = String(keyword || "").trim().toLowerCase();
+    if (!text || !state.snapshot) return;
+    const matches = state.snapshot.nodes
+      .filter((node) => String(node.label || "").toLowerCase().includes(text))
+      .slice(0, 12);
+    if (!matches.length) {
+      const li = el("li");
+      li.appendChild(el("span", "muted small", "没有匹配的节点"));
+      list.appendChild(li);
+      return;
+    }
+    matches.forEach((node) => {
+      const li = el("li");
+      const button = el("button");
+      const dot = el("span", "dot");
+      dot.style.background = KIND_COLOR[node.kind] || "#64748b";
+      button.appendChild(dot);
+      button.appendChild(el("span", "label", String(node.label || "")));
+      button.appendChild(el("span", "meta", (KIND_LABEL[node.kind] || node.kind)
+        + " · " + (Number(node.weight) || 1)));
+      button.addEventListener("click", () => {
+        state.web.setSelection([node.id]);
+        state.web.focus(node.id, 1.6);
+        if (!state.pruneMode) loadDetail(node.id);
+      });
+      li.appendChild(button);
+      list.appendChild(li);
+    });
   }
 
   function applyKindFilter() {
@@ -433,6 +491,11 @@
         state.pruneSelection = nodes.map((node) => node.id);
         updatePruneBar();
       },
+      onFocus: (node, size) => {
+        if (!node) return;
+        if (!state.pruneMode) loadDetail(node.id);
+        toast("已聚焦 " + String(node.label || "") + " 的邻域（" + size + " 个节点）", "ok");
+      },
     });
     renderKinds();
     $("btn-refresh").addEventListener("click", () => load().catch((error) => toast(String(error.message || error), "error")));
@@ -504,16 +567,12 @@
     $("search").addEventListener("input", () => {
       const keyword = $("search").value.trim().toLowerCase();
       if (!state.snapshot) return;
+      renderSearchHits(keyword);
       if (!keyword) { state.web.setSelection([]); return; }
       const matches = state.snapshot.nodes.filter(
         (node) => String(node.label || "").toLowerCase().includes(keyword));
       state.web.setSelection(matches.map((node) => node.id));
-      if (matches.length) {
-        state.web.focus(matches[0].id, 1.3);
-        toast("命中 " + matches.length + " 个节点", "ok");
-      } else {
-        toast("没有匹配的节点", "error");
-      }
+      if (matches.length) state.web.focus(matches[0].id, 1.25);
     });
     load().catch((error) => toast(String(error.message || error), "error"));
   }

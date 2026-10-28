@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.1.4-orange.svg" alt="v1.1.4">
+  <img src="https://img.shields.io/badge/version-v1.1.5-orange.svg" alt="v1.1.5">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -64,6 +64,8 @@
 
 > [!TIP]
 > **NapCat / SnowLuma 用户**：两个网关的差异插件内部都适配好了，直接可用。
+
+> **想用自己的语音合成？** 配置里把「语音合成方式」设为 `custom`，填上 `tts_api_url`（OpenAI 兼容的 `/v1/audio/speech` 形状即可），再按需填 Key / 模型 / 音色；失败会自动退回文字。
 
 ## ⚡ 三分钟上手
 

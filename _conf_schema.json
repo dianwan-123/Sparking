@@ -14,6 +14,41 @@
     "description": "允许 bot 在群里发 AI 语音（TTS；需要 SnowLuma 的 AI 语音能力，默认关闭）",
     "default": false
   },
+  "tts_provider": {
+    "type": "string",
+    "description": "语音合成方式：snowluma（用网关自带 AI 语音）/ custom（用你自己填的 TTS 接口）",
+    "default": "snowluma"
+  },
+  "tts_api_url": {
+    "type": "string",
+    "description": "自定义 TTS 接口地址（如 http://127.0.0.1:9880/tts 或 https://api.example.com/v1/audio/speech）",
+    "default": ""
+  },
+  "tts_api_key": {
+    "type": "string",
+    "description": "自定义 TTS 的 API Key（以 Bearer 头发送；不需要就留空）",
+    "default": ""
+  },
+  "tts_api_model": {
+    "type": "string",
+    "description": "模型名（有的服务需要，如 tts-1；不需要就留空）",
+    "default": ""
+  },
+  "tts_api_voice": {
+    "type": "string",
+    "description": "音色名/ID（按你的 TTS 服务文档填；留空用服务端默认）",
+    "default": ""
+  },
+  "tts_api_format": {
+    "type": "string",
+    "description": "音频格式：mp3 / wav / ogg / opus / aac / amr（按服务端支持填）",
+    "default": "mp3"
+  },
+  "tts_api_timeout": {
+    "type": "float",
+    "description": "自定义 TTS 请求超时（秒），超时就用文字回复",
+    "default": 20.0
+  },
   "voice_character": {
     "type": "string",
     "description": "AI 语音音色 id（留空=自动取第一个可用音色；可用 napcat_catalog 查 get_ai_characters）",

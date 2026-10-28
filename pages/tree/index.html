@@ -18,22 +18,46 @@
     </div>
     <div class="bar-actions">
       <select id="scope" title="只看某个会话"></select>
-      <input type="search" id="search" placeholder="高亮节点（人物/话题/事实）…">
       <button class="btn ghost" id="btn-archived" title="显示回溯归档的记忆">显示归档</button>
-      <button class="btn ghost" id="btn-refresh">刷新</button>
+      <button class="btn ghost" id="btn-refresh" title="重新拉取记忆网">刷新</button>
       <button class="btn" id="btn-prune" title="选择若干节点，沿路径丢弃低价值节点并压缩必要节点">剪枝</button>
       <button class="btn" id="btn-branches">分支 · <span id="branch-count">0</span></button>
       <button class="btn ghost" id="btn-rebuild" title="按当前记忆清空并重建整张网">重建</button>
     </div>
   </header>
 
-  <div class="chips" id="kinds"></div>
+  <div class="layout">
+    <aside class="side">
+      <section class="panel">
+        <h3>搜索</h3>
+        <input type="search" id="search" placeholder="搜人物 / 话题 / 事实…">
+        <ul class="hits" id="search-hits"></ul>
+      </section>
+      <section class="panel">
+        <h3>类别 <span class="muted" id="kind-total"></span></h3>
+        <div class="legend" id="kinds"></div>
+        <p class="muted small">点一下只看这一类，再点取消；关掉的类别不参与画图。</p>
+      </section>
+      <section class="panel">
+        <h3>怎么用</h3>
+        <ul class="tips">
+          <li>滚轮缩放、拖拽空白处平移</li>
+          <li><b>双击节点</b>看它的邻域（局部图谱）</li>
+          <li>右下角缩略图点击可直接跳过去</li>
+          <li>左下角 <b>＋ － ⤢</b> 缩放与适配全图</li>
+          <li>Ctrl / Shift 点选多个节点 → 剪枝</li>
+          <li>Esc 退出聚焦 / 取消选中</li>
+        </ul>
+      </section>
+    </aside>
 
-  <main class="stage">
-    <div id="graph" class="graph"></div>
-    <aside id="detail" class="detail" hidden></aside>
-    <aside id="branches" class="drawer" hidden></aside>
-  </main>
+    <main class="stage">
+      <div id="graph" class="graph"></div>
+      <aside id="detail" class="detail" hidden></aside>
+    </main>
+  </div>
+
+  <aside id="branches" class="drawer" hidden></aside>
 
   <footer class="stats" id="stats">加载中…</footer>
 

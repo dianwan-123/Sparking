@@ -31,6 +31,13 @@ class PluginConfig:
     owner_ids: frozenset[str]
     enable_voice_reply: bool
     voice_character: str
+    tts_provider: str
+    tts_api_url: str
+    tts_api_key: str
+    tts_api_model: str
+    tts_api_voice: str
+    tts_api_format: str
+    tts_api_timeout: float
     judge_provider_id: str
     reply_provider_id: str
     summary_provider_id: str
@@ -148,6 +155,15 @@ class PluginConfig:
             owner_ids=owners,
             enable_voice_reply=bool(d.get("enable_voice_reply", False)),
             voice_character=str(d.get("voice_character") or "").strip(),
+            tts_provider=(str(d.get("tts_provider") or "snowluma").strip().lower()
+                          or "snowluma"),
+            tts_api_url=str(d.get("tts_api_url") or "").strip(),
+            tts_api_key=str(d.get("tts_api_key") or "").strip(),
+            tts_api_model=str(d.get("tts_api_model") or "").strip(),
+            tts_api_voice=str(d.get("tts_api_voice") or "").strip(),
+            tts_api_format=(str(d.get("tts_api_format") or "mp3").strip().lower()
+                            or "mp3"),
+            tts_api_timeout=_float(d.get("tts_api_timeout"), 20.0, 3.0, 60.0),
             judge_provider_id=str(d.get("judge_provider_id", "")).strip(),
             reply_provider_id=str(d.get("reply_provider_id", "")).strip(),
             summary_provider_id=str(d.get("summary_provider_id", "")).strip(),

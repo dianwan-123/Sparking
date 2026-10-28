@@ -92,27 +92,62 @@ input:focus, select:focus, textarea:focus {
   border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary) inset;
 }
 
-/* ---------------------------------------------------------------- 种类开关 */
-.chips {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 10px 24px 4px;
+/* ---------------------------------------------------------------- 三栏布局 */
+.layout {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  min-height: 0;
 }
+.side {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 10px 12px 12px 24px;
+  max-height: calc(100vh - 150px); overflow: auto;
+}
+.panel {
+  background: var(--surface); border: 1px solid var(--hair);
+  border-radius: var(--radius-lg); padding: 12px 14px; box-shadow: var(--shadow-1);
+}
+.panel h3 {
+  margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--ink-2);
+  display: flex; align-items: baseline; gap: 6px;
+}
+.panel input[type="search"] { width: 100%; }
+.panel .muted { font-weight: 400; font-size: 12px; }
+
+/* 搜索命中列表（一眼可点的结果） */
+.hits { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.hits li { padding: 0; }
+.hits button {
+  all: unset; cursor: pointer; display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 5px 6px; border-radius: 6px; font-size: 12.5px; color: var(--ink);
+}
+.hits button:hover { background: var(--primary-soft); }
+.hits .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.hits .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hits .meta { color: var(--ink-3); font-size: 11px; flex: none; }
+
+/* 图例（带计数的类别开关） */
+.legend { display: flex; flex-direction: column; gap: 4px; }
 .chip {
   all: unset; cursor: pointer;
-  display: inline-flex; align-items: center; gap: 6px;
-  height: 28px; padding: 0 12px; border-radius: 999px;
-  background: var(--surface); border: 1px solid var(--hair);
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 6px;
   font-size: 12.5px; color: var(--ink-2);
-  box-shadow: var(--shadow-1);
 }
-.chip .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-.chip.off { opacity: .45; text-decoration: line-through; }
-.chips-note { color: var(--ink-3); font-size: 12px; margin-left: 4px; }
+.chip:hover { background: var(--primary-soft); }
+.chip .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+.chip .name { flex: 1; }
+.chip .n { color: var(--ink-3); font-size: 11.5px; }
+.chip.off { opacity: .42; }
+.chip.off .name { text-decoration: line-through; }
+
+.tips { margin: 0; padding-left: 16px; color: var(--ink-2); font-size: 12px; line-height: 1.85; }
+.tips b { color: var(--ink); font-weight: 600; }
 
 /* ---------------------------------------------------------------- 画布 */
-.stage { position: relative; padding: 8px 24px 12px; }
+.stage { position: relative; padding: 10px 24px 12px 12px; min-width: 0; }
 .graph {
-  position: relative; height: calc(100vh - 210px); min-height: 420px;
+  position: relative; height: calc(100vh - 152px); min-height: 420px;
   border: 1px solid var(--hair); border-radius: var(--radius-lg);
   background: #fbfdff;
   background-image: radial-gradient(rgba(60, 150, 202, .16) 1px, transparent 1px);
@@ -121,21 +156,50 @@ input:focus, select:focus, textarea:focus {
 }
 .web-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 .web-canvas:active { cursor: grabbing; }
+
 .web-tip {
-  position: absolute; max-width: 300px;
-  background: var(--surface); border: 1px solid var(--hair);
-  border-radius: var(--radius); padding: 6px 10px;
+  position: absolute; min-width: 132px; max-width: 240px;
+  background: rgba(255, 255, 255, .97); border: 1px solid var(--hair);
+  border-radius: var(--radius); padding: 8px 10px;
   font-size: 12.5px; color: var(--ink);
   pointer-events: none; z-index: 8; box-shadow: var(--shadow-2);
 }
+.web-tip-head { display: flex; align-items: center; gap: 7px; }
+.web-tip-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.web-tip-head strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.web-tip-meta { color: var(--ink-3); font-size: 11.5px; margin-top: 3px; }
+.web-tip-hint { color: var(--primary-strong); font-size: 11px; margin-top: 4px; }
+
+/* 画布内悬浮工具条与聚焦提示 */
+.web-tools {
+  position: absolute; left: 12px; bottom: 12px; display: flex; gap: 4px;
+  background: rgba(255, 255, 255, .94); border: 1px solid var(--hair);
+  border-radius: 999px; padding: 4px; box-shadow: var(--shadow-1); z-index: 7;
+}
+.web-tools button {
+  all: unset; cursor: pointer; width: 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 14px; color: var(--ink-2);
+}
+.web-tools button:hover { background: var(--primary-soft); color: var(--primary-strong); }
+.web-crumb {
+  position: absolute; left: 12px; top: 12px; display: flex; align-items: center; gap: 10px;
+  background: rgba(255, 255, 255, .95); border: 1px solid var(--hair);
+  border-radius: 999px; padding: 5px 8px 5px 14px;
+  font-size: 12.5px; color: var(--ink-2); box-shadow: var(--shadow-1); z-index: 7;
+}
+.web-crumb button {
+  all: unset; cursor: pointer; padding: 3px 10px; border-radius: 999px;
+  background: var(--primary-soft); color: var(--primary-strong); font-size: 12px;
+}
+.web-crumb button:hover { background: var(--primary); color: #fff; }
 
 /* ---------------------------------------------------------------- 详情面板 */
 .detail {
-  position: absolute; top: 24px; right: 40px; width: min(360px, 40vw);
-  max-height: calc(100% - 48px); overflow: auto;
-  background: var(--surface); border: 1px solid var(--hair);
-  border-radius: var(--radius-lg); padding: 16px 18px;
-  box-shadow: var(--shadow-2); z-index: 6;
+  position: absolute; top: 18px; right: 18px; width: min(340px, 38vw);
+  max-height: calc(100% - 36px); overflow: auto;
+  background: rgba(255, 255, 255, .97); border: 1px solid var(--hair);
+  border-radius: var(--radius-lg); padding: 14px 16px;
+  box-shadow: var(--shadow-2); z-index: 9;
 }
 .detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .detail-head h3 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; min-width: 0; }

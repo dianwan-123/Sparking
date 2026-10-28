@@ -144,6 +144,7 @@ from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
 from .src.storage import Storage
 from .src import timeutil
+from .src import tts
 from .src import style_learning
 from .src import qq_import
 from .src import injections as prompt_injections
@@ -281,7 +282,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.4"
+PLUGIN_VERSION = "1.1.5"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -4503,7 +4504,11 @@ class LongMemoryAgentPlugin(Star):
 
     async def _send_voice_segment(self, event: AstrMessageEvent,
                                   descriptor: dict[str, Any]) -> None:
-        """把一段文字用 AI 语音（TTS）发出去；私聊/网关不支持时退化成文字。"""
+        """把一段文字用语音发出去。
+
+        顺序：自定义 TTS 接口（配了就用）→ 网关自带 AI 语音 → 文字。
+        私聊/非 QQ 会话没有网关 AI 语音；自定义 TTS 产出的音频走平台原生发送。
+        """
         if not getattr(self.settings, "enable_voice_reply", False):
             # 开关关着时模型仍可能写 voice 段（提示词是软约束）：按文字发，别把整段丢掉
             await self._send_segment(event, {"action": "text",
@@ -4513,21 +4518,72 @@ class LongMemoryAgentPlugin(Star):
         text = text[:80]
         if not text or is_plan_json_leak(text):
             return
+        # ① 自定义 TTS（用户自己的接口）
+        if await self._send_custom_voice(event, text):
+            return
+        # ② 网关自带 AI 语音（仅群聊）
         group = str(event.get_group_id() or "").strip()
         self._ensure_gateway(event)
-        if self.gateway is None or not group.isdigit():
-            # 私聊没有 AI 语音（QQ 只在群里提供 AI 语音）——降级成文字
-            await self._send_segment(event, {"action": "text", "text": text})
-            return
-        try:
-            character = await self._voice_character(group)
-            await self.gateway.execute(
-                "send_group_ai_record", group_id=int(group),
-                character=character, text=text)
-            return
-        except Exception as error:
-            logger.info("长程记忆：AI 语音发送失败，改为文字：%s", str(error)[:150])
+        if self.gateway is not None and group.isdigit():
+            try:
+                character = await self._voice_character(group)
+                await self.gateway.execute(
+                    "send_group_ai_record", group_id=int(group),
+                    character=character, text=text)
+                return
+            except Exception as error:
+                logger.info("长程记忆：AI 语音发送失败，改为文字：%s", str(error)[:150])
+        # ③ 文字
         await self._send_segment(event, {"action": "text", "text": text})
+
+    async def _send_custom_voice(self, event: AstrMessageEvent, text: str) -> bool:
+        """用配置的 TTS 接口合成并发出去；没配/失败返回 False（交给后续降级）。"""
+        provider = str(getattr(self.settings, "tts_provider", "snowluma") or "").lower()
+        config = tts.TTSConfig.from_settings(self.settings)
+        if provider != "custom" or not config.configured:
+            return False
+        try:
+            audio_b64, audio_format = await tts.synthesize_b64(config, text)
+        except tts.TTSError as error:
+            logger.info("长程记忆：自定义 TTS 失败，改用其他方式：%s", str(error)[:150])
+            return False
+        except Exception as error:
+            logger.info("长程记忆：自定义 TTS 异常，改用其他方式：%s", str(error)[:150])
+            return False
+        if not audio_b64:
+            return False
+        try:
+            platform = str(event.get_platform_name() or "")
+        except Exception:
+            platform = ""
+        group = str(event.get_group_id() or "").strip()
+        user = str(event.get_sender_id() or "").strip()
+        self._ensure_gateway(event)
+        if platform == "aiocqhttp" and self.gateway is not None and (
+                self._as_qq_number(group or user)):
+            try:
+                await self.gateway.execute(
+                    "send_group_msg" if group else "send_private_msg",
+                    **({"group_id": int(group)} if group else {"user_id": int(user)}),
+                    message=[{"type": "record",
+                              "data": {"file": "base64://" + audio_b64}}])
+                return True
+            except Exception as error:
+                logger.info("长程记忆：自定义 TTS 音频发送失败：%s", str(error)[:150])
+                return False
+        # 非 OneBot 会话：写临时文件走平台原生发送
+        try:
+            import astrbot.api.message_components as Comp
+
+            folder = Path(get_astrbot_data_path()) / "plugin_data"                 / "astrbot_plugin_long_memory_agent" / "tts"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"tts-{uuid.uuid4().hex[:12]}.{audio_format}"
+            target.write_bytes(base64.b64decode(audio_b64))
+            await event.send(MessageChain([Comp.Record(file=str(target))]))
+            return True
+        except Exception as error:
+            logger.info("长程记忆：自定义 TTS 原生发送失败：%s", str(error)[:150])
+            return False
 
     async def _voice_character(self, group: str) -> str:
         """AI 语音音色：配置优先；没配就取网关第一个可用音色（缓存）。"""
