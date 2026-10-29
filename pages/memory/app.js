@@ -1469,7 +1469,7 @@ window.SparkingWeb = (() => {
   const webState = {
     graph: null, snapshot: null, pruneMode: false, pruneSelection: [],
     showArchived: false, hiddenKinds: new Set(),
-    focusMode: false, focusNodeId: null, hops: 1,
+    focusMode: false, focusNodeId: null, hops: 1, loadLevel: 0,
   };
   const WEB_KIND_LABEL = { person: "人物", group: "会话", topic: "话题", fact: "事实", summary: "摘要" };
   const WEB_KIND_COLOR = { person: "#f59e0b", group: "#6366f1", topic: "#10b981", fact: "#64748b", summary: "#ec4899" };
@@ -1539,7 +1539,26 @@ window.SparkingWeb = (() => {
     if (pending) bits.push("待入网 " + pending);
     if (stats.pruned) bits.push("已剪枝 " + stats.pruned);
     if (stats.last_sync_at) bits.push("上次同步 " + String(stats.last_sync_at).replace("T", " ").slice(0, 16));
-    $("web-stats").textContent = bits.join(" · ");
+    const footer = $("web-stats");
+    footer.textContent = bits.join(" · ");
+    const totalNodes = Number(stats.nodes || 0);
+    const shown = (webState.snapshot && webState.snapshot.nodes || []).length;
+    let more = footer.querySelector("button");
+    if (!more) {
+      more = el("button", "btn ghost", "");
+      more.style.marginLeft = "10px";
+      more.addEventListener("click", () => {
+        webState.loadLevel = Math.min(webState.loadLevel + 1, 2);
+        loadWeb().catch((error) => toast(String(error.message || error), "error"));
+      });
+      footer.appendChild(more);
+    }
+    if (webState.focusMode || shown >= totalNodes || webState.loadLevel >= 2) {
+      more.hidden = true;
+    } else {
+      more.textContent = "显示更多节点（当前 " + shown + " / 全库 " + totalNodes + "）";
+      more.hidden = false;
+    }
   }
 
   function webRenderBranches() {
@@ -1841,6 +1860,11 @@ window.SparkingWeb = (() => {
       if (webState.graph) webState.graph.setFocus(webState.focusNodeId, webState.hops || 1);
       return;
     }
+    // 分层取数：默认只画骨架，"加载更多"逐级放大（图糊的根源是一次塞太多）
+    const levels = [[80, 300], [200, 700], [400, 1400]];
+    const [n, e] = levels[Math.min(webState.loadLevel, levels.length - 1)];
+    params.limit_nodes = n;
+    params.limit_edges = e;
     const snapshot = await get("memory_web", params);
     webState.snapshot = snapshot;
     const select = $("web-scope");

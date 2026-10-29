@@ -170,6 +170,7 @@
     hiddenKinds: new Set(),
     focusMode: false,
     hops: 1,
+    loadLevel: 0,
   };
 
   const KIND_LABEL = { person: "人物", group: "会话", topic: "话题", fact: "事实", summary: "摘要" };
@@ -293,7 +294,27 @@
     if (stats.pruned) bits.push("已剪枝 " + stats.pruned);
     if (stats.last_sync_at) bits.push("上次同步 " + String(stats.last_sync_at).replace("T", " ").slice(0, 16));
     const kindBits = Object.keys(kinds).map((kind) => (KIND_LABEL[kind] || kind) + " " + kinds[kind]);
-    $("stats").textContent = bits.join(" · ") + (kindBits.length ? "　｜　" + kindBits.join(" / ") : "");
+    const footer = $("stats");
+    footer.textContent = bits.join(" · ") + (kindBits.length ? "　｜　" + kindBits.join(" / ") : "");
+    // 全库很大时默认只画骨架：给一个"加载更多"逐级放大（最多三级）
+    const totalNodes = Number(stats.nodes || 0);
+    const shown = (state.snapshot && state.snapshot.nodes || []).length;
+    let more = footer.querySelector("button");
+    if (!more) {
+      more = el("button", "btn ghost small", "");
+      more.style.marginLeft = "10px";
+      more.addEventListener("click", () => {
+        state.loadLevel = Math.min(state.loadLevel + 1, 2);
+        load().catch((error) => toast(String(error.message || error), "error"));
+      });
+      footer.appendChild(more);
+    }
+    if (state.focusMode || shown >= totalNodes || state.loadLevel >= 2) {
+      more.hidden = true;
+    } else {
+      more.textContent = "显示更多节点（当前 " + shown + " / 全库 " + totalNodes + "）";
+      more.hidden = false;
+    }
   }
 
   function renderBranches() {
@@ -554,6 +575,12 @@
     const params = { include_archived: state.showArchived ? 1 : 0 };
     const scope = $("scope").value;
     if (scope) params.scope = scope;
+    // 分层取数：默认只画"骨架"（重要节点+主要连线），想看更多点"加载更多"逐级放大。
+    // 图糊成毛线球的根源就是一次塞太多节点，稀疏首先是取少。
+    const levels = [[80, 300], [200, 700], [400, 1400]];
+    const [n, e] = levels[Math.min(state.loadLevel, levels.length - 1)];
+    params.limit_nodes = n;
+    params.limit_edges = e;
     // 邻域模式：只取当前选中节点周围的子图；退出时回到全图
     if (state.focusMode && state.selected) {
       params.node_id = state.selected;

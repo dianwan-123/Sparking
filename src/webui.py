@@ -607,8 +607,10 @@ class PageAPI:
         if raw_kinds:
             kinds = [item for item in raw_kinds.split(",") if item.strip()]
         try:
-            limit_nodes = max(20, min(int(query.get("limit_nodes") or 260), 600))
-            limit_edges = max(50, min(int(query.get("limit_edges") or 900), 2000))
+            # 默认取一小撮"精英骨架"：图一糊成毛线球，本质是塞进去的节点太多——
+            # 稀疏首先是"取少"，其次才是布局。想看更多由前端逐级放大。
+            limit_nodes = max(20, min(int(query.get("limit_nodes") or 80), 600))
+            limit_edges = max(30, min(int(query.get("limit_edges") or 300), 2000))
         except (TypeError, ValueError):
             raise WebUIError("limit 参数无效")
         include_archived = str(query.get("include_archived") or "").strip() in {
