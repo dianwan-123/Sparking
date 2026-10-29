@@ -16,9 +16,19 @@ window.SparkingWeb = (() => {
     derives_from: "压缩自", co_occurs: "同现", in: "属于", member_of: "成员",
   };
   const ARCHIVED_COLOR = "#94a3b8";
-  // 群落色（淡）：只做光晕，不抢节点本色
   const CLUSTER_HUES = ["#6366f1", "#10b981", "#f59e0b", "#ec4899",
                         "#06b6d4", "#8b5cf6", "#f97316", "#84cc16"];
+
+  // 布局参数：间距大、斥力强、弹簧软——宁可铺得开，不要挤成一团
+  const SPACING = {
+    repel: 5200,
+    linkDistance: 150,
+    linkStrength: 0.028,
+    centroidPull: 0.004,
+    gravity: 0.0012,
+    damping: 0.86,
+    collisionGap: 14,
+  };
 
   function hashUnit(value, salt) {
     const str = String(value) + ":" + String(salt || 0);
@@ -41,7 +51,6 @@ window.SparkingWeb = (() => {
     tip.hidden = true;
     container.appendChild(tip);
 
-    // 视图工具条（左下）与聚焦提示（左上）
     const tools = document.createElement("div");
     tools.className = "web-tools";
     container.appendChild(tools);
@@ -53,7 +62,7 @@ window.SparkingWeb = (() => {
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
     let W = 800, H = 520;
     let data = { nodes: [], edges: [] };
-    const positions = new Map();       // id -> {x, y, vx, vy}
+    const positions = new Map();
     const selection = new Set();
     let hover = null;
     let dragNode = null;
@@ -62,16 +71,16 @@ window.SparkingWeb = (() => {
     let view = { x: 0, y: 0, scale: 1 };
     let running = 0;
     let raf = 0;
+    let viewAnim = 0;
     let componentOf = new Map();
     let components = [];
     let clusterColors = true;
-    // 聚焦（局部图谱）：focusSet 为空 = 看全图
+    let showAllLabels = false;
     let focusSet = null;
     let focusNode = null;
-    let hoverEdge = null;
+    let neighbourSet = null;
 
     function computeComponents(nodes, edges) {
-      // 并查集：把有连线的节点归成一个个"群落"——布点与内聚力都按群落来
       const parent = new Map();
       nodes.forEach((node) => parent.set(node.id, node.id));
       const find = (value) => {
@@ -113,7 +122,8 @@ window.SparkingWeb = (() => {
 
     function radiusOf(node) {
       const weight = Math.max(1, Number(node.weight) || 1);
-      return Math.min(16, 4.2 + Math.sqrt(weight) * 1.7);
+      // 半径区间收窄：大小差异过大时小节点会被挤到看不见
+      return Math.min(13, 5 + Math.sqrt(weight) * 1.2);
     }
 
     function degreeOf(nodeId) {
@@ -124,24 +134,26 @@ window.SparkingWeb = (() => {
       return degree;
     }
 
-    function seed() {
-      positions.clear();
-      const nodes = data.nodes || [];
-      nodes.forEach((node, index) => {
-        const angle = index * 2.399963;
-        const radius = 40 + Math.sqrt(index + 1) * 26;
-        positions.set(node.id, {
-          x: W / 2 + Math.cos(angle) * radius,
-          y: H / 2 + Math.sin(angle) * radius,
-          vx: 0, vy: 0,
-        });
+    function isDimmed(nodeId) {
+      if (focusSet && !focusSet.has(nodeId)) return true;
+      if (neighbourSet && !neighbourSet.has(nodeId)) return true;
+      return false;
+    }
+
+    function rebuildNeighbours() {
+      neighbourSet = null;
+      if (!selection.size) return;
+      const set = new Set(selection);
+      (data.edges || []).forEach((edge) => {
+        if (selection.has(edge.source)) set.add(edge.target);
+        if (selection.has(edge.target)) set.add(edge.source);
       });
+      neighbourSet = set;
     }
 
     function step() {
       const nodes = data.nodes || [];
       const edges = data.edges || [];
-      // 群落重心：每个"群落"朝自己的重心收——比全局引力更有结构感
       const centroids = new Map();
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
@@ -152,7 +164,8 @@ window.SparkingWeb = (() => {
         centroids.set(key, slot);
       });
       centroids.forEach((slot) => { slot.x /= slot.n; slot.y /= slot.n; });
-      const cell = 130;
+
+      const cell = 190;
       const grid = new Map();
       const cellKey = (x, y) => Math.round(x / cell) + "|" + Math.round(y / cell);
       nodes.forEach((node) => {
@@ -162,6 +175,7 @@ window.SparkingWeb = (() => {
         if (!grid.has(key)) grid.set(key, []);
         grid.get(key).push(node);
       });
+
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
         if (!pos) return;
@@ -177,8 +191,8 @@ window.SparkingWeb = (() => {
               if (!target) return;
               const dx = pos.x - target.x, dy = pos.y - target.y;
               const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-              if (distance > cell * 1.9) return;
-              const force = 2400 / (distance * distance);
+              if (distance > cell * 2.2) return;
+              const force = SPACING.repel / (distance * distance);
               fx += (dx / distance) * force;
               fy += (dy / distance) * force;
             });
@@ -186,41 +200,40 @@ window.SparkingWeb = (() => {
         }
         const centroid = centroids.get(componentOf.get(node.id) ?? -1);
         if (centroid) {
-          fx += (centroid.x - pos.x) * 0.006;
-          fy += (centroid.y - pos.y) * 0.006;
+          fx += (centroid.x - pos.x) * SPACING.centroidPull;
+          fy += (centroid.y - pos.y) * SPACING.centroidPull;
         }
-        fx += (W / 2 - pos.x) * 0.0015;
-        fy += (H / 2 - pos.y) * 0.0015;
-        pos.vx = (pos.vx + fx) * 0.84;
-        pos.vy = (pos.vy + fy) * 0.84;
+        fx += (W / 2 - pos.x) * SPACING.gravity;
+        fy += (H / 2 - pos.y) * SPACING.gravity;
+        pos.vx = (pos.vx + fx) * SPACING.damping;
+        pos.vy = (pos.vy + fy) * SPACING.damping;
       });
+
       edges.forEach((edge) => {
         const a = positions.get(edge.source);
         const b = positions.get(edge.target);
         if (!a || !b) return;
         const dx = b.x - a.x, dy = b.y - a.y;
         const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-        const target = 104;
-        const strength = 0.045 * Math.min(3, Math.max(1, Number(edge.weight) || 1));
-        const force = (distance - target) * strength;
+        const weight = Math.min(3, Math.max(1, Number(edge.weight) || 1));
+        const force = (distance - SPACING.linkDistance) * SPACING.linkStrength * weight;
         const ux = dx / distance, uy = dy / distance;
         a.vx += ux * force; a.vy += uy * force;
         b.vx -= ux * force; b.vy -= uy * force;
       });
+
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
         if (!pos) return;
         if (node.id === (dragNode && dragNode.id)) return;
-        pos.x += Math.max(-14, Math.min(14, pos.vx));
-        pos.y += Math.max(-14, Math.min(14, pos.vy));
-        pos.x = Math.max(24, Math.min(W - 24, pos.x));
-        pos.y = Math.max(24, Math.min(H - 24, pos.y));
+        pos.x += Math.max(-10, Math.min(10, pos.vx));
+        pos.y += Math.max(-10, Math.min(10, pos.vy));
+        pos.x = Math.max(30, Math.min(W - 30, pos.x));
+        pos.y = Math.max(30, Math.min(H - 30, pos.y));
       });
       resolveCollisions(0.5);
     }
 
-    // 防重叠：半径和之内直接推开——没有这一步，节点会挤成一团看不出结构。
-    // 返回本轮推开的对数（收尾松弛用它判断还有没有重叠）。
     function resolveCollisions(strength) {
       const nodes = data.nodes || [];
       const gcell = 170;
@@ -251,7 +264,7 @@ window.SparkingWeb = (() => {
               if (!target) return;
               const dx = target.x - pos.x, dy = target.y - pos.y;
               const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
-              const minimum = r1 + radiusOf(other) + 6;
+              const minimum = r1 + radiusOf(other) + SPACING.collisionGap;
               if (distance >= minimum) return;
               const push = (minimum - distance) * strength;
               const ux = dx / distance, uy = dy / distance;
@@ -265,32 +278,26 @@ window.SparkingWeb = (() => {
       return pushed;
     }
 
-    // 收尾去重叠：动画停稳后做几轮"只推开、不加力"的松弛——弹簧挤压下
-    // 残留的顽固重叠（挤成一团的观感来源）在这里彻底解开，且不越出画布。
     function relaxCollisions() {
       for (let round = 0; round < 90; round += 1) {
         if (!resolveCollisions(0.6)) break;
         (data.nodes || []).forEach((node) => {
           const pos = positions.get(node.id);
           if (!pos) return;
-          pos.x = Math.max(24, Math.min(W - 24, pos.x));
-          pos.y = Math.max(24, Math.min(H - 24, pos.y));
+          pos.x = Math.max(30, Math.min(W - 30, pos.x));
+          pos.y = Math.max(30, Math.min(H - 30, pos.y));
         });
       }
     }
 
-    function toScreen(point) {
-      return { x: point.x * view.scale + view.x, y: point.y * view.scale + view.y };
-    }
     function toWorld(x, y) {
       return { x: (x - view.x) / view.scale, y: (y - view.y) / view.scale };
     }
 
-    // ---------- 聚焦（局部图谱） ----------
     function buildFocus(nodeId, hops) {
       const id = String(nodeId);
       if (!positions.has(id)) return null;
-      const depth = Math.max(0, Math.min(3, Number(hops) || 2));
+      const depth = Math.max(0, Math.min(3, Number(hops) || 1));
       const neighbours = new Map();
       (data.edges || []).forEach((edge) => {
         if (!neighbours.has(edge.source)) neighbours.set(edge.source, []);
@@ -316,7 +323,8 @@ window.SparkingWeb = (() => {
 
     function boundsOf(ids) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      (ids ? Array.from(ids) : (data.nodes || []).map((node) => node.id)).forEach((id) => {
+      const list = ids ? Array.from(ids) : (data.nodes || []).map((node) => node.id);
+      list.forEach((id) => {
         const pos = positions.get(id);
         if (!pos) return;
         minX = Math.min(minX, pos.x); maxX = Math.max(maxX, pos.x);
@@ -326,8 +334,8 @@ window.SparkingWeb = (() => {
       return { minX, minY, maxX, maxY };
     }
 
-    let viewAnim = 0;
     function animateView(target) {
+      if (!target) return;
       const from = { x: view.x, y: view.y, scale: view.scale };
       const start = (typeof performance !== "undefined" ? performance.now() : Date.now());
       const duration = 260;
@@ -351,7 +359,8 @@ window.SparkingWeb = (() => {
       const pad = padding === undefined ? 90 : padding;
       const width = Math.max(24, box.maxX - box.minX);
       const height = Math.max(24, box.maxY - box.minY);
-      const scale = Math.max(0.35, Math.min(2.2,
+      // 上限压到 1.6：适配全图时别把节点放大到糊在一起
+      const scale = Math.max(0.3, Math.min(1.6,
         Math.min((W - pad * 2) / width, (H - pad * 2) / height)));
       return {
         scale,
@@ -365,13 +374,13 @@ window.SparkingWeb = (() => {
       if (!set) return false;
       focusSet = set;
       focusNode = String(nodeId);
-      const target = viewForBounds(boundsOf(set), 80);
-      if (target) animateView(target);
+      animateView(viewForBounds(boundsOf(set), 90));
       renderCrumb();
       if (typeof options.onFocus === "function") {
         const node = (data.nodes || []).find((item) => item.id === focusNode);
         options.onFocus(node || null, set.size);
       }
+      render();
       return true;
     }
 
@@ -380,32 +389,31 @@ window.SparkingWeb = (() => {
       focusSet = null;
       focusNode = null;
       renderCrumb();
-      const target = viewForBounds(boundsOf(null), 70);
-      if (target) animateView(target);
+      animateView(viewForBounds(boundsOf(null), 70));
       if (typeof options.onFocus === "function") options.onFocus(null, 0);
+      render();
     }
 
     function renderCrumb() {
       crumb.textContent = "";
       if (!focusSet) { crumb.hidden = true; return; }
       const node = (data.nodes || []).find((item) => item.id === focusNode);
-      const label = node ? String(node.label || "").slice(0, 20) : "节点";
+      const label = node ? String(node.label || "").slice(0, 18) : "节点";
       const text = document.createElement("span");
-      text.textContent = "聚焦：" + label + "（邻域 " + focusSet.size + " 个节点）";
+      text.textContent = "只看「" + label + "」相关（" + focusSet.size + " 个节点）";
       const exit = document.createElement("button");
       exit.type = "button";
-      exit.textContent = "退出聚焦 ✕";
+      exit.textContent = "显示全部 ✕";
       exit.addEventListener("click", () => clearFocusInternal());
       crumb.appendChild(text);
       crumb.appendChild(exit);
       crumb.hidden = false;
     }
 
-    // ---------- 视图工具条 ----------
     function zoomBy(factor) {
       const cx = W / 2, cy = H / 2;
       const world = toWorld(cx, cy);
-      const scale = Math.max(0.35, Math.min(3.2, view.scale * factor));
+      const scale = Math.max(0.3, Math.min(3.2, view.scale * factor));
       view.scale = scale;
       view.x = cx - world.x * scale;
       view.y = cy - world.y * scale;
@@ -413,8 +421,7 @@ window.SparkingWeb = (() => {
     }
 
     function fitView() {
-      const target = viewForBounds(boundsOf(focusSet), 70);
-      if (target) animateView(target);
+      animateView(viewForBounds(boundsOf(focusSet), 70));
     }
 
     function addTool(label, title, handler) {
@@ -432,6 +439,10 @@ window.SparkingWeb = (() => {
       addTool("＋", "放大（+）", () => zoomBy(1.25));
       addTool("－", "缩小（-）", () => zoomBy(0.8));
       addTool("⤢", "适配全图（0）", () => fitView());
+      addTool("Aa", "显示/隐藏次要标签", () => {
+        showAllLabels = !showAllLabels;
+        render();
+      });
       addTool("◐", "群落底色开/关", () => {
         clusterColors = !clusterColors;
         render();
@@ -442,13 +453,15 @@ window.SparkingWeb = (() => {
       const target = event.target || {};
       const tag = String(target.tagName || "").toLowerCase();
       if (tag === "input" || tag === "textarea" || tag === "select") return;
-      if (event.key === "+" || event.key === "=") { zoomBy(1.25); }
-      else if (event.key === "-" || event.key === "_") { zoomBy(0.8); }
-      else if (event.key === "0" || event.key.toLowerCase() === "f") { fitView(); }
-      else if (event.key === "Escape") {
+      const key = String(event.key || "");
+      if (key === "+" || key === "=") zoomBy(1.25);
+      else if (key === "-" || key === "_") zoomBy(0.8);
+      else if (key === "0" || key.toLowerCase() === "f") fitView();
+      else if (key === "Escape") {
         if (focusSet) clearFocusInternal();
-        else {
+        else if (selection.size) {
           selection.clear();
+          rebuildNeighbours();
           render();
           emitSelect(null);
         }
@@ -456,10 +469,6 @@ window.SparkingWeb = (() => {
     }
 
     // ---------- 渲染 ----------
-    function dimmed(nodeId) {
-      return Boolean(focusSet) && !focusSet.has(nodeId);
-    }
-
     function render() {
       ctx.clearRect(0, 0, W, H);
       const nodes = data.nodes || [];
@@ -468,19 +477,17 @@ window.SparkingWeb = (() => {
       ctx.translate(view.x, view.y);
       ctx.scale(view.scale, view.scale);
 
-      // 群落光晕：同一连通分量用同一淡色底，看出"分成几团"
       if (clusterColors) {
         nodes.forEach((node) => {
           const pos = positions.get(node.id);
-          if (!pos || dimmed(node.id)) return;
+          if (!pos || isDimmed(node.id)) return;
           const index = componentOf.get(node.id) ?? 0;
           if ((components[index] || []).length < 3) return;
           const color = CLUSTER_HUES[index % CLUSTER_HUES.length];
-          const radius = radiusOf(node) + 9;
           ctx.beginPath();
-          ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+          ctx.arc(pos.x, pos.y, radiusOf(node) + 12, 0, Math.PI * 2);
           ctx.fillStyle = color;
-          ctx.globalAlpha = 0.09;
+          ctx.globalAlpha = 0.07;
           ctx.fill();
           ctx.globalAlpha = 1;
         });
@@ -491,26 +498,25 @@ window.SparkingWeb = (() => {
         const b = positions.get(edge.target);
         if (!a || !b) return;
         const weight = Math.max(1, Number(edge.weight) || 1);
-        // 曲线边：中点沿法线偏一个"随机的拐弯"（按边名取散列，稳定不闪）
+        const faded = isDimmed(edge.source) || isDimmed(edge.target);
         const dx = b.x - a.x, dy = b.y - a.y;
         const length = Math.sqrt(dx * dx + dy * dy) || 1;
         const bend = (hashUnit(edge.source + edge.relation + edge.target, 1) - 0.5)
-          * 2 * Math.min(46, length * 0.22);
+          * 2 * Math.min(40, length * 0.2);
         const midX = (a.x + b.x) / 2 - (dy / length) * bend;
         const midY = (a.y + b.y) / 2 + (dx / length) * bend;
-        const faded = focusSet && !(focusSet.has(edge.source) && focusSet.has(edge.target));
         ctx.strokeStyle = faded
-          ? "rgba(148,163,184,0.10)"
-          : (edge.archived ? "rgba(148,163,184,0.42)" : "rgba(100,116,139,0.45)");
-        ctx.lineWidth = Math.min(3.2, 1.0 + Math.log2(weight + 1) * 0.9) / view.scale;
+          ? "rgba(148,163,184,0.08)"
+          : (edge.archived ? "rgba(148,163,184,0.34)" : "rgba(100,116,139,0.34)");
+        ctx.lineWidth = Math.min(2.6, 0.8 + Math.log2(weight + 1) * 0.7) / view.scale;
         if (edge.archived) ctx.setLineDash([5, 5]);
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         ctx.quadraticCurveTo(midX, midY, b.x, b.y);
         ctx.stroke();
         ctx.setLineDash([]);
-        // 放大后给强连线标关系名
-        if (!faded && view.scale >= 1.6 && weight >= 8) {
+        // 关系名只在放大很多、且关系很强时出现
+        if (!faded && view.scale >= 2.0 && weight >= 12) {
           const label = REL_LABEL[edge.relation] || String(edge.relation || "");
           if (label) {
             const mx = (a.x + b.x) / 2 - (dy / length) * bend * 0.5;
@@ -521,7 +527,7 @@ window.SparkingWeb = (() => {
             ctx.strokeStyle = "rgba(255,255,255,0.9)";
             ctx.lineWidth = 3 / view.scale;
             ctx.strokeText(label, mx, my);
-            ctx.fillStyle = "rgba(71,85,105,0.9)";
+            ctx.fillStyle = "rgba(71,85,105,0.85)";
             ctx.fillText(label, mx, my);
           }
         }
@@ -533,8 +539,8 @@ window.SparkingWeb = (() => {
         const style = KIND_STYLE[node.kind] || KIND_STYLE.fact;
         const archived = node.status === "archived";
         const radius = radiusOf(node);
-        const faded = dimmed(node.id);
-        ctx.globalAlpha = faded ? 0.16 : (archived ? 0.45 : 1);
+        const faded = isDimmed(node.id);
+        ctx.globalAlpha = faded ? 0.14 : (archived ? 0.42 : 1);
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
         ctx.fillStyle = archived ? ARCHIVED_COLOR : style.color;
@@ -542,161 +548,76 @@ window.SparkingWeb = (() => {
         ctx.globalAlpha = 1;
         if (archived) {
           ctx.setLineDash([4, 4]);
-          ctx.strokeStyle = faded ? "rgba(100,116,139,0.25)" : "#64748b";
-          ctx.lineWidth = 1.4 / view.scale;
+          ctx.strokeStyle = faded ? "rgba(100,116,139,0.2)" : "#64748b";
+          ctx.lineWidth = 1.3 / view.scale;
           ctx.stroke();
           ctx.setLineDash([]);
         } else {
-          ctx.strokeStyle = faded ? "rgba(15,23,42,0.06)" : "rgba(15, 23, 42, 0.25)";
-          ctx.lineWidth = 1.2 / view.scale;
+          ctx.strokeStyle = faded ? "rgba(15,23,42,0.05)" : "rgba(15,23,42,0.22)";
+          ctx.lineWidth = 1.1 / view.scale;
           ctx.stroke();
         }
         if (selection.has(node.id)) {
           ctx.beginPath();
-          ctx.arc(pos.x, pos.y, radius + 4, 0, Math.PI * 2);
+          ctx.arc(pos.x, pos.y, radius + 5, 0, Math.PI * 2);
           ctx.strokeStyle = "#2563eb";
-          ctx.lineWidth = 2.4 / view.scale;
+          ctx.lineWidth = 2.2 / view.scale;
           ctx.stroke();
         } else if (hover && hover.id === node.id) {
           ctx.beginPath();
           ctx.arc(pos.x, pos.y, radius + 3, 0, Math.PI * 2);
           ctx.strokeStyle = "#0f172a";
-          ctx.lineWidth = 1.6 / view.scale;
+          ctx.lineWidth = 1.5 / view.scale;
           ctx.stroke();
         } else if (focusSet && focusNode === node.id) {
           ctx.beginPath();
-          ctx.arc(pos.x, pos.y, radius + 5, 0, Math.PI * 2);
+          ctx.arc(pos.x, pos.y, radius + 6, 0, Math.PI * 2);
           ctx.strokeStyle = "#0ea5e9";
-          ctx.lineWidth = 1.8 / view.scale;
+          ctx.lineWidth = 1.6 / view.scale;
           ctx.stroke();
         }
       });
 
-      // 标签：按重要度限流 + 防叠字（选中的、悬停的优先，其次按权重）
-      const showLabels = view.scale > 1.1;
+      // 标签：只给重要节点常驻（权重高、选中、悬停、聚焦中心），
+      // 其余靠放大或打开"显示次要标签"再出现——这是稀疏感的主要来源。
+      const zoomLabels = view.scale >= 1.5;
       ctx.font = "11px 'Segoe UI', 'Microsoft YaHei', sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       const candidates = [];
       nodes.forEach((node) => {
         const pos = positions.get(node.id);
-        if (!pos || dimmed(node.id)) return;
+        if (!pos || isDimmed(node.id)) return;
         const pinned = selection.has(node.id) || (hover && hover.id === node.id)
           || (focusSet && focusNode === node.id);
-        const important = (Number(node.weight) || 1) >= 3 || pinned;
-        if (!important && !showLabels) return;
+        const important = (Number(node.weight) || 1) >= 6 || pinned;
+        if (!pinned && !important && !showAllLabels && !zoomLabels) return;
         candidates.push({ node, pos, pinned });
       });
       candidates.sort((a, b) => (Number(b.pinned) - Number(a.pinned))
         || ((Number(b.node.weight) || 1) - (Number(a.node.weight) || 1)));
-      const labelBudget = showLabels ? 90 : 48;
+      const budget = showAllLabels || zoomLabels ? 70 : 36;
       const placed = [];
       let drawn = 0;
       for (const item of candidates) {
-        if (drawn >= labelBudget) break;
-        const label = String(item.node.label || "").slice(0, 14);
+        if (drawn >= budget) break;
+        const label = String(item.node.label || "").slice(0, 16);
         const width = ctx.measureText(label).width;
-        const y = item.pos.y + radiusOf(item.node) + 3;
-        const box = { x: item.pos.x - width / 2 - 2, y: y - 1, w: width + 4, h: 13 };
+        const y = item.pos.y + radiusOf(item.node) + 4;
+        const box = { x: item.pos.x - width / 2 - 2, y: y - 1, w: width + 4, h: 14 };
         const overlaps = placed.some((other) =>
           box.x < other.x + other.w && box.x + box.w > other.x
           && box.y < other.y + other.h && box.y + box.h > other.y);
         if (overlaps && !item.pinned) continue;
         placed.push(box);
         drawn += 1;
-        ctx.strokeStyle = "rgba(255,255,255,0.85)";
-        ctx.lineWidth = 3 / view.scale;
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = 3.2 / view.scale;
         ctx.strokeText(label, item.pos.x, y);
         ctx.fillStyle = "#0f172a";
         ctx.fillText(label, item.pos.x, y);
       }
       ctx.restore();
-      renderMinimap();
-    }
-
-    // 缩略图导航：全图缩影 + 当前视口框，点击/拖动定位
-    const MINI = { w: 150, h: 96, pad: 10 };
-    function minimapRect() {
-      return { x: W - MINI.w - 14, y: H - MINI.h - 14, w: MINI.w, h: MINI.h };
-    }
-    function worldToMini(pos, box, bounds) {
-      const width = Math.max(1, bounds.maxX - bounds.minX);
-      const height = Math.max(1, bounds.maxY - bounds.minY);
-      const scale = Math.min((box.w - MINI.pad * 2) / width, (box.h - MINI.pad * 2) / height);
-      return {
-        x: box.x + MINI.pad + (pos.x - bounds.minX) * scale
-          + ((box.w - MINI.pad * 2) - width * scale) / 2,
-        y: box.y + MINI.pad + (pos.y - bounds.minY) * scale
-          + ((box.h - MINI.pad * 2) - height * scale) / 2,
-        scale,
-      };
-    }
-    function renderMinimap() {
-      const nodes = data.nodes || [];
-      if (nodes.length < 8) return;
-      const bounds = boundsOf(null);
-      if (!bounds) return;
-      const box = minimapRect();
-      ctx.save();
-      ctx.fillStyle = "rgba(255,255,255,0.88)";
-      ctx.strokeStyle = "rgba(148,163,184,0.55)";
-      ctx.lineWidth = 1;
-      const r = 6;
-      ctx.beginPath();
-      ctx.moveTo(box.x + r, box.y);
-      ctx.arcTo(box.x + box.w, box.y, box.x + box.w, box.y + box.h, r);
-      ctx.arcTo(box.x + box.w, box.y + box.h, box.x, box.y + box.h, r);
-      ctx.arcTo(box.x, box.y + box.h, box.x, box.y, r);
-      ctx.arcTo(box.x, box.y, box.x + box.w, box.y, r);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      nodes.forEach((node) => {
-        const pos = positions.get(node.id);
-        if (!pos) return;
-        const point = worldToMini(pos, box, bounds);
-        const style = KIND_STYLE[node.kind] || KIND_STYLE.fact;
-        ctx.beginPath();
-        ctx.arc(point.x, point.y, 1.3, 0, Math.PI * 2);
-        ctx.fillStyle = dimmed(node.id) ? "rgba(148,163,184,0.5)" : style.color;
-        ctx.fill();
-      });
-      // 当前视口框
-      const topLeft = toWorld(0, 0);
-      const bottomRight = toWorld(W, H);
-      const a = worldToMini(topLeft, box, bounds);
-      const b = worldToMini(bottomRight, box, bounds);
-      const rect = {
-        x: Math.max(box.x + 2, Math.min(a.x, b.x)),
-        y: Math.max(box.y + 2, Math.min(a.y, b.y)),
-        w: Math.min(box.w - 4, Math.abs(b.x - a.x)),
-        h: Math.min(box.h - 4, Math.abs(b.y - a.y)),
-      };
-      ctx.strokeStyle = "rgba(37,99,235,0.85)";
-      ctx.lineWidth = 1.4;
-      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
-      ctx.restore();
-    }
-
-    function minimapJump(px, py) {
-      const bounds = boundsOf(null);
-      if (!bounds) return;
-      const box = minimapRect();
-      const width = Math.max(1, bounds.maxX - bounds.minX);
-      const height = Math.max(1, bounds.maxY - bounds.minY);
-      const scale = Math.min((box.w - MINI.pad * 2) / width, (box.h - MINI.pad * 2) / height);
-      const offsetX = box.x + MINI.pad + ((box.w - MINI.pad * 2) - width * scale) / 2;
-      const offsetY = box.y + MINI.pad + ((box.h - MINI.pad * 2) - height * scale) / 2;
-      const worldX = bounds.minX + (px - offsetX) / scale;
-      const worldY = bounds.minY + (py - offsetY) / scale;
-      view.x = W / 2 - worldX * view.scale;
-      view.y = H / 2 - worldY * view.scale;
-      render();
-    }
-
-    function inMinimap(x, y) {
-      const box = minimapRect();
-      return x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h;
     }
 
     function schedule(steps) {
@@ -722,7 +643,7 @@ window.SparkingWeb = (() => {
         if (!pos) return;
         const dx = world.x - pos.x, dy = world.y - pos.y;
         const distance = Math.sqrt(dx * dx + dy * dy);
-        const limit = radiusOf(node) + 5;
+        const limit = radiusOf(node) + 6;
         if (distance <= limit && (best === null || distance < bestDistance)) {
           best = node;
           bestDistance = distance;
@@ -763,27 +684,21 @@ window.SparkingWeb = (() => {
       const meta = document.createElement("div");
       meta.className = "web-tip-meta";
       meta.textContent = style.label + (archived ? " · 已归档" : "")
-        + " · 权重 " + (Number(node.weight) || 1)
+        + " · 权重 " + Math.round(Number(node.weight) || 1)
         + " · 连线 " + degreeOf(node.id);
       const hint = document.createElement("div");
       hint.className = "web-tip-hint";
-      hint.textContent = "双击看它的邻域";
+      hint.textContent = "单击看详情 · 双击只看相关";
       tip.appendChild(head);
       tip.appendChild(meta);
       tip.appendChild(hint);
-      tip.style.left = Math.min(W - 190, point.x + 14) + "px";
+      tip.style.left = Math.min(W - 200, point.x + 14) + "px";
       tip.style.top = Math.max(8, point.y - 18) + "px";
       tip.hidden = false;
     }
 
     function onPointerDown(event) {
       const point = pointer(event);
-      if (inMinimap(point.x, point.y)) {
-        minimapJump(point.x, point.y);
-        panning = { mini: true };
-        canvas.setPointerCapture(event.pointerId);
-        return;
-      }
       const node = hit(point.x, point.y);
       moved = false;
       if (node) {
@@ -798,17 +713,13 @@ window.SparkingWeb = (() => {
 
     function onPointerMove(event) {
       const point = pointer(event);
-      if (panning && panning.mini) {
-        minimapJump(point.x, point.y);
-        return;
-      }
       if (dragNode) {
         const world = toWorld(point.x, point.y);
         const pos = positions.get(dragNode.id);
         pos.x = world.x + dragNode.dx;
         pos.y = world.y + dragNode.dy;
         moved = true;
-        schedule(6);
+        schedule(4);
         render();
         return;
       }
@@ -827,7 +738,7 @@ window.SparkingWeb = (() => {
         showTip(node, point);
         if (typeof options.onHover === "function") options.onHover(node);
       } else if (node) {
-        tip.style.left = Math.min(W - 190, point.x + 14) + "px";
+        tip.style.left = Math.min(W - 200, point.x + 14) + "px";
         tip.style.top = Math.max(8, point.y - 18) + "px";
       }
     }
@@ -840,20 +751,24 @@ window.SparkingWeb = (() => {
           if (options.multi) {
             if (selection.has(node.id)) selection.delete(node.id);
             else selection.add(node.id);
+            rebuildNeighbours();
             emitMulti();
           } else if (event.ctrlKey || event.metaKey || event.shiftKey) {
             if (selection.has(node.id)) selection.delete(node.id);
             else selection.add(node.id);
+            rebuildNeighbours();
             emitMulti();
           } else {
             selection.clear();
             selection.add(node.id);
+            rebuildNeighbours();
             emitSelect(node);
           }
           render();
         }
-      } else if (!dragNode && !moved && !(panning && panning.mini)) {
+      } else if (!dragNode && !moved) {
         selection.clear();
+        rebuildNeighbours();
         render();
         emitSelect(null);
       }
@@ -866,7 +781,7 @@ window.SparkingWeb = (() => {
       const point = pointer(event);
       const world = toWorld(point.x, point.y);
       const factor = event.deltaY < 0 ? 1.12 : 0.89;
-      view.scale = Math.max(0.35, Math.min(3.2, view.scale * factor));
+      view.scale = Math.max(0.3, Math.min(3.2, view.scale * factor));
       view.x = point.x - world.x * view.scale;
       view.y = point.y - world.y * view.scale;
       render();
@@ -875,10 +790,7 @@ window.SparkingWeb = (() => {
     function onDblClick(event) {
       const point = pointer(event);
       const node = hit(point.x, point.y);
-      if (node) {
-        // 双击 = 聚焦它的邻域；已在聚焦里再双击就换中心
-        setFocusInternal(node.id, 2);
-      }
+      if (node) setFocusInternal(node.id, 1);
     }
 
     canvas.addEventListener("pointerdown", onPointerDown);
@@ -903,7 +815,6 @@ window.SparkingWeb = (() => {
       setData(next) {
         const nextNodes = (next && next.nodes) || [];
         const nextEdges = (next && next.edges) || [];
-        // 保留已有节点的位置：切换类别过滤 / 刷新时不重排（只给新节点排位置）
         const previous = new Map(positions);
         positions.clear();
         components = computeComponents(nextNodes, nextEdges);
@@ -911,7 +822,7 @@ window.SparkingWeb = (() => {
         components.forEach((members, index) => {
           members.forEach((node) => componentOf.set(node.id, index));
         });
-        // 群落布点：大群落靠中心，小群落绕外圈——布局有"块"有留白，不是均匀铺满
+        // 群落布点：大群落靠中心、小群落绕外圈，圈层拉得更开（稀疏感）
         const ordered = components
           .map((members, index) => ({ members, index }))
           .sort((a, b) => b.members.length - a.members.length);
@@ -921,12 +832,12 @@ window.SparkingWeb = (() => {
           const freshMembers = members.filter((node) => fresh.has(node.id));
           if (!freshMembers.length) return;
           const angle = rank * 2.399963;
-          const ring = 70 + Math.sqrt(rank + 1) * 76;
-          const cx = W / 2 + Math.cos(angle) * ring * 0.75;
-          const cy = H / 2 + Math.sin(angle) * ring * 0.55;
+          const ring = 90 + Math.sqrt(rank + 1) * 110;
+          const cx = W / 2 + Math.cos(angle) * ring * 0.8;
+          const cy = H / 2 + Math.sin(angle) * ring * 0.6;
           freshMembers.forEach((node, inner) => {
             const a2 = inner * 2.399963;
-            const radius = Math.min(150, 24 + Math.sqrt(inner + 1) * 15);
+            const radius = Math.min(190, 30 + Math.sqrt(inner + 1) * 22);
             positions.set(node.id, {
               x: cx + Math.cos(a2) * radius,
               y: cy + Math.sin(a2) * radius,
@@ -942,19 +853,20 @@ window.SparkingWeb = (() => {
         data = { nodes: nextNodes, edges: nextEdges };
         const alive = new Set(nextNodes.map((node) => node.id));
         Array.from(selection).forEach((id) => { if (!alive.has(id)) selection.delete(id); });
-        // 数据变化后原焦点可能已不存在
+        rebuildNeighbours();
         if (focusNode && !alive.has(focusNode)) {
           focusSet = null;
           focusNode = null;
-        } else if (focusNode && focusSet) {
-          focusSet = buildFocus(focusNode, 2) || focusSet;
+        } else if (focusNode) {
+          focusSet = buildFocus(focusNode, 1) || focusSet;
         }
         renderCrumb();
-        schedule(420);
+        schedule(520);
       },
       setSelection(ids) {
         selection.clear();
         (ids || []).forEach((id) => selection.add(String(id)));
+        rebuildNeighbours();
         render();
       },
       getSelection() {
@@ -968,9 +880,8 @@ window.SparkingWeb = (() => {
         view.y = H / 2 - pos.y * view.scale;
         render();
       },
-      // 聚焦某个节点的邻域（等价于双击）
       setFocus(id, hops) {
-        return setFocusInternal(id, hops === undefined ? 2 : hops);
+        return setFocusInternal(id, hops === undefined ? 1 : hops);
       },
       clearFocus() {
         clearFocusInternal();
@@ -981,7 +892,6 @@ window.SparkingWeb = (() => {
       zoomBy(factor) {
         zoomBy(Number(factor) || 1.2);
       },
-      // 图例用的按类别计数
       kindCounts() {
         const counts = {};
         (data.nodes || []).forEach((node) => {
@@ -994,6 +904,7 @@ window.SparkingWeb = (() => {
         options.multi = Boolean(enabled);
         if (!enabled) {
           selection.clear();
+          rebuildNeighbours();
           render();
         }
       },
@@ -1558,6 +1469,7 @@ window.SparkingWeb = (() => {
   const webState = {
     graph: null, snapshot: null, pruneMode: false, pruneSelection: [],
     showArchived: false, hiddenKinds: new Set(),
+    focusMode: false, focusNodeId: null, hops: 1,
   };
   const WEB_KIND_LABEL = { person: "人物", group: "会话", topic: "话题", fact: "事实", summary: "摘要" };
   const WEB_KIND_COLOR = { person: "#f59e0b", group: "#6366f1", topic: "#10b981", fact: "#64748b", summary: "#ec4899" };
@@ -1706,6 +1618,103 @@ window.SparkingWeb = (() => {
     if (node.status === "archived") bits.push("（归档）");
     box.appendChild(el("div", "muted small", bits.join("　")));
 
+    // ---- 只看相关：把画布收敛到这个节点的邻域
+    const focusRow = el("div", "row");
+    const onlyBtn = el("button", "btn primary", "只看与它相关");
+    onlyBtn.addEventListener("click", async () => {
+      try {
+        const sub = await get("memory_web_neighbourhood",
+                              { node_id: node.id, hops: webState.hops || 1,
+                                include_archived: webState.showArchived ? 1 : 0 });
+        webState.snapshot = sub;
+        webState.focusMode = true;
+        webState.focusNodeId = node.id;
+        webRenderStats();
+        webRenderKinds();
+        webApplyKindFilter();
+        webState.graph.setFocus(node.id, webState.hops || 1);
+        toast("只看「" + String(node.label || "").slice(0, 12) + "」相关（"
+              + (sub.nodes || []).length + " 个节点）", "ok");
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
+    focusRow.appendChild(onlyBtn);
+    const hopsSel = el("select", "");
+    [[1, "1 跳"], [2, "2 跳"], [3, "3 跳"]].forEach(([value, text]) => {
+      const option = el("option", "", text);
+      option.value = String(value);
+      if ((webState.hops || 1) === value) option.selected = true;
+      hopsSel.appendChild(option);
+    });
+    hopsSel.addEventListener("change", () => { webState.hops = Number(hopsSel.value) || 1; });
+    focusRow.appendChild(hopsSel);
+    if (webState.focusMode) {
+      const back = el("button", "btn ghost", "显示全部");
+      back.addEventListener("click", () => {
+        webState.focusMode = false;
+        webState.focusNodeId = null;
+        loadWeb().catch((error) => toast(String(error.message || error), "error"));
+      });
+      focusRow.appendChild(back);
+    }
+    box.appendChild(focusRow);
+
+    // ---- 编辑节点：标签 / 权重 / 备注 / 归档
+    const editRow = el("div", "web-edit");
+    const labelInput = el("input", "");
+    labelInput.value = String(node.label || "");
+    labelInput.placeholder = "标签";
+    labelInput.maxLength = 120;
+    editRow.appendChild(labelInput);
+    const weightInput = el("input", "");
+    weightInput.type = "number";
+    weightInput.min = "0";
+    weightInput.step = "1";
+    weightInput.value = String(Math.round(Number(node.weight) || 0));
+    weightInput.title = "权重越高越重要";
+    editRow.appendChild(weightInput);
+    const noteInput = el("input", "");
+    noteInput.value = String((node.meta && node.meta.note) || "");
+    noteInput.placeholder = "备注（只给你自己看）";
+    noteInput.maxLength = 400;
+    editRow.appendChild(noteInput);
+    box.appendChild(editRow);
+    const saveRow = el("div", "row");
+    const saveBtn = el("button", "btn primary", "保存修改");
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      try {
+        const out = await post("web_node_update", {
+          node_id: node.id, label: labelInput.value.trim(),
+          weight: Number(weightInput.value) || 0, note: noteInput.value.trim() });
+        toast("已保存", "ok");
+        webRenderDetail({ ...detail, node: out.node || node });
+        await loadWeb();
+      } catch (error) {
+        toast(String(error.message || error), "error");
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+    saveRow.appendChild(saveBtn);
+    const archiveBtn = el("button", "btn ghost",
+                          node.status === "archived" ? "取出归档" : "收进归档");
+    archiveBtn.addEventListener("click", async () => {
+      archiveBtn.disabled = true;
+      try {
+        const next = node.status === "archived" ? "active" : "archived";
+        await post("web_node_update", { node_id: node.id, status: next });
+        toast(next === "archived" ? "已收进归档" : "已取出归档", "ok");
+        await loadWeb();
+        await webLoadDetail(node.id);
+      } catch (error) {
+        toast(String(error.message || error), "error");
+      } finally {
+        archiveBtn.disabled = false;
+      }
+    });
+    saveRow.appendChild(archiveBtn);
+    box.appendChild(saveRow);
+
     const actions = el("div", "row");
     const branchBtn = el("button", "btn primary", "在此创建分支");
     branchBtn.addEventListener("click", async () => {
@@ -1820,6 +1829,18 @@ window.SparkingWeb = (() => {
     const params = { include_archived: webState.showArchived ? 1 : 0 };
     const scope = $("web-scope").value;
     if (scope) params.scope = scope;
+    // 邻域模式：只看当前选中节点周围（"显示全部"会把 focusMode 关掉）
+    if (webState.focusMode && webState.focusNodeId) {
+      params.node_id = webState.focusNodeId;
+      params.hops = webState.hops || 1;
+      const sub = await get("memory_web_neighbourhood", params);
+      webState.snapshot = sub;
+      webRenderStats();
+      webRenderKinds();
+      webApplyKindFilter();
+      if (webState.graph) webState.graph.setFocus(webState.focusNodeId, webState.hops || 1);
+      return;
+    }
     const snapshot = await get("memory_web", params);
     webState.snapshot = snapshot;
     const select = $("web-scope");

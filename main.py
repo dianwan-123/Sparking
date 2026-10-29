@@ -282,7 +282,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.5"
+PLUGIN_VERSION = "1.1.6"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:

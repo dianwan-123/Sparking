@@ -211,7 +211,13 @@ input:focus, select:focus, textarea:focus {
   background: var(--surface-2); border-radius: 6px; padding: 5px 9px;
   word-break: break-word;
 }
-.detail .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.detail .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+/* 节点编辑区：三个输入一行排开，窄屏自动换行 */
+.detail-edit { display: grid; grid-template-columns: 1fr 78px; gap: 6px; margin-top: 6px; }
+.detail-edit input { width: 100%; font-size: 12.5px; padding: 6px 9px; }
+.detail-edit input:nth-child(3) { grid-column: 1 / -1; }
+.detail select.small { height: 30px; padding: 0 8px; font-size: 12.5px; }
+.detail .row select { height: 30px; font-size: 12.5px; }
 
 /* ---------------------------------------------------------------- 分支抽屉 */
 .drawer {

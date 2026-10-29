@@ -168,6 +168,8 @@
     pruneSelection: [],
     showArchived: false,
     hiddenKinds: new Set(),
+    focusMode: false,
+    hops: 1,
   };
 
   const KIND_LABEL = { person: "人物", group: "会话", topic: "话题", fact: "事实", summary: "摘要" };
@@ -364,12 +366,111 @@
     head.appendChild(close);
     box.appendChild(head);
     const meta = el("div", "muted small");
-    const bits = [KIND_LABEL[node.kind] || node.kind, "权重 " + node.weight];
+    const bits = [KIND_LABEL[node.kind] || node.kind, "权重 " + Math.round(Number(node.weight) || 0)];
     if (node.meta && node.meta.at) bits.push("时间 " + String(node.meta.at).replace("T", " ").slice(0, 16));
     if (node.meta && node.meta.level) bits.push("层级 L" + node.meta.level);
     if (node.status === "archived") bits.push("（归档）");
     meta.textContent = bits.join("　");
     box.appendChild(meta);
+
+    // ---- 只看相关：把图收敛到这个节点的邻域（最常用的"别糊我一脸"按钮）
+    const focusRow = el("div", "row");
+    const onlyBtn = el("button", "btn primary small", "只看与它相关");
+    onlyBtn.addEventListener("click", async () => {
+      try {
+        const hops = state.hops || 1;
+        const sub = await get("memory_web_neighbourhood",
+                              { node_id: node.id, hops: hops,
+                                include_archived: state.showArchived ? 1 : 0 });
+        state.snapshot = sub;
+        state.focusMode = true;
+        renderStats();
+        renderKinds();
+        applyKindFilter();
+        toast("只看「" + String(node.label || "").slice(0, 12) + "」相关（"
+              + (sub.nodes || []).length + " 个节点）", "ok");
+      } catch (error) { toast(String(error.message || error), "error"); }
+    });
+    focusRow.appendChild(onlyBtn);
+    const hopsSel = el("select", "small");
+    [[1, "1 跳"], [2, "2 跳"], [3, "3 跳"]].forEach(([value, text]) => {
+      const option = el("option", "", text);
+      option.value = String(value);
+      if ((state.hops || 1) === value) option.selected = true;
+      hopsSel.appendChild(option);
+    });
+    hopsSel.addEventListener("change", () => { state.hops = Number(hopsSel.value) || 1; });
+    focusRow.appendChild(hopsSel);
+    if (state.focusMode) {
+      const back = el("button", "btn ghost small", "显示全部");
+      back.addEventListener("click", () => {
+        state.focusMode = false;
+        state.hops = state.hops || 1;
+        load().catch((error) => toast(String(error.message || error), "error"));
+      });
+      focusRow.appendChild(back);
+    }
+    box.appendChild(focusRow);
+
+    // ---- 编辑：改标签 / 权重 / 归档状态 / 备注（改完立即重画）
+    box.appendChild(el("h4", "", "修改这个节点"));
+    const editRow = el("div", "detail-edit");
+    const labelInput = el("input", "");
+    labelInput.value = String(node.label || "");
+    labelInput.placeholder = "标签（给记忆起个好认的名字）";
+    labelInput.maxLength = 120;
+    editRow.appendChild(labelInput);
+    const weightInput = el("input", "");
+    weightInput.type = "number";
+    weightInput.min = "0";
+    weightInput.step = "1";
+    weightInput.value = String(Math.round(Number(node.weight) || 0));
+    weightInput.title = "权重越高，越容易出现在图上与检索结果里";
+    editRow.appendChild(weightInput);
+    const noteInput = el("input", "");
+    noteInput.value = String((node.meta && node.meta.note) || "");
+    noteInput.placeholder = "备注（可选，只给你自己看）";
+    noteInput.maxLength = 400;
+    editRow.appendChild(noteInput);
+    box.appendChild(editRow);
+    const saveRow = el("div", "row");
+    const saveBtn = el("button", "btn primary small", "保存修改");
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      try {
+        const payload = { node_id: node.id, label: labelInput.value.trim(),
+                          weight: Number(weightInput.value) || 0,
+                          note: noteInput.value.trim() };
+        const out = await post("web_node_update", payload);
+        toast("已保存", "ok");
+        renderDetail({ ...detail, node: out.node || node });
+        await load();
+        if (state.selected) loadDetail(state.selected);
+      } catch (error) {
+        toast(String(error.message || error), "error");
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+    saveRow.appendChild(saveBtn);
+    const archiveBtn = el("button", "btn ghost small",
+                          node.status === "archived" ? "取出归档" : "收进归档");
+    archiveBtn.addEventListener("click", async () => {
+      archiveBtn.disabled = true;
+      try {
+        const next = node.status === "archived" ? "active" : "archived";
+        await post("web_node_update", { node_id: node.id, status: next });
+        toast(next === "archived" ? "已收进归档" : "已取出归档", "ok");
+        await load();
+        if (state.selected) loadDetail(state.selected);
+      } catch (error) {
+        toast(String(error.message || error), "error");
+      } finally {
+        archiveBtn.disabled = false;
+      }
+    });
+    saveRow.appendChild(archiveBtn);
+    box.appendChild(saveRow);
 
     const actions = el("div", "row");
     const branchBtn = el("button", "btn primary small", "在此创建分支");
@@ -409,10 +510,10 @@
           + edge.other_label + (edge.weight > 1 ? "（×" + edge.weight + "）" : "");
         row.style.cursor = "pointer";
         row.addEventListener("click", () => {
-          if (edge.other_id) {
-            state.web.focus(edge.other_id);
-            loadDetail(edge.other_id);
-          }
+          if (!edge.other_id) return;
+          state.web.focus(edge.other_id);
+          state.web.setSelection([edge.other_id]);
+          loadDetail(edge.other_id);
         });
         list.appendChild(row);
       });
@@ -453,11 +554,23 @@
     const params = { include_archived: state.showArchived ? 1 : 0 };
     const scope = $("scope").value;
     if (scope) params.scope = scope;
+    // 邻域模式：只取当前选中节点周围的子图；退出时回到全图
+    if (state.focusMode && state.selected) {
+      params.node_id = state.selected;
+      params.hops = state.hops || 1;
+      const snapshot = await get("memory_web_neighbourhood", params);
+      state.snapshot = snapshot;
+      renderStats();
+      renderKinds();
+      applyKindFilter();
+      return;
+    }
     const snapshot = await get("memory_web", params);
     state.snapshot = snapshot;
     fillScopes(snapshot.scopes || []);
     renderStats();
     renderBranches();
+    renderKinds();
     applyKindFilter();
   }
 

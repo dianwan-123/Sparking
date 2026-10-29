@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -808,8 +809,14 @@ class MemoryWeb:
     async def snapshot(self, *, scope_id: str = "", kinds: Sequence[str] = (),
                        include_archived: bool = False,
                        limit_nodes: int = 260,
-                       limit_edges: int = 900) -> dict[str, Any]:
-        """给面板用的图快照：节点（按权重取前 N）+ 聚合后的连线 + 统计。"""
+                       limit_edges: int = 900,
+                       node_whitelist: set[str] | None = None,
+                       min_weight: float = 0.0) -> dict[str, Any]:
+        """给面板用的图快照：节点（按权重取前 N）+ 聚合后的连线 + 统计。
+
+        node_whitelist 限定只看这些节点（邻域模式用）；min_weight 过滤太轻的节点，
+        让图更稀疏、重要关系更突出。
+        """
         statuses = ["active"]
         if include_archived:
             statuses.append("archived")
@@ -819,6 +826,17 @@ class MemoryWeb:
         if wanted:
             conditions.append("n.kind IN (" + ",".join("?" for _ in wanted) + ")")
             args.extend(wanted)
+        if node_whitelist:
+            ids = [str(item) for item in node_whitelist][:900]
+            conditions.append("n.node_id IN (" + ",".join("?" for _ in ids) + ")")
+            args.extend(ids)
+        try:
+            floor = max(0.0, float(min_weight))
+        except (TypeError, ValueError):
+            floor = 0.0
+        if floor > 0:
+            conditions.append("n.weight >= ?")
+            args.append(floor)
         if scope_id:
             conditions.append(
                 "(n.scope_id=? OR n.node_id IN (SELECT src_id FROM web_edges "
@@ -939,6 +957,116 @@ class MemoryWeb:
             ref = str(item["source_ref"])
             sources.append({"ref": ref, "title": await self._source_title(ref)})
         return {"node": node, "edges": edges, "sources": sources}
+
+    async def update_node(self, node_id: str, *, label: str | None = None,
+                          weight: float | None = None,
+                          status: str | None = None,
+                          note: str | None = None) -> dict[str, Any]:
+        """改一个节点的展示属性（标签 / 权重 / 状态 / 备注）。
+
+        只动"人能看到的那一层"：节点 id、键、来源都不变，所以检索与同步不受影响——
+        改标签是给记忆起个好认的名字，改权重是让它更容易出现在图与检索里，
+        改状态（active/archived）等于手动收进/取出归档。
+        """
+        ident = str(node_id or "").strip()
+        if not ident:
+            raise ValueError("缺少节点 id")
+        row = await self.storage._fetchone(
+            "SELECT * FROM web_nodes WHERE node_id=?", (ident,))
+        if row is None:
+            raise ValueError("节点不存在")
+        fields: dict[str, Any] = {}
+        if label is not None:
+            clean = " ".join(str(label).split())[:120]
+            if not clean:
+                raise ValueError("标签不能为空")
+            fields["label"] = clean
+        if weight is not None:
+            try:
+                value = float(weight)
+            except (TypeError, ValueError):
+                raise ValueError("权重必须是数字")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("权重必须是非负数字")
+            fields["weight"] = min(value, 100000.0)
+        if status is not None:
+            clean_status = str(status).strip()
+            if clean_status not in {"active", "archived"}:
+                raise ValueError("状态只能是 active / archived")
+            fields["status"] = clean_status
+        if note is not None:
+            meta = _safe_meta(row["meta_json"])
+            text = " ".join(str(note).split())[:400]
+            if text:
+                meta["note"] = text
+            else:
+                meta.pop("note", None)
+            fields["meta_json"] = _json(meta)
+        if not fields:
+            return _node_view(row)
+        assignments = ", ".join(f"{name}=?" for name in fields)
+        db = self.storage._conn()
+        async with self.storage._write_lock:
+            await self.storage._begin_write(db)
+            try:
+                await db.execute(
+                    f"UPDATE web_nodes SET {assignments} WHERE node_id=?",
+                    (*fields.values(), ident))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        fresh = await self.storage._fetchone(
+            "SELECT * FROM web_nodes WHERE node_id=?", (ident,))
+        return _node_view(fresh) if fresh is not None else _node_view(row)
+
+    async def neighbourhood(self, node_id: str, *, hops: int = 1,
+                            include_archived: bool = False,
+                            limit_nodes: int = 260,
+                            limit_edges: int = 900) -> dict[str, Any]:
+        """以某个节点为中心的子图（"只看与它相关的"）。
+
+        从中心出发按跳数扩张，取到的节点集合再交给 snapshot 同一套聚合逻辑，
+        所以连线的权重口径、孤立点处理都和全图一致。
+        """
+        center = str(node_id or "").strip()
+        if not center:
+            raise ValueError("缺少节点 id")
+        depth = max(1, min(3, int(hops or 1)))
+        cap = max(20, min(int(limit_nodes), 600))
+        seen: set[str] = {center}
+        frontier: list[str] = [center]
+        for _ in range(depth):
+            if not frontier or len(seen) >= cap:
+                break
+            marks = ",".join("?" for _ in frontier)
+            rows = await self.storage._fetchall(
+                "SELECT src_id, dst_id FROM web_edges "
+                f"WHERE status='active' AND (src_id IN ({marks}) OR dst_id IN ({marks})) "
+                "ORDER BY weight DESC LIMIT ?",
+                (*frontier, *frontier, max(200, cap * 6)))
+            nxt: list[str] = []
+            for row in rows:
+                for value in (str(row["src_id"]), str(row["dst_id"])):
+                    if value in seen:
+                        continue
+                    seen.add(value)
+                    nxt.append(value)
+                    if len(seen) >= cap:
+                        break
+                if len(seen) >= cap:
+                    break
+            frontier = nxt
+        # 用中心 + 邻域作为节点白名单交给 snapshot 的取边逻辑
+        snapshot = await self.snapshot(
+            include_archived=include_archived,
+            limit_nodes=max(len(seen), cap),
+            limit_edges=limit_edges,
+            node_whitelist=seen,
+        )
+        snapshot["focus"] = center
+        snapshot["hops"] = depth
+        return snapshot
 
     async def _source_title(self, ref: str) -> str:
         kind, _, ident = ref.partition(":")

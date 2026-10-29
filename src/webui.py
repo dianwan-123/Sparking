@@ -55,6 +55,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("context_detail", "上下文详细程度"),
     ("memory_web", "记忆网（MemoryWeb）"),
     ("memory_web_node", "记忆网节点详情"),
+    ("memory_web_neighbourhood", "记忆网邻域子图"),
     ("culture", "群风格与心理"),
     ("imports", "快速学习"),
     ("backup_memory", "记忆导出与导入"),
@@ -91,6 +92,7 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("injection_toggle", "开关提示词注入"),
     ("injection_delete", "删除自定义注入"),
     ("context_detail_set", "切换上下文详细程度（压缩档次）"),
+    ("web_node_update", "修改记忆网节点（标签/权重/状态/备注）"),
     ("web_rebuild", "重建记忆网"),
     ("web_branch_create", "创建记忆分支"),
     ("web_branch_revert", "回溯到记忆分支（压缩归档并删回该点）"),
@@ -619,6 +621,30 @@ class PageAPI:
             limit_edges=limit_edges,
         )
 
+    async def _read_memory_web_neighbourhood(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """以某个节点为中心的子图（只看与它相关的）。"""
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        node_id = str(query.get("node_id") or "").strip()
+        if not node_id:
+            raise WebUIError("缺少 node_id")
+        try:
+            hops = int(query.get("hops") or 1)
+            limit_nodes = int(query.get("limit_nodes") or 120)
+            limit_edges = int(query.get("limit_edges") or 400)
+        except (TypeError, ValueError):
+            raise WebUIError("参数无效")
+        include_archived = str(query.get("include_archived") or "").strip() in {
+            "1", "true", "yes", "on"}
+        try:
+            return await web.neighbourhood(
+                node_id, hops=hops, include_archived=include_archived,
+                limit_nodes=max(20, min(limit_nodes, 600)),
+                limit_edges=max(50, min(limit_edges, 2000)))
+        except ValueError as error:
+            raise WebUIError(str(error))
+
     async def _read_memory_web_node(self, query: Mapping[str, Any]) -> dict[str, Any]:
         host = self.host
         web = getattr(host, "memory_web", None)
@@ -639,6 +665,36 @@ class PageAPI:
         if not callable(getter):
             raise WebUIError("上下文详细程度不可用")
         return getter()
+
+    async def _do_web_node_update(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """改节点：标签 / 权重 / 状态 / 备注（只动展示层，不动来源与检索）。"""
+        web = getattr(self.host, "memory_web", None)
+        if web is None:
+            raise WebUIError("记忆网未就绪")
+        node_id = str(body.get("node_id") or "").strip()
+        if not node_id:
+            raise WebUIError("缺少 node_id")
+        kwargs: dict[str, Any] = {}
+        if "label" in body:
+            kwargs["label"] = body.get("label")
+        if "weight" in body:
+            kwargs["weight"] = body.get("weight")
+        if "status" in body:
+            kwargs["status"] = body.get("status")
+        if "note" in body:
+            kwargs["note"] = body.get("note")
+        if not kwargs:
+            raise WebUIError("没有要改的字段（label / weight / status / note）")
+        try:
+            node = await web.update_node(node_id, **kwargs)
+        except ValueError as error:
+            raise WebUIError(str(error))
+        self._invalidate_memory_cache()
+        return {"ok": True, "node": node}
+
+    def _invalidate_memory_cache(self) -> None:
+        """改完节点让记忆网快照的读缓存立刻失效（否则面板还是旧数据）。"""
+        self.invalidate_read_cache()
 
     async def _do_web_rebuild(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """清空记忆网并按当前记忆重建（分支保留）。"""

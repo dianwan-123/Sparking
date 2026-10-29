@@ -430,6 +430,9 @@ textarea { width: 100%; resize: vertical; line-height: 1.65; }
 .web-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .web-detail-head strong { flex: 1; min-width: 0; font-size: 14px; }
 .web-detail-head .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.web-edit { display: grid; grid-template-columns: 1fr 74px; gap: 6px; margin-top: 8px; }
+.web-edit input { width: 100%; font-size: 12.5px; padding: 5px 8px; }
+.web-edit input:nth-child(3) { grid-column: 1 / -1; }
 .web-detail-title { font-size: 12.5px; color: var(--ink-2); margin: 12px 0 6px; font-weight: 600; }
 .web-detail-list { display: flex; flex-direction: column; gap: 4px; }
 .web-detail-edge {
