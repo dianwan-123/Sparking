@@ -225,6 +225,13 @@ class PageAPI:
     _CACHEABLE = {"overview": 20.0, "memory_web": 20.0, "scopes": 20.0,
                   "stickers": 30.0, "capabilities": 30.0}
 
+    def _require_ready(self) -> None:
+        """加载未完成时给出明确提示（路由先挂、初始化后跑，面板不会一片 404）。"""
+        if getattr(self.host, "_load_ready", True):
+            return
+        raise WebUIError(
+            "插件正在加载中（大库首次加载可能要几分钟），稍等一下刷新本页即可")
+
     def _cache_bucket(self) -> dict[str, Any]:
         bucket = getattr(self.host, "_webui_read_cache", None)
         if not isinstance(bucket, dict):
@@ -236,6 +243,9 @@ class PageAPI:
         self._cache_bucket().clear()
 
     async def read(self, route: str, query: Mapping[str, Any]) -> Any:
+        # 环境自检在加载期间也要能看（用来确认"卡在哪一步"）
+        if route != "platform":
+            self._require_ready()
         handler = getattr(self, f"_read_{route}", None)
         if handler is None:
             raise WebUIError(f"未知的数据面：{route}")
@@ -1352,6 +1362,7 @@ class PageAPI:
 
     # ------------------------------------------------------------ 写
     async def write(self, action: str, body: Mapping[str, Any]) -> Any:
+        self._require_ready()
         handler = getattr(self, f"_do_{action}", None)
         if handler is None:
             raise WebUIError(f"未知的操作：{action}")

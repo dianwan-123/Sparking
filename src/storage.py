@@ -117,16 +117,22 @@ class Storage:
         await self.db.execute(f"PRAGMA busy_timeout={max(0, int(self.busy_timeout_ms))}")
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA synchronous=NORMAL")
-        # 统计信息：让"行数"这类面板统计不必扫全表（慢盘上 COUNT(*) 要十几秒），
-        # 顺带让查询规划器有更好的选择。库大时 ANALYZE 本身也不便宜，放后台跑。
-        try:
-            await self.db.execute("PRAGMA optimize")
-        except Exception:
-            pass
         await self._migrate()
         await self._add_scope_tag_column()
         await self._load_table_columns()
         return self
+
+    async def warm_statistics(self, *, timeout: float = 300.0) -> None:
+        """后台补齐查询规划器统计（``sqlite_stat1``）。
+
+        大库首次 ANALYZE 在慢盘上可能要很久，不能放在启动路径上——这里带超时，
+        超时就放弃（面板统计本来就有 COUNT(*) 兜底）。
+        """
+        try:
+            await asyncio.wait_for(self.db.execute("PRAGMA optimize"),
+                                   timeout=max(5.0, float(timeout)))
+        except Exception:
+            pass
 
     async def close(self) -> None:
         if self.db is not None:

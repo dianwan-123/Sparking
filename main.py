@@ -406,6 +406,10 @@ class LongMemoryAgentPlugin(Star):
         self._reply_queue_enabled = True
         self._tasks: set[asyncio.Task[Any]] = set()
         self._stopping = False
+        # 加载完成标志：initialize() 一开始置 False，路由挂上后跑重活，
+        # 跑完再置 True；面板在这期间显示"正在加载"而不是 404。
+        self._load_ready = True
+        self._platform_cache: tuple[float, dict[str, Any]] | None = None
 
     def _config_signature(self) -> str:
         try:
@@ -595,12 +599,22 @@ class LongMemoryAgentPlugin(Star):
             zone = timeutil.configure(None)
         logger.info("长程记忆：时间基准 = %s（存储 UTC / 展示本地）",
                     zone or timeutil.zone_name() or "本机时区")
+        started_at = time.monotonic()
+        # 大库在慢盘上初始化要很久（十几万消息 + 上百万连线），而 AstrBot 是
+        # "await initialize() 之后才算加载完"。所以先挂控制台路由、再干重活：
+        # 加载期间打开面板能看到"正在加载"，不会是一片 404。
+        self._load_ready = False
+        self._init_marks: dict[str, float] = {}
+        self._register_page_routes()
         self._apply_auto_install_setting()
         self._injections_cache = None
         root = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_long_memory_agent"
         root.mkdir(parents=True, exist_ok=True)
         (root / "backups").mkdir(exist_ok=True)
         self.storage = await Storage(root / "memory.db").open()
+        self._spawn(self.storage.warm_statistics())
+        self._init_marks["storage"] = round(time.monotonic() - started_at, 1)
+        logger.info("长程记忆：存储已打开（%.1fs）", time.monotonic() - started_at)
         self._claim_instance_slot()
         self._reap_zombie_instances()
         self.ingest = IngestService(self.storage)
@@ -703,6 +717,8 @@ class LongMemoryAgentPlugin(Star):
         # Rebuild the scope map from disk so autonomous loops act on every known
         # chat immediately instead of waiting for each chat's first message.
         await self._hydrate_known_scopes()
+        self._init_marks["scopes"] = round(time.monotonic() - started_at, 1)
+        logger.info("长程记忆：会话索引就绪（%.1fs）", time.monotonic() - started_at)
         if not self.settings.group_whitelist:
             logger.warning(
                 "长程记忆：群白名单为空——不会完整记忆任何群，也不会在群里主动发言。"
@@ -724,7 +740,8 @@ class LongMemoryAgentPlugin(Star):
         if self.settings.style_learn_hours > 0:
             self._spawn(self._style_learn_loop())
         self._spawn(self._browser_setup_task())
-        self._log_platform_once()
+        # 环境自检里有 fc-list / ldd 这类同步子进程，放后台跑，别拖慢加载
+        self._spawn(self._platform_log_task())
         self._extensions = ExtensionRegistry(root / "extensions.json")
         self._ssh = SSHClient(
             self._ssh_config, connect_timeout=15.0)
@@ -774,7 +791,6 @@ class LongMemoryAgentPlugin(Star):
                 datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             )
             self._save_event_watermark()
-        self._register_page_routes()
         # scripts/ 万能拓展：加载失败只影响该拓展自身，绝不阻塞插件启动
         try:
             await self.load_script_extensions()
@@ -787,7 +803,10 @@ class LongMemoryAgentPlugin(Star):
                 self.settings.persona_id,
                 "已加载（自主发言将带该人设）" if resolved else "未加载，请对照启动日志检查ID",
             )
-        logger.info("长程记忆插件已初始化；仅白名单群会被完整存储")
+        self._load_ready = True
+        self._init_marks["ready"] = round(time.monotonic() - started_at, 1)
+        logger.info("长程记忆插件已初始化（耗时 %.1fs）；仅白名单群会被完整存储",
+                    time.monotonic() - started_at)
 
     async def terminate(self) -> None:
         """Shut down bulletproof: a failing step must never strand the database.
@@ -7579,7 +7598,16 @@ class LongMemoryAgentPlugin(Star):
             "checked": bool(env.get("checked")),
         })
         report["browser"] = browser
+        report["ready"] = bool(getattr(self, "_load_ready", True))
+        report["init"] = dict(getattr(self, "_init_marks", {}) or {})
         return report
+
+    async def _platform_log_task(self) -> None:
+        """后台跑环境自检并打一行启动日志（fc-list/ldd 都是同步子进程）。"""
+        try:
+            await asyncio.to_thread(self._log_platform_once)
+        except Exception:
+            pass
 
     def _log_platform_once(self) -> None:
         """启动时把运行环境打一行日志：迁移换系统后第一时间能看出环境差异。"""
