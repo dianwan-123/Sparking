@@ -312,11 +312,17 @@ class PageAPI:
         }
 
     async def _scope_counts(self) -> dict[str, dict[str, int]]:
-        """一次分组把每个会话的三项计数算齐。
+        """一次分组把每个会话的三项计数算齐（带缓存）。
 
         原实现每会话调 stats(scope)=7 个 COUNT：25 个会话就是 175 次查询，
-        整个「群与会话」页要十几秒。这里 3 条 GROUP BY 一次算完。
+        整个「群与会话」页要十几秒。现在 3 条 GROUP BY 一次算完并缓存 5 分钟——
+        慢盘上这 3 条分组也要扫全表，不能每次开面板都重跑。
         """
+        bucket = self._cache_bucket()
+        hit = bucket.get("_scope_counts")
+        now = time.monotonic()
+        if isinstance(hit, tuple) and now - hit[0] < 300.0:
+            return hit[1]
         counts: dict[str, dict[str, int]] = {}
         for table, field in (("message_identities", "messages"),
                              ("summary_nodes", "summaries"),
@@ -329,11 +335,36 @@ class PageAPI:
             for row in rows:
                 slot = counts.setdefault(str(row["scope_id"]), {})
                 slot[field] = int(row["n"] or 0)
+        bucket["_scope_counts"] = (now, counts)
         return counts
+
+    async def _scope_last_at(self) -> dict[str, str]:
+        """每个会话最后一条消息的时间（一条分组查询，代替每会话一次四表 join）。"""
+        bucket = self._cache_bucket()
+        hit = bucket.get("_scope_last_at")
+        now = time.monotonic()
+        if isinstance(hit, tuple) and now - hit[0] < 300.0:
+            return hit[1]
+        result: dict[str, str] = {}
+        try:
+            rows = await self.storage._fetchall(
+                "SELECT mi.scope_id AS scope_id, MAX(mr.occurred_at) AS last_at "
+                "FROM message_identities mi JOIN message_current mc "
+                "ON mc.message_id=mi.message_id JOIN message_revisions mr "
+                "ON mr.revision_id=mc.revision_id WHERE mc.is_deleted=0 "
+                "GROUP BY mi.scope_id")
+            for row in rows:
+                if row["last_at"]:
+                    result[str(row["scope_id"])] = str(row["last_at"])[:19]
+        except Exception:
+            result = {}
+        bucket["_scope_last_at"] = (now, result)
+        return result
 
     async def _read_scopes(self, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows = await self.storage.all_scopes("aiocqhttp")
         counts = await self._scope_counts()
+        last_seen = await self._scope_last_at()
         out: list[dict[str, Any]] = []
         for row in rows:
             conversation = str(row.get("conversation_id") or "")
@@ -341,7 +372,6 @@ class PageAPI:
             if not conversation or not scope:
                 continue
             stats = counts.get(scope, {})
-            tail = await self.storage.recent_messages(scope, 1)
             config = await self.storage.get_group_config(scope)
             out.append({
                 "group_id": conversation,
@@ -357,7 +387,7 @@ class PageAPI:
                 "messages": stats.get("messages", 0),
                 "summaries": stats.get("summaries", 0),
                 "memories": stats.get("memories", 0),
-                "last_at": str(tail[0].occurred_at)[:19] if tail else "",
+                "last_at": last_seen.get(scope, ""),
             })
         out.sort(key=lambda item: item["last_at"], reverse=True)
         return out

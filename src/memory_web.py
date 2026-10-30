@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import re
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -785,6 +786,18 @@ class MemoryWeb:
 
     # ---------------------------------------------------------------- 面板
     async def stats(self) -> dict[str, Any]:
+        """记忆网规模统计（缓存 2 分钟）。
+
+        三个 COUNT 在慢盘上要十几秒（全库十几万节点、上百万连线），而面板每次
+        刷新都会拉；数字差一两分钟没人看得出来。
+        """
+        cache = getattr(self, "_stats_cache_mw", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._stats_cache_mw = cache
+        now = time.monotonic()
+        if cache.get("at") and now - float(cache["at"]) < 120.0:
+            return dict(cache.get("value") or {})
         rows = await self.storage._fetchall(
             "SELECT kind, COUNT(*) AS n FROM web_nodes WHERE status='active' "
             "GROUP BY kind")
@@ -796,7 +809,7 @@ class MemoryWeb:
         pruned = await self.storage._fetchone(
             "SELECT COUNT(*) AS n FROM web_nodes WHERE status='pruned'")
         meta = await self._meta()
-        return {
+        value = {
             "nodes": sum(kinds.values()),
             "edges": int(edge["n"]) if edge else 0,
             "sources": int(sources["n"]) if sources else 0,
@@ -805,6 +818,9 @@ class MemoryWeb:
             "last_sync_at": meta.get("last_sync_at", ""),
             "migrated_at": meta.get("migrated_at", ""),
         }
+        cache["at"] = now
+        cache["value"] = dict(value)
+        return value
 
     async def snapshot(self, *, scope_id: str = "", kinds: Sequence[str] = (),
                        include_archived: bool = False,

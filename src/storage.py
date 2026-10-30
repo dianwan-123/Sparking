@@ -117,6 +117,12 @@ class Storage:
         await self.db.execute(f"PRAGMA busy_timeout={max(0, int(self.busy_timeout_ms))}")
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA synchronous=NORMAL")
+        # 统计信息：让"行数"这类面板统计不必扫全表（慢盘上 COUNT(*) 要十几秒），
+        # 顺带让查询规划器有更好的选择。库大时 ANALYZE 本身也不便宜，放后台跑。
+        try:
+            await self.db.execute("PRAGMA optimize")
+        except Exception:
+            pass
         await self._migrate()
         await self._add_scope_tag_column()
         await self._load_table_columns()
@@ -2301,10 +2307,12 @@ class Storage:
         return target
 
     async def stats(self, scope_id: str | None = None) -> dict[str, Any]:
-        """各表计数（全局统计缓存 15 秒）。
+        """各表计数（全局统计缓存，慢盘上也能秒回）。
 
-        控制台 overview 与记忆网快照都会拉它；大库上 7 个 COUNT 反复全表扫不值当，
-        而面板显示差几秒没人看得出来。
+        为什么不用 `SELECT COUNT(*)`：在慢盘/云盘上，`COUNT(*)` 要扫全表或全部索引，
+        17 万条消息就要十几秒——控制台首屏（overview）与记忆网快照都会拉它，
+        于是整个面板也跟着卡。这里改成读 SQLite 的统计信息（sqlite_stat1），
+        一个索引页就能拿到行数估计；再退一步才用 COUNT，且缓存 5 分钟。
         """
         cache = getattr(self, "_stats_cache", None)
         if not isinstance(cache, dict):
@@ -2313,16 +2321,51 @@ class Storage:
         key = str(scope_id or "")
         now = time.monotonic()
         hit = cache.get(key)
-        if isinstance(hit, tuple) and now - hit[0] < 15.0:
+        if isinstance(hit, tuple) and now - hit[0] < 300.0:
             return dict(hit[1])
         suffix, params = (" WHERE scope_id=?", (scope_id,)) if scope_id else ("", ())
         result: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "fts5": self.fts5_available}
-        for name in ("scopes", "message_identities", "summary_nodes", "memory_items", "catalog_entries", "jobs", "embeddings"):
+        tables = ("scopes", "message_identities", "summary_nodes", "memory_items",
+                  "catalog_entries", "jobs", "embeddings")
+        estimates = {} if scope_id else await self._table_estimates(tables)
+        for name in tables:
             where = suffix if name != "scopes" else ((" WHERE scope_id=?") if scope_id else "")
-            row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {name}{where}", params)
-            result[name] = int(row["n"])
+            count = estimates.get(name)
+            if count is None:
+                try:
+                    row = await self._fetchone(
+                        f"SELECT COUNT(*) AS n FROM {name}{where}", params)
+                    count = int(row["n"])
+                except Exception:
+                    count = 0
+            result[name] = int(count)
         cache[key] = (now, dict(result))
         return result
+
+    async def _table_estimates(self, tables: Sequence[str]) -> dict[str, int]:
+        """从 sqlite_stat1 读行数估计（O(索引项)，不扫表）。
+
+        只在自己表上有索引统计时可用（ANALYZE 过、或索引本身被统计）；
+        拿不到就返回空，调用方退回 COUNT。
+        """
+        estimates: dict[str, int] = {}
+        try:
+            rows = await self._fetchall(
+                "SELECT tbl, stat FROM sqlite_stat1")
+        except Exception:
+            return estimates
+        for row in rows:
+            table = str(row["tbl"])
+            if table not in tables:
+                continue
+            parts = str(row["stat"] or "").split()
+            if not parts or not parts[0].isdigit():
+                continue
+            value = int(parts[0])
+            # 多个索引时取最大值（更接近真实行数）
+            if value > estimates.get(table, -1):
+                estimates[table] = value
+        return estimates
 
     async def _sync_search(self, message_id: str, scope_id: str, text: str, deleted: bool) -> None:
         db = self._conn()

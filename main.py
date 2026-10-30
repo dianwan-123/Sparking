@@ -1616,6 +1616,19 @@ class LongMemoryAgentPlugin(Star):
                         "长程记忆：模型 %s 不可用且没有别的候选（%s）",
                         provider_id[:40], str(error)[:80],
                     )
+                # 超时类失败快速切换：AstrBot 自己已经按 provider 的 timeout 重试过好几轮，
+                # 插件再原样重试同一个模型只是白烧时间（实测连续 20+ 次全超时，
+                # 用户看到的就是"回复要等几分钟"）。第一次超时就直接换候选模型。
+                timed_out = isinstance(error, (TimeoutError, asyncio.TimeoutError)) or                     "timed out" in str(error).lower() or "timeout" in str(error).lower()
+                if timed_out and attempt == 1:
+                    alternative = await self._alternate_provider(provider_id)
+                    if alternative:
+                        logger.warning(
+                            "长程记忆：模型 %s 超时，改用 %s 重试",
+                            provider_id[:40], alternative[:40],
+                        )
+                        provider_id = alternative
+                        continue
                 logger.warning(
                     "长程记忆：LLM调用失败（第%d/%d次尝试）：%s",
                     attempt, max_attempts, str(error)[:200],
