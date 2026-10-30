@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.1.6-orange.svg" alt="v1.1.6">
+  <img src="https://img.shields.io/badge/version-v1.1.7-orange.svg" alt="v1.1.7">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -64,6 +64,14 @@
 
 > [!TIP]
 > **NapCat / SnowLuma 用户**：两个网关的差异插件内部都适配好了，直接可用。
+
+> **Linux 服务器（Ubuntu / Debian 等）**：Windows 与 Linux 都能跑。服务器上第一次用浏览器截图前，chromium 还需要系统库与中文字体——以 root 运行插件时会自动补装，非 root 时日志和控制台会给出对应命令：
+> ```bash
+> sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+>   libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+>   libpango-1.0-0 libcairo2 libasound2 fonts-noto-cjk
+> ```
+> 控制台「概览 → 系统与环境」能看到操作系统、桌面会话、中文字体与浏览器缺库情况，并可一键重新检测/安装。
 
 > **想用自己的语音合成？** 配置里把「语音合成方式」设为 `custom`，填上 `tts_api_url`（OpenAI 兼容的 `/v1/audio/speech` 形状即可），再按需填 Key / 模型 / 音色；失败会自动退回文字。
 
@@ -292,8 +300,14 @@ QQ 只在服务端缓存转发资源一小段时间。Sparking 在**消息到达
 发送层做了多重拦截（计划 JSON 泄漏、心声、失控重复）。若仍遇到，请带日志开 Issue——这类问题一律按插件缺陷处理。
 </details>
 
-## 🧪 实验性功能（接口可能随版本调整）
+<details>
+<summary><b>迁到 Linux 服务器后网页打不开 / 截图里中文是方块 / 图表乱码</b></summary>
 
+先看控制台「概览 → 系统与环境」：缺系统库会直接列出来（照提示 `apt-get install`），中文字体缺失就装 `fonts-noto-cjk`；点「重新检测/安装浏览器环境」会重跑一遍检测并补装。以 root 运行插件时这些依赖会自动装好。
+「桌面会话：无」不用管——插件会自动用无头浏览器，`browser_headful` 在没桌面的服务器上会被忽略而不是报错。
+</details>
+
+## 🧪 实验性功能（接口可能随版本调整）
 - SSH 远程运维
 - 手写拓展（scripts/）
 - 内置拓展「生图 API」（接入 OpenAI 格式的生图接口；**尚未完工、暂不可用**，默认关闭）

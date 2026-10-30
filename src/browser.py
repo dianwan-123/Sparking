@@ -280,6 +280,28 @@ def _decompress(data: bytes, headers: Any) -> bytes:
     return data
 
 
+def _make_ssl_context() -> ssl.SSLContext:
+    """HTTPS 校验上下文；系统证书库为空时退回 certifi。
+
+    精简的 Linux 镜像（没装 ca-certificates）里 ``create_default_context()``
+    拿不到任何根证书，所有 HTTPS 都报 CERTIFICATE_VERIFY_FAILED。装了 certifi
+    就用它自带的根证书包，没装就沿用系统默认。
+    """
+    context: ssl.SSLContext | None = None
+    try:
+        context = ssl.create_default_context()
+        if context.get_ca_certs():
+            return context
+    except Exception:
+        context = None
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return context if context is not None else ssl.create_default_context()
+
+
 class BrowserSession:
     """A small multi-tab browser backed by the standard library only.
 
@@ -305,7 +327,7 @@ class BrowserSession:
         self._next_tab = 1
         self._cache: dict[str, Page] = {}
         self._lock = asyncio.Lock()
-        self._context = ssl.create_default_context()
+        self._context = _make_ssl_context()
 
     # ------------------------------------------------------------------ tabs
     def _tab(self, tab_id: int | None = None) -> Tab:

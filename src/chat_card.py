@@ -158,7 +158,8 @@ def build_card_html(messages: list[dict[str, Any]], *, title: str = "聊天记�
         '<!DOCTYPE html><html><head><meta charset="utf-8"><style>'
         f"html,body{{margin:0;padding:0;background:{_CARD_BG};}}"
         ".card{width:520px;padding:14px 16px 10px;font-family:'Microsoft YaHei',"
-        "'PingFang SC','Noto Sans CJK SC',sans-serif;}"
+        "'PingFang SC','Hiragino Sans GB','Noto Sans CJK SC','Source Han Sans SC',"
+        "'WenQuanYi Zen Hei','WenQuanYi Micro Hei','Droid Sans Fallback',sans-serif;}"
         ".title{display:flex;justify-content:center;margin-bottom:10px;}"
         ".title span{background:rgba(0,0,0,.28);color:#fff;font-size:13px;"
         "padding:3px 12px;border-radius:12px;}"

@@ -7,9 +7,12 @@ Runs in the background after plugin install/startup:
 2. chromium kernel not cached → ``playwright install chromium`` with
    PLAYWRIGHT_DOWNLOAD_HOST pointed at npmmirror (domestic, fast).
 
-Only the chromium kernel is downloaded (lightweight — no firefox/webkit, no
-``--with-deps`` system packages). Every failure is reported in the returned
-status dict and never breaks the plugin.
+Only the chromium kernel is downloaded (lightweight — no firefox/webkit). On
+Linux the kernel additionally needs a handful of system shared libraries
+(libnss3, libgbm …); when they are missing and we run as root they are installed
+via ``playwright install-deps chromium``, otherwise the exact ``apt-get`` command
+is reported. Every failure is reported in the returned status dict and never
+breaks the plugin.
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from . import platform_support as plat
 
 PIP_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
 PW_DOWNLOAD_HOSTS = [
@@ -35,12 +40,7 @@ def playwright_installed(name: str = "playwright") -> bool:
 
 
 def _candidate_roots() -> list[Path]:
-    roots: list[Path] = []
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        roots.append(Path(local) / "ms-playwright")
-    roots.append(Path.home() / ".cache" / "ms-playwright")
-    return roots
+    return plat.playwright_cache_roots()
 
 
 def chromium_cached(root: Path | None = None) -> bool:
@@ -89,6 +89,57 @@ async def _run(cmd: list[str], *, timeout: int, env: dict[str, str] | None = Non
     return await asyncio.to_thread(_sync)
 
 
+def _chromium_binary() -> str:
+    """已下载的完整 chromium 可执行文件（没有则空串）。"""
+    try:
+        from .pw_driver import _resolve_full_chromium
+
+        return _resolve_full_chromium()
+    except Exception:
+        return ""
+
+
+async def _ensure_system_deps(run: Callable[..., Awaitable[tuple[int, str]]],
+                              log: Callable[[str], Any],
+                              status: dict[str, Any],
+                              log_file: Path | None = None) -> None:
+    """Linux：chromium 缺系统库时补装（有 root 直接装，没有就给 apt 命令）。
+
+    Windows/macOS 上 chromium 自带全部依赖，这一步是空操作。
+    """
+    exe = _chromium_binary()
+    missing = plat.missing_shared_libs(exe)
+    status["missing_libs"] = missing
+    if not missing:
+        return
+    packages = plat.apt_packages_for(missing)
+    status["apt_packages"] = packages
+    hint = ("sudo apt-get install -y " + " ".join(packages)) if packages else ""
+    log(f"浏览器环境：chromium 缺少系统库 {', '.join(missing[:6])}")
+    if plat.is_root() and plat.which("apt-get"):
+        log("浏览器环境：正在以 root 身份安装系统依赖（playwright install-deps）……")
+        code, tail = await run(
+            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+            timeout=900)
+        status.setdefault("steps", []).append(
+            f"playwright install-deps chromium -> exit {code}")
+        _append_log(log_file,
+                    f"playwright install-deps chromium exit={code}\n{tail}")
+        still = plat.missing_shared_libs(exe)
+        status["missing_libs"] = still
+        if not still:
+            log("浏览器环境：系统依赖已装好")
+            return
+        status["error"] = (
+            "chromium 系统依赖安装后仍缺库：" + ", ".join(still[:6])
+            + (f"；可手动执行：{hint}" if hint else ""))
+        return
+    status["error"] = (
+        "chromium 缺少系统库：" + ", ".join(missing[:6])
+        + (f"；请执行：{hint}" if hint else "")
+        + "（或用 root 运行插件让它自动安装）")
+
+
 async def ensure_browser_environment(
     *,
     auto_install: bool = True,
@@ -100,7 +151,8 @@ async def ensure_browser_environment(
 ) -> dict[str, Any]:
     """Detect (and optionally install) the browser environment.
 
-    Returns a status dict: {playwright, chromium, steps, error}.
+    Returns a status dict: {playwright, chromium, steps, error, missing_libs,
+    cjk_font}。Linux 上还会补系统库，缺中文字体时给出提示。
     """
     log = logger or (lambda _msg: None)
     check = import_check or playwright_installed
@@ -127,6 +179,8 @@ async def ensure_browser_environment(
     if cached():
         status["chromium"] = True
         log("浏览器环境：chromium 内核已就绪，截图与页面操作可用")
+        await _ensure_system_deps(run, log, status, log_file)
+        _report_fonts(log, status)
         return status
     if not auto_install:
         status["error"] = "chromium 内核未下载，且 browser_auto_install 已关闭"
@@ -156,6 +210,8 @@ async def ensure_browser_environment(
         if code == 0 and cached():
             status["chromium"] = True
             log("浏览器环境：chromium 内核下载完成，网页截图/点击/输入已解锁")
+            await _ensure_system_deps(run, log, status, log_file)
+            _report_fonts(log, status)
             return status
         log(f"浏览器环境：该下载源失败（exit {code}），换下一个……")
     status["error"] = (
@@ -164,3 +220,15 @@ async def ensure_browser_environment(
         + (f"。完整输出见 {log_file}" if log_file else "")
     )
     return status
+
+
+def _report_fonts(log: Callable[[str], Any], status: dict[str, Any]) -> None:
+    """中文页面截图需要系统里有中文字体，否则全是方块。"""
+    ok = plat.has_cjk_font()
+    status["cjk_font"] = ok
+    if ok:
+        return
+    hint = ("浏览器环境：系统没有中文字体，截图里的中文会变成方块，"
+            "建议安装：sudo apt-get install -y fonts-noto-cjk")
+    log(hint)
+    status["font_hint"] = hint

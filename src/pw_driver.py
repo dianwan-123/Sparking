@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .browser import BrowserError, assert_browsable
+from . import platform_support as plat
 
 # 市场规范：日志器必须取自 astrbot.api，插件不自建日志器
 
@@ -62,20 +63,10 @@ def _resolve_full_chromium() -> str:
     so we point Playwright at the full binary via ``executable_path``. Globs the
     revision dir so it keeps working after Playwright downloads a newer chromium.
     """
-    bases: list[Path] = []
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        bases.append(Path(local) / "ms-playwright")
-    bases.append(Path.home() / ".cache" / "ms-playwright")   # linux / mac
-    patterns = (
-        "chromium-*/chrome-win64/chrome.exe",
-        "chromium-*/chrome-win/chrome.exe",
-        "chromium-*/chrome-linux/chrome",
-        "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
-    )
+    bases = plat.playwright_cache_roots()
     hits: list[str] = []
     for base in bases:
-        for pattern in patterns:
+        for pattern in plat.chromium_patterns():
             hits.extend(glob.glob(str(base / pattern)))
     if not hits:
         return ""
@@ -181,7 +172,10 @@ class PlaywrightDriver:
         self._timeout = max(5.0, float(timeout))
         # 有头模式：服务器上有桌面会话时（比如你在 RDP 里挂着），像真人浏览器一样开窗口，
         # 反爬/风控最不敏感。默认无头，出问题可在配置里打开。
-        self._headful = bool(headful)
+        # 但 Linux 服务器通常没有 X/Wayland，headless=False 会直接起不来
+        # （Missing X server or $DISPLAY）——没有桌面会话时自动降级为无头。
+        self._headful = bool(headful) and plat.display_available()
+        self.headful_downgraded = bool(headful) and not self._headful
         self._user_data_dir = str(user_data_dir) if user_data_dir else ""
         self._executable_path = str(executable_path) if executable_path else ""
         self._pw: Any = None
@@ -205,6 +199,22 @@ class PlaywrightDriver:
         if exe and not os.path.exists(exe):
             exe = ""
         return exe
+
+    def _launch_error_hint(self, error: Any) -> str:
+        """把启动失败翻译成可执行的建议（缺库/缺字体/无桌面会话各给各的办法）。"""
+        raw = str(error or "")
+        head = "浏览器内核启动失败（可能 chromium 未下载，重启插件后台会自动安装）"
+        lowered = raw.lower()
+        if "shared libraries" in lowered or "error while loading" in lowered:
+            missing = plat.missing_shared_libs(self._chromium_executable())
+            packages = plat.apt_packages_for(missing)
+            if packages:
+                return ("浏览器内核缺少系统库（" + ", ".join(missing[:6]) + "）："
+                        "sudo apt-get install -y " + " ".join(packages))
+        if "display" in lowered or "x server" in lowered:
+            return ("浏览器需要桌面会话才能开窗口：服务器没有 DISPLAY，"
+                    "把 browser_headful 关掉（默认就是无头）")
+        return f"{head}：{raw[:160]}"
 
     async def _launch_context(self) -> Any:
         """Persistent context when a profile dir is set, else ephemeral.
@@ -289,9 +299,7 @@ class PlaywrightDriver:
                 except Exception as retry_error:
                     await self._reset()
                     raise BrowserError(
-                        "浏览器内核启动失败（可能 chromium 未下载，"
-                        "重启插件后台会自动安装）："
-                        f"{str(retry_error or error)[:160]}") from retry_error
+                        self._launch_error_hint(retry_error or error)) from retry_error
         return self._page
 
     async def _acquire_page(self) -> Any:

@@ -20,6 +20,8 @@ _ZONE_NAME = ""
 TIME_KEYS = ("occurred_at", "created_at", "updated_at", "first_seen", "last_seen",
              "next_run_at", "last_run_at", "finished_at", "time")
 
+_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
 
 def configure(name: str | None) -> str:
     """按 AstrBot 配置定基准时区；无效/为空则用本机时区。返回生效的时区名。"""
@@ -52,7 +54,23 @@ def now() -> _dt.datetime:
 
 
 def text(fmt: str = "%Y-%m-%d %H:%M", at: _dt.datetime | None = None) -> str:
-    return (at or now()).strftime(fmt)
+    """格式化时间；``%A`` 一律给中文星期（不随系统 locale 变）。
+
+    ``strftime("%A")`` 跟着 locale 走：Windows 中文系统给"星期五"，Linux 服务器
+    （LANG=C / en_US）给"Friday"。同一个插件在两台机器上对模型说的时间描述不该
+    不一样，这里统一成中文。
+    """
+    moment = at or now()
+    rendered = moment.strftime(fmt)
+    if "%A" in fmt:
+        rendered = rendered.replace(moment.strftime("%A"),
+                                    _WEEKDAYS[moment.weekday()])
+    return rendered
+
+
+def weekday_name(at: _dt.datetime | None = None) -> str:
+    """中文星期（星期一 … 星期日）。"""
+    return _WEEKDAYS[(at or now()).weekday()]
 
 
 def parse(value: Any) -> _dt.datetime | None:

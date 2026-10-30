@@ -30,6 +30,7 @@ from .src.agent_tools import AgentToolService, AuthorizationError
 from .src.astrbot_runtime import build_runtime_manifest
 from .src.browser import BrowserError, BrowserSession, allow_local_port, page_text
 from .src.browser_setup import ensure_browser_environment
+from .src.platform_support import system_report
 from .src.pw_driver import PlaywrightDriver
 from .src.ssh_ext import (
     SSHAgentManager,
@@ -282,7 +283,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.6"
+PLUGIN_VERSION = "1.1.7"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -723,6 +724,7 @@ class LongMemoryAgentPlugin(Star):
         if self.settings.style_learn_hours > 0:
             self._spawn(self._style_learn_loop())
         self._spawn(self._browser_setup_task())
+        self._log_platform_once()
         self._extensions = ExtensionRegistry(root / "extensions.json")
         self._ssh = SSHClient(
             self._ssh_config, connect_timeout=15.0)
@@ -2752,7 +2754,7 @@ class LongMemoryAgentPlugin(Star):
         模型只能猜。这里统一给，并要求寒暄必须按它对上。
         """
         moment = timeutil.now()
-        return (f"现在是 {moment.strftime('%Y-%m-%d %H:%M')}（{moment.strftime('%A')}，"
+        return (f"现在是 {moment.strftime('%Y-%m-%d %H:%M')}（{timeutil.weekday_name(moment)}，"
                 f"本地时间，{self._time_of_day(moment.hour)}）。"
                 "**打招呼/寒暄（早安、晚安、下午好…）必须按这个时间说，说错很出戏**；"
                 "判断「隔了多久」「是不是该睡了」也以它为准。")
@@ -5300,7 +5302,7 @@ class LongMemoryAgentPlugin(Star):
     @filter.llm_tool(name="run_script")
     async def run_script_tool(self, event: AstrMessageEvent, path: str,
                               args: str = "", timeout: int = 60):
-        """在工作区里运行一个脚本文件（.py/.js/.sh/.bat/.ps1），返回 exit_code 与输出。
+        """在工作区里运行一个脚本文件（.py/.js/.sh，按本机实际装了的解释器），返回 exit_code 与输出。
         脚本必须位于允许目录内；超时会被掐断（最长 10 分钟）。
 
         Args:
@@ -7550,21 +7552,85 @@ class LongMemoryAgentPlugin(Star):
         head = f"{title}（{url}）" if title else url
         return f"{head}\n{text[:limit * 1000]}"
 
+    def _platform_report(self) -> dict[str, Any]:
+        """本机环境自检：系统、Python、桌面会话、中文字体、浏览器缺库。
+
+        控制台「系统与环境」面板和 bot 的自查工具都读这一份；系统层面的探测
+        （fc-list / ldd）结果缓存 5 分钟，浏览器安装状态每次现取。
+        """
+        now = time.monotonic()
+        cache = getattr(self, "_platform_cache", None)
+        if not (isinstance(cache, tuple) and now - cache[0] < 300.0):
+            try:
+                report = system_report(
+                    browser_executable=getattr(
+                        self.settings, "browser_executable_path", "") or "")
+            except Exception as error:
+                report = {"error": f"环境自检失败：{str(error)[:200]}"}
+            cache = (now, report)
+            self._platform_cache = cache
+        report = dict(cache[1])
+        browser = dict(report.get("browser") or {})
+        env = dict(getattr(self, "_browser_env", {}) or {})
+        browser.update({
+            "playwright": bool(env.get("playwright")),
+            "chromium": bool(env.get("chromium")),
+            "error": str(env.get("error") or "")[:300],
+            "checked": bool(env.get("checked")),
+        })
+        report["browser"] = browser
+        return report
+
+    def _log_platform_once(self) -> None:
+        """启动时把运行环境打一行日志：迁移换系统后第一时间能看出环境差异。"""
+        if getattr(self, "_platform_logged", False):
+            return
+        self._platform_logged = True
+        try:
+            report = self._platform_report()
+            logger.info(
+                "长程记忆：运行环境 %s / Python %s / 桌面会话=%s / 中文字体=%s",
+                report.get("os", "?"), report.get("python", "?"),
+                "有" if report.get("display") else "无",
+                "有" if report.get("cjk_font") else "无")
+            browser = report.get("browser") or {}
+            if browser.get("missing_libs"):
+                logger.warning("长程记忆：%s", browser.get("hint") or "")
+            if report.get("hint"):
+                logger.warning("长程记忆：%s", report["hint"])
+        except Exception:
+            pass
+
     async def _browser_setup_task(self) -> None:
         """Install-time auto-detection: pip mirror + npmmirror kernel download."""
+        await self._run_browser_setup(log=True)
+
+    async def _run_browser_setup(self, *, log: bool = False) -> dict[str, Any]:
+        """检测/安装浏览器环境（内核 + Linux 系统库），返回最新状态。
+
+        安装可能持续很久（下载内核），调用方负责放到后台跑。
+        """
         log_file = None
         if self.storage is not None:
             log_file = self.storage.path.parent / "browser_setup.log"
-        self._browser_env = await ensure_browser_environment(
+        status = await ensure_browser_environment(
             # 浏览器环境安装也归总开关管：关掉 auto_install_deps 就一律不自动装
             auto_install=bool(self.settings.browser_auto_install
                               and self.settings.auto_install_deps),
             logger=lambda msg: logger.info("长程记忆：%s", str(msg)[:200]),
             log_file=log_file,
         )
-        self._browser_env["checked"] = True
-        if self._browser_env.get("error"):
-            logger.warning("长程记忆：浏览器环境：%s", self._browser_env["error"])
+        status["checked"] = True
+        self._browser_env = status
+        self._platform_cache = None
+        if log and status.get("error"):
+            logger.warning("长程记忆：浏览器环境：%s", status["error"])
+        return status
+
+    async def _repair_browser_env(self) -> dict[str, Any]:
+        """重新检测并补装浏览器环境（缺什么装什么），返回最新环境报告。"""
+        await self._run_browser_setup(log=True)
+        return self._platform_report()
 
     def _pw_driver(self) -> PlaywrightDriver:
         if self._pw is None:
@@ -7578,6 +7644,9 @@ class LongMemoryAgentPlugin(Star):
                 headful=headful)
             logger.info("长程记忆：浏览器启动模式 = %s（heads-up 在服务器上更像真人浏览器）",
                         "有头(真实窗口)" if headful else "无头")
+            if headful and getattr(self._pw, "headful_downgraded", False):
+                logger.warning(
+                    "长程记忆：这台机器没有桌面会话（DISPLAY），有头浏览器已自动降级为无头")
         return self._pw
 
     # ------------------------------------------------------------------ studio（designer / programmer）
@@ -10014,6 +10083,26 @@ class LongMemoryAgentPlugin(Star):
         if not self._is_owner(event):
             return "只有主人（配置里的 owner_ids）才能看日志。"
         return await self._read_astrbot_logs(tail=tail, keyword=keyword)
+
+    @filter.llm_tool(name="system_status")
+    async def system_status_tool(self, event: AstrMessageEvent, action: str = "check"):
+        """主人专用：本机环境自检（操作系统、Python、桌面会话、中文字体、浏览器内核与缺库）。
+
+        排障入口：网页打不开/截图空白/图表中文变方块 → 先 action=check 看
+        browser.missing_libs 与 cjk_font；缺系统库时按 browser.hint 里的 apt 命令装，
+        有 root 的话直接 action=repair 让插件自己补装，装完再 check 一次确认。
+
+        Args:
+            action(string): check（只体检，默认）/ repair（重新检测并补装浏览器内核与系统库）。
+        """
+        if not self._is_owner(event):
+            return "只有主人（配置里的 owner_ids）才能做环境自检。"
+        try:
+            if str(action or "").strip().lower() == "repair":
+                return compact_json(await self._repair_browser_env(), 4000)
+            return compact_json(self._platform_report(), 4000)
+        except Exception as error:
+            return f"环境自检失败：{str(error)[:200]}"
 
     async def _read_astrbot_logs(self, tail: int = 120, keyword: str = "") -> str:
         """读最近日志：优先 AstrBot 内存环形缓冲，其次 data/logs 下的日志文件。"""
@@ -13696,6 +13785,10 @@ _TOOL_QUERY_ALIASES: dict[str, tuple[str, ...]] = {
     "表格": ("table", "csv", "excel", "pandas", "tabular"),
     "转发": ("forward", "share"),
     "拓展": ("extension", "script", "plugin"),
+    "环境": ("platform", "system", "env", "browser", "status"),
+    "系统": ("system", "platform", "os", "status"),
+    "字体": ("font", "cjk", "platform"),
+    "依赖": ("deps", "depend", "install", "platform"),
 }
 
 

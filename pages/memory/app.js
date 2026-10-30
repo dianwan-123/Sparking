@@ -1397,6 +1397,42 @@ window.SparkingWeb = (() => {
       usageBox.appendChild(line);
     });
     if (!daily.length && !totalCalls) usageBox.appendChild(el("div", "muted", "近 7 天暂无调用记录"));
+
+    renderPlatform(data.platform || {}, data.browser_env || {});
+  }
+
+  // 系统与环境：换机器/换系统后先看这块——缺系统库、缺中文字体、没有桌面会话
+  // 都会直接导致"网页打不开/截图空白/图表全是方块"。
+  function renderPlatform(platform, browserEnv) {
+    const box = $("overview-platform");
+    if (!box) return;
+    box.textContent = "";
+    const missing = (platform.browser_missing_libs || []).join("、");
+    const ready = browserEnv.chromium ? "内核就绪"
+      : browserEnv.checked ? "未就绪" : "检测中";
+    const rows = [
+      ["系统", `${platform.os || "未知"} · Python ${platform.python || "?"}`],
+      ["浏览器", ready + (missing ? `（缺系统库：${missing}）` : "")],
+      ["中文字体", platform.cjk_font ? "已安装" : "缺失（截图/图表中文会变方块）"],
+      ["桌面会话", platform.display ? "有（可用有头浏览器）" : "无（自动用无头）"],
+    ];
+    rows.forEach(([key, value]) => {
+      box.appendChild(el("b", "", key));
+      box.appendChild(el("span", "", String(value ?? "")));
+    });
+    if (platform.hint) box.appendChild(el("div", "muted", platform.hint));
+    const actions = $("overview-platform-actions");
+    if (actions) {
+      actions.textContent = "";
+      actions.appendChild(actionBtn("重新检测/安装浏览器环境", async () => {
+        try {
+          const result = await post("browser_repair", {});
+          toast(result.message || "已在后台重新检测", "ok");
+        } catch (error) {
+          toast(String(error.message || error), "error");
+        }
+      }));
+    }
   }
 
   // ---------------------------------------------------------------- 记忆

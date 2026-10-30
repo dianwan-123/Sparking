@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-import subprocess
 import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from . import platform_support as plat
 
 MAX_READ_CHARS = 200_000
 MAX_WRITE_BYTES = 4 * 1024 * 1024
@@ -241,24 +242,36 @@ class Workspace:
                 "truncated": len(matches) >= cap}
 
     # ------------------------------------------------------------ 脚本运行
-    _INTERPRETERS = {
-        ".py": None,                     # 用当前解释器（sys.executable）
-        ".js": ["node"], ".mjs": ["node"], ".cjs": ["node"],
-        ".sh": ["bash"], ".bash": ["bash"],
-        ".bat": ["cmd", "/c"], ".cmd": ["cmd", "/c"],
-        ".ps1": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
-    }
+    # 解释器按本机实际安装情况给：Windows 上才有 cmd/powershell，Linux 上
+    # bash/node 可能压根没装——缺的时候要说清是"缺解释器"而不是"类型不支持"。
+    _SUPPORTED_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".sh", ".bash",
+                           ".bat", ".cmd", ".ps1")
 
     def script_command(self, script: Path, args: Sequence[str]) -> list[str]:
-        if script.suffix.lower() == ".py":
+        suffix = script.suffix.lower()
+        if suffix == ".py":
             command = [sys.executable, str(script)]
         else:
-            prefix = self._INTERPRETERS.get(script.suffix.lower())
-            if prefix is None:
+            if suffix not in self._SUPPORTED_SUFFIXES:
                 raise WorkspaceError(
-                    f"不支持的脚本类型：{script.suffix}（支持 .py/.js/.sh/.bat/.ps1）")
+                    f"不支持的脚本类型：{suffix}（支持 .py/.js/.sh/.bat/.ps1）")
+            prefix = plat.shell_interpreters().get(suffix)
+            if not prefix:
+                raise WorkspaceError(
+                    f"这台机器上没有能运行 {suffix} 的解释器"
+                    f"（{self._interpreter_hint(suffix)}）")
             command = [*prefix, str(script)]
         return [*command, *[str(a) for a in args]]
+
+    @staticmethod
+    def _interpreter_hint(suffix: str) -> str:
+        if suffix in (".sh", ".bash"):
+            return "需要 bash"
+        if suffix in (".js", ".mjs", ".cjs"):
+            return "需要 node"
+        if suffix == ".ps1":
+            return "需要 PowerShell（pwsh）"
+        return "这类脚本只能在 Windows 上运行"
 
     async def run_script(self, path: str, *, args: str = "",
                          timeout: int = 60) -> dict[str, Any]:
@@ -267,27 +280,26 @@ class Workspace:
             raise WorkspaceError(f"脚本不存在：{script}")
         limit = min(max(5, int(timeout or 60)), SCRIPT_TIMEOUT_LIMIT)
         try:
-            extra = shlex.split(str(args or ""), posix=False)
+            # posix=False 会把引号原样留下（Windows 写法），Linux 上按 POSIX 拆
+            extra = shlex.split(str(args or ""), posix=not plat.IS_WINDOWS)
         except ValueError as error:
             raise WorkspaceError(f"参数解析失败：{error}") from error
         command = self.script_command(script, extra)
 
         def _run() -> dict[str, Any]:
-            try:
-                completed = subprocess.run(
-                    command, cwd=str(script.parent), capture_output=True,
-                    timeout=limit, text=True, encoding="utf-8", errors="replace",
-                )
-                return {
-                    "exit_code": completed.returncode,
-                    "stdout": (completed.stdout or "")[:MAX_SCRIPT_OUTPUT],
-                    "stderr": (completed.stderr or "")[:MAX_SCRIPT_OUTPUT],
-                    "truncated": len(completed.stdout or "") > MAX_SCRIPT_OUTPUT
-                    or len(completed.stderr or "") > MAX_SCRIPT_OUTPUT,
-                }
-            except subprocess.TimeoutExpired:
+            payload = plat.run_capture(command, cwd=script.parent, timeout=limit)
+            stdout = str(payload.get("stdout") or "")
+            stderr = str(payload.get("stderr") or "")
+            if payload.get("timed_out"):
                 return {"exit_code": -1, "stdout": "", "stderr": "",
                         "error": f"超时（{limit} 秒）"}
+            return {
+                "exit_code": int(payload.get("exit_code", -1)),
+                "stdout": stdout[:MAX_SCRIPT_OUTPUT],
+                "stderr": stderr[:MAX_SCRIPT_OUTPUT],
+                "truncated": len(stdout) > MAX_SCRIPT_OUTPUT
+                or len(stderr) > MAX_SCRIPT_OUTPUT,
+            }
 
         result = await asyncio.to_thread(_run)
         return {"script": str(script), "command": command[0], **result}

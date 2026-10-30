@@ -59,6 +59,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("culture", "群风格与心理"),
     ("imports", "快速学习"),
     ("backup_memory", "记忆导出与导入"),
+    ("platform", "系统与环境"),
 )
 
 WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
@@ -126,6 +127,7 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("task_add", "新增任务"),
     ("task_update", "修改任务"),
     ("task_cancel", "撤销任务"),
+    ("browser_repair", "重新检测/安装浏览器环境"),
 )
 
 
@@ -308,8 +310,37 @@ class PageAPI:
             "scripts": scripts,
             "capability_enabled": bool(getattr(settings, "enable_qq_tools", False)),
             "browser_env": dict(getattr(self.host, "_browser_env", {}) or {}),
+            "platform": self._platform_summary(),
             "timings": marks,
         }
+
+    def _platform_summary(self) -> dict[str, Any]:
+        """概览页要的环境摘要（完整报告在 platform 数据面）。"""
+        report_fn = getattr(self.host, "_platform_report", None)
+        if not callable(report_fn):
+            return {}
+        try:
+            report = report_fn() or {}
+        except Exception:
+            return {}
+        browser = report.get("browser") or {}
+        return {
+            "os": report.get("os", ""),
+            "python": report.get("python", ""),
+            "display": bool(report.get("display")),
+            "cjk_font": bool(report.get("cjk_font")),
+            "browser_missing_libs": list(browser.get("missing_libs") or [])[:6],
+            "hint": report.get("hint", "") or browser.get("hint", ""),
+        }
+
+    async def _read_platform(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """系统与环境：OS、Python、桌面会话、中文字体、浏览器内核与缺库。"""
+        report_fn = getattr(self.host, "_platform_report", None)
+        if not callable(report_fn):
+            raise WebUIError("当前宿主不支持环境自检")
+        data = dict(report_fn() or {})
+        data["version"] = getattr(self.host, "_version", "") or ""
+        return data
 
     async def _scope_counts(self) -> dict[str, dict[str, int]]:
         """一次分组把每个会话的三项计数算齐（带缓存）。
@@ -1328,6 +1359,17 @@ class PageAPI:
             return await handler(body)
         finally:
             self.invalidate_read_cache()
+
+    async def _do_browser_repair(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """后台重新检测/安装浏览器环境（内核 + Linux 系统库），不阻塞请求。"""
+        host = self.host
+        repair = getattr(host, "_repair_browser_env", None)
+        spawn = getattr(host, "_spawn", None)
+        if not callable(repair) or not callable(spawn):
+            raise WebUIError("当前宿主不支持浏览器环境修复")
+        spawn(repair())
+        return {"ok": True, "started": True,
+                "message": "已在后台重新检测并补装浏览器环境，稍后刷新概览查看结果"}
 
     async def _do_config_set(self, body: Mapping[str, Any]) -> dict[str, Any]:
         host = self.host

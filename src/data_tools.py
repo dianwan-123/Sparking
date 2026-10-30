@@ -16,18 +16,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import platform_support as plat
+
 _PANDAS_STATE: tuple[bool, str] | None = None
 _MPL_STATE: tuple[bool, str] | None = None
 MAX_OUTPUT = 8000
-
-# matplotlib 中文字体候选（Windows 服务器/AstrBot 常见目录）
-_CJK_FONT_CANDIDATES = (
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/simhei.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/arphic/uming.ttc",
-)
 
 
 _ALLOW_AUTO_INSTALL = True
@@ -111,12 +104,16 @@ def ensure_matplotlib() -> tuple[bool, str]:
 
 
 def _apply_cjk_font(matplotlib_mod: Any) -> None:
-    """给 matplotlib 挂上手边能用的中文字体，免得图上全是豆腐块。"""
+    """给 matplotlib 挂上手边能用的中文字体，免得图上全是豆腐块。
+
+    候选来自统一发现（含 Windows 字体目录、Linux 常见包、macOS 系统字体，
+    最后兜底 ``fc-list :lang=zh``）——服务器上字体装在哪个目录都能找到。
+    """
     try:
         from matplotlib import font_manager
     except Exception:
         return
-    for candidate in _CJK_FONT_CANDIDATES:
+    for candidate in plat.cjk_font_files():
         path = Path(candidate)
         if not path.is_file():
             continue
@@ -124,6 +121,7 @@ def _apply_cjk_font(matplotlib_mod: Any) -> None:
             font_manager.fontManager.addfont(str(path))
             name = font_manager.FontProperties(fname=str(path)).get_name()
             matplotlib_mod.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+            matplotlib_mod.rcParams["axes.unicode_minus"] = False
             return
         except Exception:
             continue

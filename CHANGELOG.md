@@ -1,5 +1,22 @@
 # 更新日志
 
+## v1.1.7
+
+### 🐧 搬到 Linux 服务器也能直接用
+
+搬到 Linux 服务器（Ubuntu / Debian 等）后，网页打不开、截图一片空白、图表中文全是方块、脚本跑不起来——这些毛病多半都出在平台差异上。这一版把平台差异全部收拢处理：
+
+- **浏览器按平台找内核**：内核缓存目录按系统取（Windows `%LOCALAPPDATA%`、Linux `~/.cache`、macOS `~/Library/Caches`，也认 `PLAYWRIGHT_BROWSERS_PATH`），换系统不用再手填路径。
+- **Linux 缺系统库会自动补**：chromium 依赖的 `libnss3`/`libgbm` 等库缺失时，以 root 运行会自动执行 `playwright install-deps chromium`；非 root 则把精确的 `apt-get install` 命令写进日志和控制台。
+- **没有桌面会话不再报错**：服务器没有 X/Wayland 时，有头模式自动降级为无头（日志说明原因），不会因为 `Missing X server` 整个浏览器起不来。
+- **启动失败给的是解决办法**：缺库、缺字体、无桌面会话各自给出对应动作，不再是干巴巴的英文报错。
+- **中文字体统一发现**：Windows 字体目录、Linux 常见字体包（Noto CJK / 文泉驿 / 文鼎）、macOS 系统字体、`fc-list :lang=zh` 依次尝试；没有中文字体时明确提示装 `fonts-noto-cjk`（否则截图与图表里的中文是方块）。聊天卡片的字体栈也补了 Linux 常见中文字体。
+- **HTTPS 证书兜底**：精简镜像没装根证书时改用 `certifi` 自带的证书包，不再全站 `CERTIFICATE_VERIFY_FAILED`。
+- **脚本按本机解释器跑**：`.py` 用当前解释器、`.sh` 找 `bash`/`sh`、`.js` 找 `node`、`.ps1` 找 PowerShell；缺解释器时明确说是"这台机器没装"而不是"不支持该类型"。参数解析按平台规则，子进程强制 UTF-8（Windows 默认 GBK 会把中文参数搞坏）。
+- **超时连子进程一起收**：脚本超时按进程组结束，不会留下孤儿进程。
+- **星期统一成中文**：`%A` 受系统语言影响（Linux 服务器常是英文 `Friday`），现在给模型的时间描述一律"星期五"，换机器不会变。
+- **环境自检可查**：控制台「概览 → 系统与环境」显示操作系统、Python、桌面会话、中文字体、浏览器缺库情况，并提供「重新检测/安装浏览器环境」；bot 也能用 `system_status` 自查（`action=repair` 会自己补装）。启动日志会打一行运行环境，迁移换系统后第一眼就能看出差异。
+
 ## v1.1.6
 
 ### ✨ 记忆网重做：看得清、改得动、只看相关的

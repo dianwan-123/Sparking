@@ -9,6 +9,8 @@ import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+from . import timeutil
 from typing import Any, Mapping
 
 PLAN_KINDS = (
@@ -66,7 +68,7 @@ def build_plan_prompt(
 ) -> str:
     """Build the planner user prompt from current world state."""
     payload = {
-        "now": now.strftime("%Y-%m-%d %H:%M %A"),
+        "now": timeutil.text("%Y-%m-%d %H:%M %A", at=now),
         "horizon": f"请把未来{horizon_hours}小时排成具体日程（time 从当前时间往后排）",
         "mood": mood,
         "groups": groups,

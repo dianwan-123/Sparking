@@ -411,7 +411,7 @@
   },
   "browser_auto_install": {
     "type": "bool",
-    "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；关闭后仅检测上报",
+    "description": "插件启动时自动检测并安装浏览器环境（pip 走清华镜像、chromium 内核走 npmmirror 镜像，只装 chromium 保持轻量）；Linux 上还会检查 chromium 需要的系统库（libnss3/libgbm 等），以 root 运行时装，非 root 时给出 apt 命令。关闭后仅检测上报",
     "default": true
   },
   "auto_install_deps": {
@@ -451,12 +451,12 @@
   },
   "browser_executable_path": {
     "type": "string",
-    "description": "可选：手动指定浏览器可执行文件（完整 chrome.exe，而非 headless_shell）。留空自动探测 ms-playwright 下的完整 chromium。当安全软件拦截 headless_shell.exe 导致截图超时时，指到 ...\\ms-playwright\\chromium-<版本>\\chrome-win64\\chrome.exe 即可",
+    "description": "可选：手动指定浏览器可执行文件（完整 chrome，而非 headless_shell）。留空自动探测 ms-playwright 下的完整 chromium（Windows 在 %LOCALAPPDATA%\\ms-playwright，Linux 在 ~/.cache/ms-playwright，或 PLAYWRIGHT_BROWSERS_PATH 指定的目录）。当安全软件拦截 headless_shell 导致截图超时时，指到对应平台的 chrome 可执行文件即可",
     "default": ""
   },
   "browser_headful": {
     "type": "bool",
-    "description": "浏览器用有头模式（真的开一个窗口，需要服务器上有桌面会话，比如你挂着 RDP）。有些站点会把无头浏览器当成机器人直接卡住，截图一直超时的话把它打开试试。",
+    "description": "浏览器用有头模式（真的开一个窗口，需要机器上有桌面会话：Windows 桌面或 Linux 的 X/Wayland，比如你挂着 RDP）。Linux 服务器没有桌面会话时这一项会被自动忽略（降级为无头），不会报错。有些站点会把无头浏览器当成机器人直接卡住，截图一直超时的话把它打开试试。",
     "default": false
   },
   "ssh_host": {
