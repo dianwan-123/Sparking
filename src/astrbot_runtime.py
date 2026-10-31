@@ -97,7 +97,10 @@ def _owner_for_tool(tool: Any, stars: list[Any]) -> str | None:
         if not matched and tool_root:
             matched = tool_root == _plugin_root(path)
         if matched:
-            candidate = (len(path), _plugin_id(star))
+            # 优先用 plugin_id（author/name）：插件名在不同作者间可能重名，
+            # 而能力表要按"哪个插件"分组，重名会把两家的工具算到一起
+            identifier = _safe_text(_value(star, "plugin_id"), 256) or _plugin_id(star)
+            candidate = (len(path), identifier)
             if best is None or candidate[0] > best[0]:
                 best = candidate
     return best[1] if best else None

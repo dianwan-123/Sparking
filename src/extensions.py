@@ -203,13 +203,32 @@ BUILTIN_PACKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
 }
 
+# 不属于任何"可开关包"的本插件核心工具（主人入口、任务表、派发、群配置…）。
+# 它们不放进 BUILTIN_PACKS：那是**开关集合**，放进去就等于允许被关掉；
+# 但归属判定需要知道"这是我自己的工具"，否则会被误认成别家插件提供的。
+_UNPACKED_TOOLS = frozenset({
+    "owner_config", "owner_logs", "system_status",
+    "task_add", "task_list", "task_update", "task_cancel",
+    "say_now", "send_sticker",
+    "dispatch_subagent", "dispatch_parallel_subagents",
+    "person_profile", "get_user_style", "list_group_style",
+    "explain_jargon", "find_quiet_scopes", "group_config",
+    "qzone_msg_detail",
+    "extension_install", "extension_uninstall",
+    "extension_enable", "extension_disable", "extension_manual",
+})
+
 _CORE_TOOLS = {"extension_list", "extension_call", "find_tools"}  # never gated
+
+# 本插件在 AstrBot 里的 plugin_id（author/name 形式），用于把"名单里还没登记的新工具"
+# 按归属认回自己——新增工具忘了登记时不会在能力表里被当成别家插件
+SELF_PLUGIN_ID = "rikka0612/astrbot_plugin_long_memory_agent"
 
 
 def known_tool_names() -> set[str]:
     """本插件（含内置各包与核心工具）注册的全部工具名——用于区分"自己的工具"
     与"AstrBot/其它插件提供的工具"（能力总表与 find_tools 都要用到）。"""
-    names: set[str] = set(_CORE_TOOLS)
+    names: set[str] = set(_CORE_TOOLS) | set(_UNPACKED_TOOLS)
     for _name, _desc, tools in BUILTIN_PACKS.values():
         names.update(tools)
     return names

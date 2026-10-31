@@ -1039,7 +1039,7 @@ class PageAPI:
         except Exception:
             tools = []
         from .astrbot_runtime import _owner_for_tool
-        from .extensions import known_tool_names
+        from .extensions import SELF_PLUGIN_ID, known_tool_names
 
         try:
             stars = list(host.context.get_all_stars())
@@ -1052,13 +1052,14 @@ class PageAPI:
             if not name:
                 continue
             active = bool(getattr(tool, "active", True))
-            if name in own:
+            owner = None if name in own else _owner_for_tool(tool, stars)
+            if owner and owner == SELF_PLUGIN_ID:
+                owner = None   # 名单里漏了的新工具：按 plugin_id 认回自己
+            if name in own or owner is None:
                 source = "本插件"
             else:
-                owner = _owner_for_tool(tool, stars)
-                source = f"插件：{owner}" if owner else "AstrBot/其它插件"
-                if owner:
-                    by_plugin[owner] = by_plugin.get(owner, 0) + 1
+                source = f"插件：{owner}"
+                by_plugin[owner] = by_plugin.get(owner, 0) + 1
             rows.append({
                 "name": name,
                 "source": source,

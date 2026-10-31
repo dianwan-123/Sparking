@@ -252,6 +252,35 @@ def looks_like_tech_question(text: str) -> bool:
     return any(_has_ascii_token(lowered, token) for token in _TECH_QUESTION_TOKENS)
 
 
+# 疑问词表：出现任一个就算"在问事"（要先去知识库看看有没有料）。
+# 和上面同理，用词表 + 显式扫描，不写正则。
+_QUESTION_WORDS = (
+    "怎么", "怎样", "如何", "为什么", "为啥", "为何", "什么是", "是什么", "啥是",
+    "哪些", "哪个", "哪里", "哪儿", "多少", "几天", "几个", "是不是", "能不能",
+    "可不可以", "有没有", "要不要", "请问", "求问", "问下", "问一下", "谁知道",
+    "谁会", "有人知道", "谁懂", "帮我查", "查一下", "解释一下", "讲讲", "说说看",
+    "区别", "原理", "意思", "定义", "用法", "教程", "攻略", "步骤",
+)
+_QUESTION_MARKS = ("?", "？", "¿", "⁇")
+
+
+def looks_like_question(text: str) -> bool:
+    """这句话是不是在问事（含疑问词或问号）。
+
+    判据逐条显式：先看有没有问号字符，再看词表里有没有疑问词，
+    最后看句末是不是"吗/么/呢"这类疑问语气词（剥掉尾部标点后判断）。
+    """
+    value = str(text or "")
+    if not value.strip():
+        return False
+    if any(mark in value for mark in _QUESTION_MARKS):
+        return True
+    if any(word in value for word in _QUESTION_WORDS):
+        return True
+    tail = value.rstrip(" \t\u3000。！!．.～~…")
+    return tail.endswith(("吗", "么", "呢"))
+
+
 def _within_hours(stamp: Any, hours: float) -> bool:
     """时间戳（ISO 字符串）距今是否在 hours 内；解析失败按"算新鲜"处理。"""
     try:
@@ -2148,6 +2177,16 @@ class LongMemoryAgentPlugin(Star):
                 context_data.update(enrichment)
                 tech_enriched = True
                 break
+        # 知识库清单：让模型知道"我手上有哪些知识库"，它才会想到去查
+        kb_catalog = await self._knowledge_catalog()
+        if kb_catalog:
+            context_data["knowledge_bases"] = kb_catalog
+            context_data["knowledge_hint"] = (
+                "这些是你挂着的 AstrBot 知识库（kb_id/kb_name）。问句已经由系统自动查过"
+                "（见 knowledge_hits）；需要更细的内容、或想换关键词再查，用 "
+                "kb_search(query, kb_id)。知识库里的内容可以直接当成你自己知道的，"
+                "不要解释检索过程。"
+            )
         # 合并转发：判定前同步展开内容，否则模型只看到"[合并转发]"占位符。
         # 来源三处：当前消息本体、攒批里各条消息的事件、到达时登记的待展开表
         # （非唤醒消息的转发先缓着，判定时才展开——逐条覆盖会丢先到的那条）
@@ -4847,7 +4886,7 @@ class LongMemoryAgentPlugin(Star):
     def _capability_digest(self) -> dict[str, Any]:
         """工具清单摘要：分来源给出名字（描述太占预算，细节交给 find_tools）。"""
         from .src.astrbot_runtime import _owner_for_tool
-        from .src.extensions import known_tool_names
+        from .src.extensions import SELF_PLUGIN_ID, known_tool_names
 
         own = known_tool_names()
         astrbot: list[str] = []
@@ -4864,9 +4903,13 @@ class LongMemoryAgentPlugin(Star):
             if name in own:
                 astrbot.append(name)
                 continue
+            owner = _owner_for_tool(tool, stars)
+            if owner == SELF_PLUGIN_ID:
+                # 名单没登记的新工具：按 plugin_id 认回自己，别算成别家插件
+                astrbot.append(name)
+                continue
             plugins.append(name)
-            owner = _owner_for_tool(tool, stars) or "未知插件"
-            by_plugin[owner] = by_plugin.get(owner, 0) + 1
+            by_plugin[owner or "未知插件"] = by_plugin.get(owner or "未知插件", 0) + 1
         return {
             "own": sorted(astrbot),
             "external": sorted(plugins),
@@ -5451,6 +5494,11 @@ class LongMemoryAgentPlugin(Star):
             return "找不到要发送的文件（path 不存在且 media_id 无效）"
         given_group = str(group_id or "").strip()
         given_user = str(user_id or "").strip()
+        if given_group:
+            guard = self._guard_send_target(
+                await self._scope_for_event(event), given_group)
+            if guard:
+                return guard
         if given_group and not self.settings.allows_group(given_group):
             return f"拒绝发送：群 {given_group} 不在白名单"
         chosen = str(kind or "").strip()
@@ -8334,7 +8382,6 @@ class LongMemoryAgentPlugin(Star):
     def _most_active_group(self) -> tuple[str, str]:
         """(scope_id, group_key) of the whitelist group with the newest message."""
         best: tuple[str, str] = ("", "")
-        best_stamp = 0.0
         for key, scope_id in self._known_scopes.items():
             if key.startswith("private:") or not self.settings.allows_group(key):
                 continue
@@ -8342,6 +8389,30 @@ class LongMemoryAgentPlugin(Star):
                 continue
             best = best if best[0] else (scope_id, key)
         return best
+
+    def _scope_group_key(self, scope: str | None) -> str:
+        """scope_id → 群号（会话键）。不是群会话时返回空串。"""
+        if not scope:
+            return ""
+        key = self._conversation_key_of(scope)
+        return key if key.isdigit() else ""
+
+    def _guard_send_target(self, scope: str | None, group_id: str) -> str:
+        """发送目标守卫：要发到"当前会话"时，绝不准悄悄换成别的群。
+
+        已知问题：A 群被禁言后，表情包发到了 B 群——`_most_active_group()` 会
+        跳过处于封锁期的群，于是"发到最活跃的群"实际落到另一个群上。
+        规则：调用方给了 scope（当前正在处理的会话）就必须发到那个群；
+        目标群不匹配时返回拒绝说明，宁可这次不发，也不能串群。
+        """
+        want = self._scope_group_key(scope)
+        target = str(group_id or "").strip()
+        if not target:
+            return ""   # 没指定 → 由调用方决定（通常是当前会话）
+        if want and target != want:
+            return (f"拒绝发送：当前会话是群 {want}，但目标是群 {target}——"
+                    "不能把话发到别的群。要发到别的群，必须由主人在那个场景明确要求。")
+        return ""
 
     async def _friend_to_talk(self) -> dict[str, Any] | None:
         if not self.storage:
@@ -8938,6 +9009,13 @@ class LongMemoryAgentPlugin(Star):
                 return await self.qzone.comment(str(args.get("topic_id", "")), str(args.get("content", "")))
             if tool == "qq_send_group" and self.gateway:
                 target_group = str(args.get("group_id", "")).strip()
+                guard = self._guard_send_target(scope, target_group)
+                if guard:
+                    return guard
+                if not target_group:
+                    target_group = self._scope_group_key(scope)
+                if not target_group:
+                    return "没有指定目标群，且当前会话不是群聊"
                 if not self.settings.allows_group(target_group):
                     return f"拒绝发送：群 {target_group} 不在白名单，不能跨群发言"
                 return await self.gateway.execute(
@@ -9005,7 +9083,7 @@ class LongMemoryAgentPlugin(Star):
                 impression = await self.storage.get_impression(scope, user)
                 return compact_json({"affinity": affinity, "impression": impression}, 2000)
             if tool == "send_sticker" and self.stickers:
-                return await self._send_sticker_action(args)
+                return await self._send_sticker_action(args, scope=scope)
             if tool == "done":
                 return "done"
             return f"unknown tool: {tool}"
@@ -9881,18 +9959,32 @@ class LongMemoryAgentPlugin(Star):
         """主动向某个群发送一条文本消息。
 
         Args:
-            group_id(string): 群号。
+            group_id(string): 群号（留空=当前群）。
             text(string): 消息文本，最长1200字。
         """
         self._require_qq(event)
         current_group = str(event.get_group_id() or "")
-        if current_group:
-            group_id = current_group
+        wanted = str(group_id or "").strip()
+        scope = await self._scope_for_event(event)
+        if not wanted:
+            wanted = current_group
+        else:
+            guard = self._guard_send_target(scope, wanted)
+            if guard:
+                return guard
+        if not wanted:
+            return "需要 group_id（当前会话不是群聊）"
+        if not self.settings.allows_group(wanted):
+            return f"拒绝发送：群 {wanted} 不在白名单"
         bubble = _bubble_text(self._sanitize_outgoing(text))
-        result = await self.qq.send_group(
-            group_id, [{"type": "text", "data": {"text": bubble}}])
+        try:
+            result = await self.qq.send_group(
+                wanted, [{"type": "text", "data": {"text": bubble}}])
+        except Exception as error:
+            # 被禁言/被踢在这里失败：**绝不**换一个群重发——那才是真正的串群
+            return f"发送到群 {wanted} 失败：{str(error)[:160]}（不会改发到别的群）"
         # 发出去的话要记进记忆（否则下一轮它把自己的话当成别人说的）
-        await self._note_own_message(str(group_id), bubble)
+        await self._note_own_message(str(wanted), bubble)
         return compact_json(result, 4000)
 
     @filter.llm_tool(name="qq_send_private")
@@ -11251,12 +11343,16 @@ class LongMemoryAgentPlugin(Star):
         """开一条新回复：换令牌，让表情去重按回复重新计。"""
         self._sticker_reply_token = uuid.uuid4().hex
 
-    async def _send_sticker_action(self, args: dict[str, Any]) -> str:
+    async def _send_sticker_action(self, args: dict[str, Any],
+                                   scope: str | None = None) -> str:
         """往群里发一张库存表情包（主动发/被要求发都走这里）。
 
         已知问题：提示词一直承诺有 send_sticker，但它只挂在内部动作分发上、**没有注册成工具**，
         模型在主循环里按名字调用不到 → 跑去别家插件的 run_wyc_tool 包装器里试，白烧一轮
         （日志：无效的工具名称或工具未启用: send_sticker）。现在补成真工具，两处共用这一段。
+
+        `scope` 是调用方正在处理的会话：有它就必须发到那个群，缺省目标也用它，
+        **绝不**回退到"最活跃的群"（那正是 A 群被禁言后表情发到 B 群的原因）。
         """
         if self.stickers is None:
             return "表情包库未启用"
@@ -11269,8 +11365,13 @@ class LongMemoryAgentPlugin(Star):
         if sticker is None:
             return "没有可发送的表情包（可用 list_stickers 翻库存）"
         target_group = str(payload.get("group_id", "")).strip()
+        guard = self._guard_send_target(scope, target_group)
+        if guard:
+            return guard
         if target_group and not self.settings.allows_group(target_group):
             return f"拒绝发送：群 {target_group} 不在白名单"
+        if not target_group:
+            target_group = self._scope_group_key(scope)
         if not target_group:
             active = self._most_active_group()
             target_group = active[1] if active else ""
@@ -11311,9 +11412,10 @@ class LongMemoryAgentPlugin(Star):
             if not key:
                 return f"没能定位这个群：{hint}"
             resolved = key
+        scope = await self._scope_for_event(event) if event is not None else None
         return await self._send_sticker_action({
             "sticker_id": sticker_id, "query": query, "group_id": resolved,
-        })
+        }, scope=scope)
 
     @filter.llm_tool(name="group_memory")
     async def group_memory_tool(
@@ -12159,28 +12261,74 @@ class LongMemoryAgentPlugin(Star):
             for kb in kbs
         ]
 
-    async def _knowledge_enrichment(self, question: str) -> dict[str, Any] | None:
-        """技术类问题（数学/信息学）强制先查知识库：由插件主动检索并把结果
-        与指令注入上下文。不指望模型自觉调用 kb_search——弱模型经常不查就编。"""
+    def _knowledge_available(self) -> bool:
+        """知识库模块是否就绪（只看有没有 manager，不打网络）。"""
+        manager = getattr(self.context, "kb_manager", None)
+        return manager is not None and getattr(manager, "retrieval_manager", None) is not None
+
+    async def _knowledge_catalog(self) -> list[dict[str, Any]]:
+        """知识库清单（缓存 10 分钟）：给模型"我有哪些知识库"的事实。
+
+        已知问题：模型从来不去 kb_search——因为提示词里只有"遇到数学/信息学问题
+        先查知识库"，它并不知道自己到底挂了什么知识库、覆盖哪些主题，于是把
+        所有问题都当成闲聊凭记忆答。这里把清单塞进上下文，它才有查的理由。
+        """
+        if not self._knowledge_available():
+            return []
+        cached = getattr(self, "_kb_catalog_cache", None)
+        now = time.monotonic()
+        if isinstance(cached, tuple) and now - cached[0] < 600.0:
+            return cached[1]
+        try:
+            rows = await self._kb_list_data()
+        except Exception:
+            rows = []
+        self._kb_catalog_cache = (now, rows)
+        return rows
+
+    async def _knowledge_enrichment(self, question: str,
+                                    *, force: bool = False) -> dict[str, Any] | None:
+        """强制先查知识库：由插件主动检索并把结果 + 指令注入上下文。
+
+        两种触发：
+        ① 数学/信息学这类**技术问题**——以前只认这一类，于是"这个游戏的攻略"
+           "我们群里说过的那个方案"全都不查；
+        ② 任何**问句**（含疑问词/问号）且知识库里有内容——只要可能查到，就先查再说。
+
+        不指望模型自觉调用 kb_search：它不知道查什么、也懒得查。
+        """
         question = str(question or "").strip()
-        if not question or not looks_like_tech_question(question):
+        if not question or not self._knowledge_available():
+            return None
+        tech = looks_like_tech_question(question)
+        if not (force or tech or looks_like_question(question)):
             return None
         hits: Any = []
         try:
-            raw = await self._kb_search_data(question[:120], limit=3)
+            raw = await self._kb_search_data(question[:160], limit=4)
             parsed = parse_json_object(raw) if isinstance(raw, str) else None
             if isinstance(parsed, dict) and isinstance(parsed.get("hits"), list):
                 hits = parsed["hits"]
         except Exception as error:
             logger.info("长程记忆：知识库预检索失败：%s", str(error)[:120])
-        return {
-            "knowledge_directive": (
+        if tech:
+            directive = (
                 "这是技术类问题（数学/信息学），已强制检索知识库：回答前必须先依据 "
                 "knowledge_hits 核对结论；hits 为空或与本题无关时，先说明知识库没有"
                 "相关内容，再按你自己的知识作答，禁止谎称来自知识库。"
-            ),
-            "knowledge_hits": hits,
-        }
+            )
+        elif hits:
+            directive = (
+                "这是问句，已先查过知识库（knowledge_hits）。有相关条目就以它为准作答，"
+                "并在语气上自然带出（不必解释检索过程）；hits 与问题无关就忽略它们"
+                "按常识答，**绝不许**谎称结论来自知识库。"
+            )
+        else:
+            directive = (
+                "这是问句，已先查过知识库但没有命中（knowledge_hits 为空）。"
+                "按你自己的知识正常作答，不要说「我去查一下」这类空话。"
+            )
+        return {"knowledge_directive": directive, "knowledge_hits": hits}
 
     async def _kb_search_data(self, query: str, kb_id: str = "", limit: int = 5):
         """混合检索 AstrBot 知识库（稠密+BM25+RRF，与可查询记忆同级）。"""
