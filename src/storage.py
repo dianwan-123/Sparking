@@ -18,6 +18,9 @@ from .models import CatalogEntry, NormalizedMessage, StoredMessage, SummaryRecor
 
 SCHEMA_VERSION = 1
 
+# 库文件超过这个大小，面板统计改走常数级估算（COUNT(*) 在慢盘上要十几秒）
+_EXACT_COUNT_MAX_BYTES = 64 * 1024 * 1024
+
 # 各表的真实列名（导入记忆时用来过滤包里多余的字段；open() 时用 PRAGMA 预热）
 _TABLE_COLUMNS: dict[str, frozenset] = {}
 
@@ -125,14 +128,19 @@ class Storage:
     async def warm_statistics(self, *, timeout: float = 300.0) -> None:
         """后台补齐查询规划器统计（``sqlite_stat1``）。
 
-        大库首次 ANALYZE 在慢盘上可能要很久，不能放在启动路径上——这里带超时，
-        超时就放弃（面板统计本来就有 COUNT(*) 兜底）。
+        大库首次 ANALYZE 在慢盘上可能要很久（十几万行 + 上百万连线），不能放在
+        启动路径上——这里带超时，超时就放弃（面板统计本来就有 COUNT(*) 兜底）。
+        ANALYZE 本身是**写事务**，会挡住同一连接上的其它查询，所以它也是统计
+        首次调用慢的原因之一；因此 stats() 在拿不到估计时先给常数级估算。
         """
         try:
             await asyncio.wait_for(self.db.execute("PRAGMA optimize"),
                                    timeout=max(5.0, float(timeout)))
         except Exception:
             pass
+        finally:
+            # 统计信息变了：清掉面板缓存，下一次读会拿到新估计
+            self._stats_cache = {}
 
     async def close(self) -> None:
         if self.db is not None:
@@ -2338,15 +2346,42 @@ class Storage:
             where = suffix if name != "scopes" else ((" WHERE scope_id=?") if scope_id else "")
             count = estimates.get(name)
             if count is None:
-                try:
-                    row = await self._fetchone(
-                        f"SELECT COUNT(*) AS n FROM {name}{where}", params)
-                    count = int(row["n"])
-                except Exception:
-                    count = 0
+                count = await self._table_row_count(name, where, params)
             result[name] = int(count)
         cache[key] = (now, dict(result))
         return result
+
+    async def _table_row_count(self, table: str, where: str, params: Sequence[Any]) -> int:
+        """行数：小库给精确值，大库走常数级估算（不扫全表）。
+
+        慢盘上一条 ``COUNT(*)`` 要十几秒，而面板首屏就卡在那一条上（后台
+        ANALYZE 还是写事务，会把同一连接上的查询一起堵住）。所以：
+        库文件不大时照旧精确统计，大库用 ``MAX(rowid)`` 估算——删过行会略偏大，
+        面板上差这个量无所谓，等后台统计补完就换成 sqlite_stat1 的真实估计。
+        """
+        if self._exact_counts_cheap():
+            try:
+                row = await self._fetchone(
+                    f"SELECT COUNT(*) AS n FROM {table}{where}", params)
+                return int(row["n"])
+            except Exception:
+                return 0
+        try:
+            row = await self._fetchone(
+                f"SELECT MAX(rowid) AS n FROM {table}{where}", params)
+            value = row["n"] if row is not None else None
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+        return 0
+
+    def _exact_counts_cheap(self) -> bool:
+        """库文件小到 COUNT(*) 足够快吗（64MB 以内按精确算）。"""
+        try:
+            return self.path.stat().st_size <= _EXACT_COUNT_MAX_BYTES
+        except OSError:
+            return True
 
     async def _table_estimates(self, tables: Sequence[str]) -> dict[str, int]:
         """从 sqlite_stat1 读行数估计（O(索引项)，不扫表）。
