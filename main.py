@@ -134,6 +134,7 @@ from .src.prompts import (
     SSH_AGENT_SYSTEM_PROMPT,
     SUBAGENT_SYSTEM_PROMPT,
     TASK_DISPATCH_PROMPT,
+    PLUGIN_ECOSYSTEM_PROMPT,
     QQMSG_STYLE_PROMPT,
     GROUP_LIFE_BEHAVIORS_PROMPT,
 )
@@ -283,7 +284,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.7"
+PLUGIN_VERSION = "1.1.8"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -660,6 +661,7 @@ class LongMemoryAgentPlugin(Star):
                 self.dashboard,
                 group_authorizer=lambda group_id: self.settings.allows_group(group_id),
                 audit_callback=self._audit_callback,
+                owner_check=self._is_owner,
             )
         self.stickers = StickerManager(
             root / "stickers",
@@ -2807,11 +2809,22 @@ class LongMemoryAgentPlugin(Star):
         external = digest.get("external") or []
         if external:
             listed = "、".join(external[:40])
+            owners = digest.get("by_plugin") or {}
+            source_line = ""
+            if owners:
+                top = list(owners.items())[:8]
+                source_line = ("（来自这些插件："
+                               + "、".join(f"{name}×{count}" for name, count in top)
+                               + "；用 astrbot_plugin_list 看某个插件具体给哪些工具）")
             parts.append(
-                "【可用能力】这次会话里你能调用的工具共 %d 个（含 AstrBot 内置与其它插件）：%s。"
+                "【可用能力】这次会话里你能调用的工具共 %d 个，其中其它插件/内置提供 %d 个%s：%s。"
                 "不确定工具名或用法时，先调 find_tools 搜关键词（如 知识库/搜索/图片/文件/"
                 "群相册/定时）——比凭记忆猜工具名可靠；搜到的工具与你自己的一样可以直接调用。"
-                % (digest["total"], listed))
+                % (digest["total"], len(external), source_line, listed))
+        # 插件生态只在能真的操作时讲：没配 dashboard 就没有市场与安装工具，
+        # 讲一遍只会让它对着不存在的工具空转
+        if getattr(self, "dashboard", None) is not None:
+            parts.append(PLUGIN_ECOSYSTEM_PROMPT)
         parts.append(self._now_brief())
         parts.append(QQMSG_STYLE_PROMPT)
         parts.append(GROUP_LIFE_BEHAVIORS_PROMPT)
@@ -4833,19 +4846,31 @@ class LongMemoryAgentPlugin(Star):
 
     def _capability_digest(self) -> dict[str, Any]:
         """工具清单摘要：分来源给出名字（描述太占预算，细节交给 find_tools）。"""
+        from .src.astrbot_runtime import _owner_for_tool
         from .src.extensions import known_tool_names
 
         own = known_tool_names()
         astrbot: list[str] = []
         plugins: list[str] = []
+        by_plugin: dict[str, int] = {}
+        try:
+            stars = list(self.context.get_all_stars())
+        except Exception:
+            stars = []
         for tool in self._all_active_tools():
             name = str(getattr(tool, "name", ""))
             if not name:
                 continue
-            (astrbot if name in own else plugins).append(name)
+            if name in own:
+                astrbot.append(name)
+                continue
+            plugins.append(name)
+            owner = _owner_for_tool(tool, stars) or "未知插件"
+            by_plugin[owner] = by_plugin.get(owner, 0) + 1
         return {
             "own": sorted(astrbot),
             "external": sorted(plugins),
+            "by_plugin": dict(sorted(by_plugin.items(), key=lambda kv: -kv[1])),
             "total": len(astrbot) + len(plugins),
         }
 
@@ -4891,17 +4916,58 @@ class LongMemoryAgentPlugin(Star):
                 params = list(raw_args)[:12]
             elif isinstance(raw_args, (list, tuple)):
                 params = [str(getattr(item, "name", item)) for item in raw_args][:12]
-            rows.append({"name": name, "source": bucket, "description": description[:200],
-                         "params": params})
+            row = {"name": name, "source": bucket,
+                   "description": description[:200], "params": params}
+            if bucket != "astrbot":
+                owner = self._plugin_badge(name)
+                if owner:
+                    row["plugin"] = owner
+            rows.append(row)
         if not tokens:
             digest = self._capability_digest()
             own = digest["own"] if wanted in ("", "astrbot", "plugin") else []
             other = digest["external"] if wanted in ("", "other") else []
-            return compact_json({"count": len(own) + len(other),
-                                 "astrbot": own, "other": other,
-                                 "hint": "给 query 关键词可查具体工具的参数与说明"}, 6000)
+            payload: dict[str, Any] = {
+                "count": len(own) + len(other),
+                "astrbot": own, "other": other,
+                "by_plugin": digest.get("by_plugin") or {},
+                "hint": "给 query 关键词可查具体工具的参数与说明",
+            }
+            return compact_json(payload, 6000)
         rows.sort(key=lambda item: (item["source"], item["name"]))
+        if not rows:
+            return compact_json({
+                "matched": 0,
+                "query": str(query or ""),
+                "hint": ("现有工具里没有匹配项。可以换个词再搜（中文说法/英文词根都试）；"
+                         "确实没有这个能力就去 astrbot_market_search 找现成插件，"
+                         "或坦白说清做不了——别编一个工具名。"),
+            }, 1200)
         return compact_json({"matched": len(rows), "tools": rows[:40]}, 6000)
+
+    def _plugin_badge(self, tool_name: str) -> str:
+        """工具属于哪个插件（find_tools 结果里给模型一个来源线索）。"""
+        from .src.astrbot_runtime import _owner_for_tool
+
+        try:
+            stars = list(self.context.get_all_stars())
+        except Exception:
+            return ""
+        badge_cache = getattr(self, "_plugin_badge_cache", None)
+        if not isinstance(badge_cache, dict):
+            badge_cache = {}
+            self._plugin_badge_cache = badge_cache
+        cache_key = (tool_name, len(stars))
+        if cache_key in badge_cache:
+            return badge_cache[cache_key]
+        owner = ""
+        for tool in self._all_active_tools():
+            if str(getattr(tool, "name", "") or "") != tool_name:
+                continue
+            owner = _owner_for_tool(tool, stars) or ""
+            break
+        badge_cache[cache_key] = owner
+        return owner
 
     def _subagent_tool_set(self, event: AstrMessageEvent | None,
                            *, analyzer: bool = False) -> ToolSet:
@@ -9550,35 +9616,158 @@ class LongMemoryAgentPlugin(Star):
         return (compact_json(manifest, 16000))
 
     @filter.llm_tool(name="astrbot_market_search")
-    async def market_search_tool(self, event: AstrMessageEvent, query: str):
-        """只读搜索AstrBot官方插件市场。
+    async def market_search_tool(self, event: AstrMessageEvent, query: str = ""):
+        """在 AstrBot 官方插件市场里搜插件（只读，不会安装）。
+
+        想到什么能力手边没有、想找"有没有现成插件"时用这个：中文英文关键词都行
+        （天气/音乐/点歌/图片/翻译/新闻/游戏/签到/管理…），结果按 stars 与下载量
+        排好序，给出市场 ID（安装时用它）。query 留空则列出热门插件。
 
         Args:
-            query(string): 插件名、作者或功能关键词。
+            query(string): 功能关键词，可中英文；留空看热门。
         """
         if not self.dashboard:
-            raise RuntimeError("Dashboard未配置")
-        result = await self.dashboard.search_market(query)
-        return (compact_json(result[:20], 14000))
+            return "插件市场未配置（需要 dashboard_api_key），只能在现有工具里想办法。"
+        try:
+            entries = await self.dashboard.search_market(str(query or "").strip())
+        except Exception as error:
+            return f"市场查询失败：{str(error)[:160]}"
+        from .src.dashboard_client import DashboardClient as _DC
+
+        def _score(entry: dict[str, Any]) -> tuple[int, int]:
+            try:
+                return (int(entry.get("stars") or 0), int(entry.get("download_count") or 0))
+            except (TypeError, ValueError):
+                return (0, 0)
+
+        ranked = sorted(entries, key=_score, reverse=True)[:12]
+        rows = [_DC.market_summary(entry) for entry in ranked]
+        if not rows:
+            return (f"市场里没搜到「{query}」相关插件。换个说法或英文关键词再试；"
+                    "也可以先用 find_tools 看看已装插件里有没有现成工具。")
+        return compact_json({
+            "matched": len(entries),
+            "shown": len(rows),
+            "hint": "要装就由主人直接说「安装插件 <market_plugin_id>」，装完新工具下一轮可用",
+            "plugins": rows,
+        }, 14000)
 
 
 
     @filter.llm_tool(name="astrbot_manage_plugin")
     async def manage_plugin_tool(self, event: AstrMessageEvent, action: str, plugin_id: str):
-        """执行当前管理员消息明确授权的插件管理动作。
+        """装/更新/启停 AstrBot 插件（主人或管理员**当面的直接指令**才放行）。
+
+        用来补上自己缺的能力：先 astrbot_market_search 找到 market_plugin_id，
+        主人说"安装插件 xxx"之后调 action=install。装完会顺手确认启用状态——
+        以前装完常常是"在列表里但被禁用"，看起来像装失败了。
 
         Args:
-            action(string): install、update、enable、disable或reload。
-            plugin_id(string): 官方market_plugin_id或已安装插件ID。
+            action(string): install、update、enable、disable 或 reload。
+            plugin_id(string): 市场 ID（author/name）或已装插件名。
         """
         if not self.agent_tools:
-            raise RuntimeError("管理服务未配置")
+            return "插件管理未配置（需要 dashboard_api_key）。"
         try:
             result = await self.agent_tools.manage_plugin(event, action, plugin_id)
         except AuthorizationError as error:
-            return ("拒绝执行：" + error.authorization.reason)
-            return
-        return (compact_json(result, 12000) + "\n新能力将在下一轮Agent自然生效。")
+            return ("拒绝执行：" + error.authorization.reason
+                    + "。需要主人或管理员当面直接说「安装插件 <ID>」这类祈使句，"
+                      "转述/引用/假设都不算授权。")
+        except PermissionError as error:
+            return f"没有权限：{str(error)[:160]}"
+        except Exception as error:
+            return f"操作失败：{str(error)[:200]}"
+        note = ""
+        payload = result.get("data") if isinstance(result, dict) else None
+        activation = (payload or {}).get("activation") if isinstance(payload, dict) else None
+        if isinstance(activation, dict):
+            if activation.get("enabled"):
+                note = "\n插件已确认启用：" + str(activation.get("message") or "已启用")
+            else:
+                note = ("\n注意：安装/更新完成但启用状态未确认——"
+                        + str(activation.get("reason") or "请到控制台手动启用"))
+        return compact_json(result, 12000) + note + "\n新工具下一轮就能用。"
+
+    @filter.llm_tool(name="astrbot_plugin_list")
+    async def plugin_list_tool(self, event: AstrMessageEvent, include_tools: bool = True):
+        """列出现已安装的 AstrBot 插件及其提供的工具名（含加载失败的插件）。
+
+        想知道"我手上到底有什么能力"时先调它：比 find_tools 更上层——find_tools 按
+        关键词搜工具，这个是按插件看全貌（哪个插件禁用/加载失败，一眼就知道要不要启用）。
+
+        Args:
+            include_tools(bool): 是否带上每个插件提供的工具名，默认 true。
+        """
+        if not self.dashboard:
+            return "插件管理未配置（需要 dashboard_api_key）。"
+        try:
+            plugins = await self.dashboard.list_plugins()
+        except Exception as error:
+            return f"读取插件列表失败：{str(error)[:180]}"
+        rows: list[dict[str, Any]] = []
+        for item in (plugins if isinstance(plugins, list) else []):
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            row: dict[str, Any] = {
+                "name": name,
+                "display_name": str(item.get("display_name") or ""),
+                "version": str(item.get("version") or ""),
+                "enabled": bool(item.get("activated")),
+            }
+            if include_tools:
+                owned = self._tools_of_plugin(name)
+                if owned:
+                    row["tools"] = owned[:24]
+            rows.append(row)
+        failed: list[dict[str, Any]] = []
+        try:
+            raw_failed = await self.dashboard.failed_plugins()
+            if isinstance(raw_failed, Mapping):
+                for key, value in raw_failed.items():
+                    info = value if isinstance(value, Mapping) else {}
+                    failed.append({
+                        "dir": str(key),
+                        "error": str(info.get("error") or info.get("message")
+                                     or "加载失败")[:160],
+                    })
+        except Exception:
+            pass
+        rows.sort(key=lambda r: (not r["enabled"], r["name"]))
+        payload: dict[str, Any] = {
+            "total": len(rows),
+            "disabled": [r["name"] for r in rows if not r["enabled"]],
+            "plugins": rows,
+        }
+        if failed:
+            payload["failed"] = failed[:10]
+            payload["failed_hint"] = ("这些插件加载失败，通常要重载或补依赖；"
+                                      "可以用 astrbot_manage_plugin(action=\"reload\") 重试")
+        return compact_json(payload, 16000)
+
+    def _tools_of_plugin(self, plugin_name: str) -> list[str]:
+        """某个插件注册的工具名（按 handler 的模块路径归属）。"""
+        from .src.astrbot_runtime import _owner_for_tool
+
+        try:
+            stars = list(self.context.get_all_stars())
+        except Exception:
+            stars = []
+        try:
+            tools = self._all_active_tools()
+        except Exception:
+            tools = []
+        names: list[str] = []
+        for tool in tools:
+            if _owner_for_tool(tool, stars) != plugin_name:
+                continue
+            label = str(getattr(tool, "name", "") or "")
+            if label:
+                names.append(label)
+        return sorted(names)
 
     @filter.llm_tool(name="astrbot_skill_list")
     async def skill_list_tool(self, event: AstrMessageEvent):
@@ -13787,6 +13976,8 @@ _ANALYZER_BLOCKED_TOOLS = _SUBAGENT_BLOCKED_TOOLS | {
     "program_write", "program_archive", "extension_call", "script_call",
     "adjust_affinity", "update_impression", "remember", "add_plan", "drop_plan",
     "render_code",
+    # 装/删插件是宿主级改动，分析层只许查（market_search / plugin_list 放行）
+    "astrbot_manage_plugin", "astrbot_manage_skill",
 }
 
 # find_tools 的中英关键词映射：模型多用中文问，而工具名/描述常是英文
@@ -13813,6 +14004,10 @@ _TOOL_QUERY_ALIASES: dict[str, tuple[str, ...]] = {
     "表格": ("table", "csv", "excel", "pandas", "tabular"),
     "转发": ("forward", "share"),
     "拓展": ("extension", "script", "plugin"),
+    "插件": ("plugin", "astrbot"),
+    "安装": ("install", "plugin", "market"),
+    "市场": ("market", "plugin"),
+    "技能": ("skill",),
     "环境": ("platform", "system", "env", "browser", "status"),
     "系统": ("system", "platform", "os", "status"),
     "字体": ("font", "cjk", "platform"),

@@ -2784,6 +2784,7 @@ window.SparkingWeb = (() => {
     const [caps, extensions] = await Promise.all([get("capabilities"), get("extensions")]);
     state.capabilities = caps.items || [];
     $("caps-count").textContent = `（共 ${caps.total ?? state.capabilities.length} 个工具）`;
+    renderCapsPlugins(caps);
     renderCapabilities();
 
     const bundles = extensions.bundles || [];
@@ -2944,6 +2945,24 @@ window.SparkingWeb = (() => {
       show("上传失败：" + String(error.message || error));
       toast(String(error.message || error), "error");
     }
+  }
+
+  // 插件生态摘要：每个插件贡献多少个工具 + 市场功能有没有接上
+  function renderCapsPlugins(caps) {
+    const box = $("caps-plugins");
+    if (!box) return;
+    box.textContent = "";
+    const plugins = caps.plugins || [];
+    const market = caps.market_ready
+      ? "已接上（bot 能搜市场、并在你下令时装插件）"
+      : "未接上（在配置里填 dashboard_api_key 后，bot 才能查插件市场与装插件）";
+    box.appendChild(el("b", "", "插件贡献的工具"));
+    box.appendChild(el("span", "",
+      plugins.length
+        ? plugins.map(([name, count]) => `${name}（${count}）`).join("、")
+        : "除本插件外没有其它插件提供工具"));
+    box.appendChild(el("b", "", "插件市场"));
+    box.appendChild(el("span", "", market));
   }
 
   function renderCapabilities() {

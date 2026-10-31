@@ -197,8 +197,8 @@ BUILTIN_PACKS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
     "platform": (
         "AstrBot 平台",
-        "运行时能力清单、插件市场搜索、插件/Skill 管理",
-        ("astrbot_runtime_inventory", "astrbot_market_search",
+        "运行时能力清单、已装插件与它们提供的工具、插件市场搜索、插件/Skill 管理",
+        ("astrbot_runtime_inventory", "astrbot_plugin_list", "astrbot_market_search",
          "astrbot_manage_plugin", "astrbot_skill_list", "astrbot_manage_skill"),
     ),
 }

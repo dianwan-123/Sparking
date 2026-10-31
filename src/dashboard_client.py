@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
+import time
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,6 +15,33 @@ class DashboardError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+# 市场条目是英文写的（name/desc 都是），中文关键词要展开成英文才搜得到
+_MARKET_ALIASES: dict[str, tuple[str, ...]] = {
+    "天气": ("weather",),
+    "音乐": ("music", "song", "netEase"),
+    "点歌": ("music", "song"),
+    "图片": ("image", "img", "picture", "pic"),
+    "画图": ("image", "draw", "pixiv", "picture"),
+    "表情": ("sticker", "meme", "emoji", "face"),
+    "翻译": ("translate", "translation"),
+    "新闻": ("news", "rss"),
+    "搜索": ("search", "query"),
+    "游戏": ("game", "play", "minecraft"),
+    "签到": ("checkin", "sign", "daily"),
+    "统计": ("stat", "stats", "count"),
+    "管理": ("admin", "manage", "guard"),
+    "提醒": ("remind", "reminder", "schedule", "cron"),
+    "插件": ("plugin",),
+    "语音": ("voice", "tts", "audio", "record"),
+    "视频": ("video", "bilibili", "youtube"),
+    "聊天": ("chat", "talk", "llm", "ai"),
+    "ai": ("llm", "chat", "ai"),
+    "资讯": ("news", "rss", "feed"),
+    "答题": ("answer", "quiz", "question"),
+    "抽卡": ("gacha", "draw", "card"),
+}
 
 
 class DashboardClient:
@@ -44,6 +72,7 @@ class DashboardClient:
             if str(host).strip()
         )
         self._session = session
+        self._market_cache: tuple[float, Any] | None = None
         self._validate_base_url()
 
     def _validate_base_url(self) -> None:
@@ -186,25 +215,76 @@ class DashboardClient:
         return self.unwrap(await self._request("GET", "/api/v1/plugins/failed"))
 
     async def list_market(self, *, force_refresh: bool = False) -> Any:
+        # 市场数据是 2MB 级的整包，模型一次任务里常要好几个关键词轮着搜——
+        # 5 分钟缓存能省掉重复下载，又不会看到太旧的价格/版本
+        cached = getattr(self, "_market_cache", None)
+        now = time.monotonic()
+        if (not force_refresh and isinstance(cached, tuple)
+                and now - cached[0] < 300.0):
+            return cached[1]
         payload = await self._request(
             "GET",
             "/api/v1/plugins/market",
             params={"force_refresh": str(force_refresh).lower()},
         )
-        return self.unwrap(payload)
+        value = self.unwrap(payload)
+        self._market_cache = (now, value)
+        return value
 
     async def search_market(self, query: str) -> list[dict[str, Any]]:
-        """Fetch the complete market once and filter it locally."""
+        """Fetch the complete market once and filter it locally.
+
+        Chinese keywords get expanded to their English equivalents (``天气`` →
+        ``weather``), because market entries are written in English identifiers
+        and mostly-English descriptions.
+        """
         market = await self.list_market()
         entries = self._market_entries(market)
-        words = [word.casefold() for word in query.split() if word]
+        words = [word for word in str(query or "").split() if word]
         if not words:
             return entries
+        for word in list(words):
+            words.extend(_MARKET_ALIASES.get(word.casefold(), ()))
+        needles = [word.casefold() for word in words]
         return [
             entry
             for entry in entries
-            if all(word in self._searchable_text(entry) for word in words)
+            if all(needle in self._searchable_text(entry) for needle in needles)
         ]
+
+    async def find_market_entry(self, needle: str) -> dict[str, Any] | None:
+        """Locate one market entry by id / name / display name (case-insensitive)."""
+        wanted = str(needle or "").strip().casefold()
+        if not wanted:
+            return None
+        entries = self._market_entries(await self.list_market())
+        for entry in entries:
+            if str(entry.get("market_plugin_id") or "").casefold() == wanted:
+                return entry
+        for entry in entries:
+            for field in ("name", "display_name"):
+                if str(entry.get(field) or "").casefold() == wanted:
+                    return entry
+        matches = [
+            entry for entry in entries
+            if wanted in self._searchable_text(entry)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def market_summary(entry: Mapping[str, Any]) -> dict[str, Any]:
+        """Compact, model-friendly market row (no readme, no logo)."""
+        return {
+            "market_plugin_id": str(entry.get("market_plugin_id") or ""),
+            "name": str(entry.get("name") or ""),
+            "display_name": str(entry.get("display_name") or ""),
+            "author": str(entry.get("author") or ""),
+            "version": str(entry.get("version") or ""),
+            "desc": str(entry.get("desc") or entry.get("description") or "")[:200],
+            "stars": entry.get("stars", 0),
+            "downloads": entry.get("download_count", 0),
+            "repo": str(entry.get("repo") or ""),
+        }
 
     @classmethod
     def _market_entries(cls, market: Any) -> list[dict[str, Any]]:
@@ -252,6 +332,44 @@ class DashboardClient:
         return self.unwrap(
             await self._request("POST", "/api/v1/plugins/install/github", json_body=body)
         )
+
+    async def ensure_activated(self, plugin_id: str) -> dict[str, Any]:
+        """安装/上传后插件常常是 ``activated: false``（被禁用）——顺手启用一次。
+
+        AstrBot 的安装流程只负责把目录铺好并调一次 load()；若该插件此前被
+        用户关过（或以 inactivated 状态装进来），装完就是"在列表里但没跑"。
+        这里读一次列表，确认存在且未启用时调启用接口，并回一条可读结论。
+        """
+        wanted = str(plugin_id or "").strip()
+        if not wanted:
+            return {"checked": False, "reason": "缺少插件名"}
+        try:
+            plugins = await self.list_plugins()
+        except DashboardError as error:
+            return {"checked": False, "reason": f"读取插件列表失败：{error}"}
+        rows = plugins if isinstance(plugins, list) else []
+        found = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("name") or "") == wanted or wanted in {
+                    str(row.get("root_dir_name") or ""),
+                    str(row.get("plugin_id") or "")}:
+                found = row
+                break
+        if found is None:
+            return {"checked": True, "found": False,
+                    "reason": f"安装后在插件列表里没找到 {wanted}"}
+        if bool(found.get("activated")):
+            return {"checked": True, "found": True, "enabled": True,
+                    "message": "已启用"}
+        try:
+            await self.set_plugin_enabled(wanted, True)
+        except DashboardError as error:
+            return {"checked": True, "found": True, "enabled": False,
+                    "reason": f"启用失败：{error}"}
+        return {"checked": True, "found": True, "enabled": True,
+                "message": "安装后原本是禁用状态，已自动启用"}
 
     async def install_plugin_url(self, url: str) -> Any:
         if not self.allow_arbitrary_plugin_urls:

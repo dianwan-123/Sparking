@@ -267,7 +267,26 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-async def authorize_admin_instruction(event: Any) -> Authorization:
+async def _owner_allows(owner_check: Any, event: Any) -> bool:
+    """主人判定（由插件注入；没配 owner_ids 就是恒 False）。"""
+    if not callable(owner_check):
+        return False
+    try:
+        value = owner_check(event)
+        if inspect.isawaitable(value):
+            value = await value
+        return bool(value)
+    except Exception:
+        return False
+
+
+async def authorize_admin_instruction(event: Any, *,
+                                      owner_check: Any = None) -> Authorization:
+    """授权一次插件/Skill 管理操作（管理员**或**主人 + 直接祈使句）。
+
+    句法要求不放松：即便说话的是主人，也必须是"更新插件 x"这种直接祈使句——
+    这样聊天里被贴进来的话（含被引用/转述的内容）永远无法授权安装。
+    """
     now = datetime.now(timezone.utc).isoformat()
     actor = _event_value(event, "get_sender_id", "sender_id", "user_id")
     event_id = _event_value(event, "get_message_id", "message_id", "id")
@@ -288,16 +307,18 @@ async def authorize_admin_instruction(event: Any) -> Authorization:
         )
 
     checker = getattr(event, "is_admin", None)
-    if not callable(checker):
-        return result(False, "event has no administrator check")
-    try:
-        admin = checker()
-        if inspect.isawaitable(admin):
-            admin = await admin
-    except Exception:
-        return result(False, "administrator check failed")
-    if not bool(admin):
-        return result(False, "sender is not an administrator")
+    is_admin = False
+    if callable(checker):
+        try:
+            is_admin = checker()
+            if inspect.isawaitable(is_admin):
+                is_admin = await is_admin
+        except Exception:
+            is_admin = False
+    if not bool(is_admin):
+        is_admin = await _owner_allows(owner_check, event)
+    if not is_admin:
+        return result(False, "sender is neither an administrator nor the owner")
     if text is None:
         return result(False, "current event is not pure text")
     if len(text.encode("utf-8")) > 512 * 1024:
@@ -339,6 +360,7 @@ async def authorize_structured_command(
     target: str,
     payload: str | None = None,
     source: str = "slash",
+    owner_check: Any = None,
 ) -> Authorization:
     """Authorize slash/structured commands without interpreting flattened message text."""
     now = datetime.now(timezone.utc).isoformat()
@@ -360,15 +382,17 @@ async def authorize_structured_command(
         source,
     )
     checker = getattr(event, "is_admin", None)
-    if not callable(checker):
-        return authorization
-    try:
-        admin = checker()
-        if inspect.isawaitable(admin):
-            admin = await admin
-    except Exception:
-        return authorization
-    if not admin:
+    allowed = False
+    if callable(checker):
+        try:
+            allowed = checker()
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+        except Exception:
+            allowed = False
+    if not bool(allowed):
+        allowed = await _owner_allows(owner_check, event)
+    if not allowed:
         return authorization
     if not target or not _supported_operation(action, resource):
         return authorization
@@ -462,6 +486,7 @@ class AgentToolService:
         audit_callback: Any = None,
         memory_scope_resolver: Any = None,
         memory_callbacks: dict[str, Any] | None = None,
+        owner_check: Any = None,
     ):
         self.context = context
         self.dashboard = dashboard
@@ -471,6 +496,7 @@ class AgentToolService:
         self.audit_callback = audit_callback
         self.memory_scope_resolver = memory_scope_resolver
         self.memory_callbacks = memory_callbacks or {}
+        self.owner_check = owner_check
 
     @staticmethod
     def _require_event(event: Any) -> None:
@@ -488,12 +514,15 @@ class AgentToolService:
         if inspect.isawaitable(value):
             await value
 
-    async def _management_context(self, event: Any) -> tuple[str, str]:
+    async def _management_context(self, event: Any, *, owner: bool = False) -> tuple[str, str]:
         self._require_event(event)
         platform = self._event_fact(event, "get_platform_name", "platform_name")
         group_id = self._event_fact(event, "get_group_id", "group_id")
         if platform != "aiocqhttp":
             raise PermissionError("Management is restricted to aiocqhttp")
+        if owner:
+            # 主人可以在私聊里管插件：不受"必须在白名单群"限制
+            return platform, group_id
         if not group_id:
             raise PermissionError("Management requires a group event")
         if not callable(self.group_authorizer):
@@ -559,9 +588,10 @@ class AgentToolService:
                 resource=resource,
                 target=target,
                 payload=payload,
+                owner_check=self.owner_check,
             )
             if structured
-            else await authorize_admin_instruction(event)
+            else await authorize_admin_instruction(event, owner_check=self.owner_check)
         )
         matches = (
             authorization.authorized
@@ -602,7 +632,8 @@ class AgentToolService:
             self._require_event(event)
             platform = self._event_fact(event, "get_platform_name", "platform_name")
             group_id = self._event_fact(event, "get_group_id", "group_id")
-            platform, group_id = await self._management_context(event)
+            owner = await _owner_allows(self.owner_check, event)
+            platform, group_id = await self._management_context(event, owner=owner)
             authorization = await self._authorization(
                 event, action, resource, target, payload, structured
             )
@@ -646,10 +677,40 @@ class AgentToolService:
         }
         if action not in methods:
             raise ValueError("Unsupported plugin action")
+
+        async def operate() -> Any:
+            data = await methods[action](plugin_id)
+            if action in {"install", "update"}:
+                # 安装/更新完常常是"在列表里但 disabled"：顺手确认一次并启用，
+                # 否则用户看到的就是"装好了但什么都没发生"。
+                try:
+                    activation = await self.dashboard.ensure_activated(
+                        await self._installed_name(plugin_id))
+                except Exception as error:  # 启用失败不该覆盖安装结果
+                    activation = {"checked": False,
+                                  "reason": f"启用检查失败：{str(error)[:120]}"}
+                return {"result": data, "activation": activation}
+            return data
+
         return await self._manage(
-            event, action, "plugin", plugin_id,
-            lambda: methods[action](plugin_id), structured=structured,
+            event, action, "plugin", plugin_id, operate, structured=structured,
         )
+
+    async def _installed_name(self, market_id: str) -> str:
+        """市场 ID（author/name）→ 安装后的插件名（name）。查不到就用原名。"""
+        finder = getattr(self.dashboard, "find_market_entry", None)
+        if not callable(finder):
+            return str(market_id)
+        try:
+            entry = await finder(market_id)
+        except Exception:
+            entry = None
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "").strip()
+            if name:
+                return name
+        text = str(market_id)
+        return text.split("/", 1)[1] if "/" in text else text
 
     async def install_plugin(self, event: Any, plugin_id: str) -> dict[str, Any]:
         return await self.manage_plugin(event, "install", plugin_id)

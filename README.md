@@ -11,7 +11,7 @@
 *一点星火，把"问答机器"烧成群里那个真人——它会记得你、主动找你、像真人一样接话、攒梗、挂人。*
 
 <p>
-  <img src="https://img.shields.io/badge/version-v1.1.7-orange.svg" alt="v1.1.7">
+  <img src="https://img.shields.io/badge/version-v1.1.8-orange.svg" alt="v1.1.8">
   <img src="https://img.shields.io/badge/AstrBot-4.27%2B-orange.svg" alt="AstrBot 4.27+">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Platform-OneBot%20v11%20(NapCat%20%2F%20SnowLuma)-12B7F3.svg" alt="Platform">
@@ -217,6 +217,24 @@ manifest 里的两个关键字段：
 manifest 里的 `name`，按 `manual.md` 里的注释填内容即可。控制台「能力与拓展」里可以
 查看/开关/重载/编辑配置，`extension_manual` 工具就是读的这份说明。
 
+## 🧩 和其它插件共处（AstrBot 生态）
+
+Sparking 不把自己当孤岛：装了别的插件，那些工具就是它自己的工具。
+
+- **能看到别人的工具**：`find_tools("天气")` 会连"哪个插件提供的"一起列出来，查到就能直接调，
+  不需要额外配置。
+- **能查市场**：`astrbot_market_search("点歌")` 搜官方插件市场（中英文关键词都行，
+  比如"天气"会自动按 weather 搜），结果按 stars 与下载量排序，给出市场 ID。
+- **能装插件**：你在群里/私聊直接说「安装插件 a/astrbot_plugin_weather」，它调
+  `astrbot_manage_plugin` 装好——**装完会顺手确认启用状态**（AstrBot 装完常常是禁用状态，
+  以前看起来像装失败）。装好之后新工具下一轮就能用。
+- **权限边界**：装/启停插件只认**主人或 AstrBot 管理员当面的直接祈使句**；聊天里被转述、
+  被引用、"如果能装个……"这类一律不算授权。
+- **控制台可见**：「能力与拓展」页会列出每个插件贡献了多少工具，以及市场功能是否已接通。
+
+> 需要填 `dashboard_api_key`（AstrBot 控制台「设置 → API Key」，勾 plugin 与 skill 两个 scope）。
+> 不填也能用，只是没有"查市场/装插件"这一层。
+
 ## 📑 常用配置
 
 <details>
@@ -247,6 +265,8 @@ manifest 里的 `name`，按 `manual.md` 里的注释填内容即可。控制台
 | `agent_max_steps` | `40` | Agent 工具循环最大步数 |
 | `subagent_enabled` | `true` | 子 agent（主 agent 可并行派活） |
 | `decision_subagent_enabled` | `true` | 决策层需求梳理子 agent |
+| `dashboard_api_key` | 空 | AstrBot 控制台 API Key（plugin + skill scope）：填了 bot 才能查已装插件、搜官方插件市场、在你下令时装插件 |
+| `owner_ids` | `[]` | 主人的 QQ 号：不占冷却/限额，能让你看日志、改配置、装插件 |
 
 其余 60+ 项在控制台的「配置」面板里逐条有中文说明。
 

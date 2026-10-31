@@ -1038,15 +1038,27 @@ class PageAPI:
             tools = list(manager.get_full_tool_set())
         except Exception:
             tools = []
+        from .astrbot_runtime import _owner_for_tool
         from .extensions import known_tool_names
 
+        try:
+            stars = list(host.context.get_all_stars())
+        except Exception:
+            stars = []
         own = known_tool_names()
+        by_plugin: dict[str, int] = {}
         for tool in tools:
             name = str(getattr(tool, "name", ""))
             if not name:
                 continue
             active = bool(getattr(tool, "active", True))
-            source = "本插件" if name in own else "AstrBot/其它插件"
+            if name in own:
+                source = "本插件"
+            else:
+                owner = _owner_for_tool(tool, stars)
+                source = f"插件：{owner}" if owner else "AstrBot/其它插件"
+                if owner:
+                    by_plugin[owner] = by_plugin.get(owner, 0) + 1
             rows.append({
                 "name": name,
                 "source": source,
@@ -1058,7 +1070,12 @@ class PageAPI:
             rows.append({"name": name, "source": "本插件(被拓展开关关闭)", "active": False,
                          "description": "在「拓展」页打开对应包即可恢复"})
         rows.sort(key=lambda item: (item["source"], item["name"]))
-        return {"total": len(rows), "items": rows}
+        return {
+            "total": len(rows),
+            "items": rows,
+            "plugins": sorted(by_plugin.items(), key=lambda kv: -kv[1])[:20],
+            "market_ready": getattr(host, "dashboard", None) is not None,
+        }
 
     def _gated_own_tools(self) -> list[str]:
         registry = getattr(self.host, "_extensions", None)

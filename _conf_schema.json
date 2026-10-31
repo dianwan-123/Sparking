@@ -240,7 +240,7 @@
   },
   "dashboard_api_key": {
     "type": "string",
-    "description": "仅授予plugin和skill scope的API Key",
+    "description": "AstrBot 控制台的 API Key（至少授予 plugin 与 skill 两个 scope：插件列表/市场搜索/安装、Skill 管理都要它）。填了之后 bot 才能：查已装插件与它们的工具、搜官方插件市场、在你明确下令时装插件；不填则只能用本插件自带工具。在 AstrBot 控制台「设置 → API Key」里生成。",
     "secret": true,
     "default": ""
   },

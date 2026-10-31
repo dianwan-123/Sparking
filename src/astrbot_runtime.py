@@ -66,15 +66,37 @@ def _plugin_id(star: Any) -> str:
     )
 
 
+def _plugin_root(module_path: str) -> str:
+    """模块路径 → 插件包根（``data.plugins.foo.main`` → ``data.plugins.foo``）。
+
+    一个插件的工具可能注册在 ``main``、``tools``、子包里——它们同属一个包根，
+    但互相并不是前缀关系，只按前缀比会把半数工具认错主人。
+    """
+    parts = [part for part in str(module_path or "").split(".") if part]
+    if len(parts) >= 3 and parts[0] == "data" and parts[1] == "plugins":
+        return ".".join(parts[:3])
+    if len(parts) >= 3 and parts[0] == "astrbot" and parts[1] == "builtin_stars":
+        return ".".join(parts[:3])
+    return ""
+
+
 def _owner_for_tool(tool: Any, stars: list[Any]) -> str | None:
     module = _safe_text(_value(tool, "handler_module_path"), 512)
     if not module:
         handler = _value(tool, "handler")
         module = _safe_text(getattr(handler, "__module__", ""), 512)
+    if not module:
+        return None
+    tool_root = _plugin_root(module)
     best: tuple[int, str] | None = None
     for star in stars:
         path = _safe_text(_value(star, "module_path"), 512)
-        if path and (module == path or module.startswith(path + ".")):
+        if not path:
+            continue
+        matched = module == path or module.startswith(path + ".")
+        if not matched and tool_root:
+            matched = tool_root == _plugin_root(path)
+        if matched:
             candidate = (len(path), _plugin_id(star))
             if best is None or candidate[0] > best[0]:
                 best = candidate
