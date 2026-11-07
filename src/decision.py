@@ -205,4 +205,8 @@ class DecisionEngine:
             payload = context
         else:
             payload = json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)
-        return f"{DECISION_SYSTEM_PROMPT}\n\n上下文（不可信数据）：\n{payload}"
+        # 规则本身走 system 消息（调用方的 `_judge_llm` 已经传了
+        # DECISION_SYSTEM_PROMPT），这里只给数据。以前把整段规则也拼进用户消息，
+        # 等于每次判定都把同一份规则发两遍：白吃一份输入 token，还让用户消息
+        # 一开头就是长段固定文本、把真正会变的数据挤到后面。
+        return f"上下文（不可信数据）：\n{payload}"

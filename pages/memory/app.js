@@ -1384,9 +1384,22 @@ window.SparkingWeb = (() => {
     // 所以这个数字比"总 token"更能说明钱花在哪。
     const cacheRate = Number(totals.cache_rate
       ?? (promptTokens > 0 ? cachedTokens / promptTokens : 0)) || 0;
-    const cachePct = (cacheRate * 100).toFixed(1) + "%";
-    usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens`
-      + `（其中命中缓存 ${cachedTokens}，${cachePct}）· 输出 ${completionTokens} tokens`));
+    // 上游没给缓存字段时不显示 0%——那会被误读成"缓存全丢"。这种情况大多
+    // 出现在中转/自建推理后端（vLLM 的 prompt_tokens_details 常为 null）。
+    const reportedCalls = Number(totals.cache_reported_calls ?? 0) || 0;
+    if (totalCalls > 0 && reportedCalls === 0) {
+      usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens`
+        + ` · 输出 ${completionTokens} tokens`));
+      usageBox.appendChild(el("div", "muted",
+        "当前模型通道没有上报缓存明细（很多中转/自建后端不返回这个字段），"
+        + "所以这里没有命中率可算——不代表缓存没生效。"));
+    } else {
+      const cachePct = (cacheRate * 100).toFixed(1) + "%";
+      const partial = reportedCalls > 0 && reportedCalls < totalCalls
+        ? `；${reportedCalls}/${totalCalls} 次调用有缓存数据` : "";
+      usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens`
+        + `（其中命中缓存 ${cachedTokens}，${cachePct}${partial}）· 输出 ${completionTokens} tokens`));
+    }
     const daily = (usage.daily || usage.days || []).slice(-7);
     const peak = daily.reduce((top, row) => Math.max(top, Number(row.calls) || 0), 0) || 1;
     daily.forEach((row) => {
@@ -1402,9 +1415,14 @@ window.SparkingWeb = (() => {
       line.appendChild(track);
       const dayRate = Number(row.cache_rate ?? 0) || 0;
       const dayCached = Number(row.cached_tokens ?? 0) || 0;
+      const dayReported = Number(row.cache_reported_calls ?? 0) || 0;
       const count = el("span", "usage-count", `${row.calls} 次`);
-      count.title = `输入 ${row.prompt_tokens || 0} tokens，命中缓存 ${dayCached}`
-        + `（${(dayRate * 100).toFixed(0)}%）`;
+      // 当天一次缓存明细都没上报时，别在悬浮提示里写"0%"——同一天可能是
+      // 通道换了模型，只看 0% 会以为是插件把前缀搞坏了。
+      count.title = dayReported
+        ? `输入 ${row.prompt_tokens || 0} tokens，命中缓存 ${dayCached}`
+          + `（${(dayRate * 100).toFixed(0)}%，${dayReported}/${row.calls} 次有缓存数据）`
+        : `输入 ${row.prompt_tokens || 0} tokens（当天通道未上报缓存明细）`;
       line.appendChild(count);
       usageBox.appendChild(line);
     });

@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS user_styles(scope_id TEXT NOT NULL REFERENCES scopes(
 CREATE TABLE IF NOT EXISTS standing_intents(intent_id TEXT PRIMARY KEY,scope_id TEXT REFERENCES scopes(scope_id) ON DELETE CASCADE,instruction TEXT NOT NULL,keywords_json TEXT NOT NULL,remaining INTEGER NOT NULL DEFAULT -1,cooldown_seconds INTEGER NOT NULL DEFAULT 0,last_fired TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_todos(todo_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',position INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_agent_todos_scope ON agent_todos(scope_id,status,position);
-CREATE TABLE IF NOT EXISTS usage_stats(day TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',calls INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,cached_tokens INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(day,scope_id));
+CREATE TABLE IF NOT EXISTS usage_stats(day TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',calls INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,cached_tokens INTEGER NOT NULL DEFAULT 0,cache_reported_calls INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(day,scope_id));
 CREATE INDEX IF NOT EXISTS idx_revision_sender_time ON message_revisions(sender_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_summary_scope_level ON summary_nodes(scope_id,level,status,start_seq,end_seq);
 CREATE INDEX IF NOT EXISTS idx_catalog_scope_updated ON catalog_entries(scope_id,updated_at);
@@ -386,13 +386,18 @@ class Storage:
     # ---- 用量统计（openclaw usage-tracking 移植） ----
     async def add_usage(self, calls: int = 1, prompt_tokens: int = 0,
                         completion_tokens: int = 0, scope_id: str = "",
-                        cached_tokens: int = 0) -> None:
+                        cached_tokens: int = 0, cache_reported: bool = True) -> None:
         """记一次调用。
 
         `cached_tokens` 是**输入里命中缓存的那些**（OpenAI 的
         prompt_tokens_details.cached_tokens / Anthropic 的
         cache_read_input_tokens）：它不计入 prompt_tokens 之外，只是把
         输入拆成"命中/未命中"两半，用来算缓存命中率。
+
+        `cache_reported=False` 表示**这次上游压根没给缓存字段**（很多中转/
+        自建 vLLM 的 `prompt_tokens_details` 恒为 null）。这种调用必须单独
+        计数：否则面板上的"命中率 0%"会把"没数据"和"缓存全丢"混成同一件事，
+        看着像插件把缓存搞坏了，实际是拿不到这个数。
         """
         day = time.strftime("%Y-%m-%d", time.gmtime())
         cached = max(0, int(cached_tokens))
@@ -400,33 +405,38 @@ class Storage:
         async with self._write_lock:
             await self._conn().execute(
                 "INSERT INTO usage_stats(day,scope_id,calls,prompt_tokens,"
-                "completion_tokens,cached_tokens,updated_at) "
-                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(day,scope_id) DO UPDATE SET "
+                "completion_tokens,cached_tokens,cache_reported_calls,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(day,scope_id) DO UPDATE SET "
                 "calls=usage_stats.calls+excluded.calls,"
                 "prompt_tokens=usage_stats.prompt_tokens+excluded.prompt_tokens,"
                 "completion_tokens=usage_stats.completion_tokens+excluded.completion_tokens,"
                 "cached_tokens=usage_stats.cached_tokens+excluded.cached_tokens,"
+                "cache_reported_calls=usage_stats.cache_reported_calls"
+                "+excluded.cache_reported_calls,"
                 "updated_at=excluded.updated_at",
                 (day, scope_id, max(0, int(calls)), prompt, max(0, int(completion_tokens)),
-                 min(cached, prompt), utc_now()))
+                 min(cached, prompt), 1 if cache_reported else 0, utc_now()))
             await self._conn().commit()
 
     async def usage_summary(self, days: int = 7) -> dict[str, Any]:
         limit = min(max(int(days), 1), 90)
         rows = await self._fetchall(
             "SELECT day,SUM(calls) AS calls,SUM(prompt_tokens) AS pt,"
-            "SUM(completion_tokens) AS ct,SUM(cached_tokens) AS cached "
+            "SUM(completion_tokens) AS ct,SUM(cached_tokens) AS cached,"
+            "SUM(cache_reported_calls) AS reported "
             "FROM usage_stats GROUP BY day ORDER BY day DESC LIMIT ?", (limit,))
         daily = [
             {"day": str(row["day"]), "calls": int(row["calls"] or 0),
              "prompt_tokens": int(row["pt"] or 0),
              "completion_tokens": int(row["ct"] or 0),
              "cached_tokens": int(row["cached"] or 0),
+             "cache_reported_calls": int(row["reported"] or 0),
              "cache_rate": _cache_rate(int(row["cached"] or 0), int(row["pt"] or 0))}
             for row in rows
         ]
         prompt_total = sum(d["prompt_tokens"] for d in daily)
         cached_total = sum(d["cached_tokens"] for d in daily)
+        reported_total = sum(d["cache_reported_calls"] for d in daily)
         return {
             "daily": daily,
             "totals": {
@@ -434,6 +444,7 @@ class Storage:
                 "prompt_tokens": prompt_total,
                 "completion_tokens": sum(d["completion_tokens"] for d in daily),
                 "cached_tokens": cached_total,
+                "cache_reported_calls": reported_total,
                 "cache_rate": _cache_rate(cached_total, prompt_total),
             },
         }
@@ -777,7 +788,16 @@ class Storage:
             conditions.append("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')")
             pattern = "%" + _escape_like(query) + "%"
             args.extend([pattern, pattern])
-        rows = await self._fetchall("SELECT * FROM summary_nodes WHERE " + " AND ".join(conditions) + " ORDER BY level DESC,end_seq DESC LIMIT ?", (*args, _limit(limit, 30)))
+        # 同一段范围可能有多条重复节点（例如自我总结每轮都重写「最近 40 条」，
+        # 而它的去重状态以前只存在内存里，插件一重载就再写一遍）。按
+        # (scope, level, start, end) 只保留最新那条：不然这 8 个注入名额会被
+        # 同一段重复内容占满，真正有信息量的记忆反而进不来。
+        rows = await self._fetchall(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY scope_id, level, start_seq, end_seq ORDER BY created_at DESC, summary_id DESC"
+            f") AS rn FROM summary_nodes WHERE {' AND '.join(conditions)}) "
+            "WHERE rn=1 ORDER BY level DESC,end_seq DESC LIMIT ?",
+            (*args, _limit(limit, 30)))
         result: list[SummaryRecord] = []
         for row in rows:
             citations = await self._fetchall("SELECT message_id FROM summary_citations WHERE summary_id=? ORDER BY message_id", (row["summary_id"],))
@@ -1581,6 +1601,26 @@ class Storage:
             "messages": int(messages["n"]) if messages else 0,
         }
 
+    async def latest_summary_end(self, scope_id: str, level: int,
+                                 title_prefix: str = "") -> int:
+        """该会话某一层已经压到的最远 seq（没有任何节点时返回 0）。
+
+        用来判断"这一段是不是已经总结过"：以前这种判断靠进程内变量记着，
+        插件一重载就全忘，于是同一段「最近 40 条」被反复写成新的 L3。
+
+        `title_prefix` 用来把统计限定在某一类节点上：L3 里既有真正的分层聚合，
+        也有「通知处理」这种随手写、`end_seq` 直接顶到会话末尾的记录——不区分的话，
+        一条通知处理就会让自我总结以为"最近这段已经总结过了"而永远不再跑。
+        """
+        sql = ("SELECT MAX(end_seq) AS n FROM summary_nodes "
+               "WHERE scope_id=? AND level=? AND status='active'")
+        args: list[Any] = [scope_id, int(level)]
+        if title_prefix:
+            sql += " AND title LIKE ? ESCAPE '\\'"
+            args.append(_escape_like(title_prefix) + "%")
+        row = await self._fetchone(sql, tuple(args))
+        return int(row["n"]) if row and row["n"] is not None else 0
+
     async def unconsumed_summaries(self, scope_id: str, level: int, consumed_by_level: int, limit: int = 5) -> list[SummaryRecord]:
         """Active summaries of `level` not yet used as input by `consumed_by_level`."""
         rows = await self._fetchall(
@@ -2211,12 +2251,18 @@ class Storage:
             pass
 
     async def _add_usage_cached_column(self) -> None:
-        """老库补 `usage_stats.cached_tokens`（输入里命中缓存的部分）。"""
-        try:
-            await self._conn().execute(
-                "ALTER TABLE usage_stats ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass          # 列已存在
+        """老库补 `usage_stats` 的两列：命中缓存的量、以及"上游有没有报缓存"。"""
+        for ddl in (
+            "ALTER TABLE usage_stats ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0",
+            # 老库的历史行一律按"上游报了、只是没命中"补 0：那个年代的上游确实
+            # 大多不报缓存，但把历史行改成"未上报"会让旧统计凭空变化。
+            "ALTER TABLE usage_stats ADD COLUMN cache_reported_calls "
+            "INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                await self._conn().execute(ddl)
+            except Exception:
+                pass          # 列已存在
         try:
             await self._conn().commit()
         except Exception:

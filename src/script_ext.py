@@ -47,6 +47,52 @@ def _slug(value: str) -> str:
     if not text or len(text) < 2 or not _ID_RE.match(text):
         return ""
     return text[:48].rstrip("-")
+
+
+# 自学习技能常驻提示词的挑选：只把跟眼前这句话有关的带进来。
+# 这些技能动辄上百个、每个都带着自己的触发条件与话术，全量常驻就是几万 token。
+_LEARNED_PROMPT_MAX_SKILLS = 4
+_LEARNED_PROMPT_MAX_CHARS = 4000
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+
+
+def _skill_terms(text: str) -> set[str]:
+    """把一段中文/英文文本切成"能用来比对"的词。
+
+    中文没有空格分词，这里取相邻二字（bigram）：对"这个话题在聊什么"这种
+    粗粒度匹配足够，且不会像整句比对那样一换说法就完全匹配不上。
+    """
+    value = str(text or "").lower()
+    terms: set[str] = set(_TOKEN_RE.findall(value))
+    cjk = "".join(_CJK_RE.findall(value))
+    terms.update(cjk[i:i + 2] for i in range(len(cjk) - 1))
+    return {term for term in terms if term.strip()}
+
+
+def relevant_learned_prompts(ext: Any, context_text: str) -> list[str]:
+    """按当前语境挑出这个自学习技能的提示词（不相关就一条都不给）。
+
+    相关度看 manifest 的 display_name / description / when_to_use 与语境的
+    重合词数；一个词都对不上就不注入——技能的完整说明仍然可以用
+    `extension_manual` 按需取，能力不会丢，只是不再无条件占着每轮的上下文。
+    """
+    context_terms = _skill_terms(context_text)
+    if not context_terms:
+        return []
+    manifest = getattr(ext, "manifest", {}) or {}
+    profile = " ".join(str(manifest.get(key) or "") for key in
+                       ("display_name", "description", "when_to_use"))
+    profile_terms = _skill_terms(profile)
+    if not profile_terms:
+        return []
+    overlap = context_terms & profile_terms
+    if not overlap:
+        return []
+    # 命中太少说明只是撞上了"群里""然后"这类泛词，按不相关处理
+    if len(overlap) < 2:
+        return []
+    return [str(x) for x in manifest.get("prompts", []) if str(x).strip()]
 _KNOWN_PERMISSIONS = frozenset({"llm", "memory", "net", "send", "program", "media", "ssh"})
 _OPEN_TIMEOUT = 20
 
@@ -409,8 +455,21 @@ class ScriptExtension:
             result = await result
         return str(result)
 
-    def prompts(self) -> list[str]:
-        """manifest prompts + 模块 get_prompts() 合并。"""
+    def prompts(self, context_text: str = "") -> list[str]:
+        """这一轮该注入的提示词（自学习技能按语境挑选，其余全量）。
+
+        `context_text` 是这一轮真正要处理的文本（用户说的话 / 群里的近况）。
+        自学习技能动辄上百个、每个都带着自己的「触发条件 + 话术」，全部无条件
+        常驻的话光这一项就是几万 token——而实际只有少数几个和眼前这句话有关。
+        给了语境就按相关度挑（见 `relevant_learned_prompts`）；没给语境时退回
+        全量（插件自带拓展数量有限，且它们的提示词本身就是通用约束）。
+        """
+        if context_text and self.origin == "learned":
+            return relevant_learned_prompts(self, context_text)
+        return self.manifest_prompts()
+
+    def manifest_prompts(self) -> list[str]:
+        """manifest prompts + 模块 get_prompts() 合并（不做语境筛选）。"""
         result = [str(x) for x in self.manifest.get("prompts", []) if str(x).strip()]
         getter = getattr(self.module, "get_prompts", None) if self.module else None
         if callable(getter):
@@ -932,6 +991,31 @@ class ScriptExtensionManager:
     def list(self) -> list[dict[str, Any]]:
         return [ext.summary() for ext in sorted(self.extensions.values(), key=lambda e: e.id)]
 
+    def search(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
+        """按关键词找拓展（名字/简介/何时用/工具名）。
+
+        自学习技能会一直长到上百个，全量列出来一次就是几万字符——模型真正需要的
+        是"跟眼前这个话题有关的几个"，所以列表默认给检索，而不是整份倒出来。
+        """
+        rows = self.list()
+        text = str(query or "").strip().lower()
+        if not text:
+            return rows[:max(1, int(limit))]
+        terms = _skill_terms(text)
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            haystack = " ".join(str(row.get(key) or "") for key in
+                                ("id", "display_name", "description", "when_to_use"))
+            tools = " ".join(str(x) for x in (row.get("tools") or []))
+            haystack = (haystack + " " + tools).lower()
+            score = sum(1 for term in terms if term in haystack)
+            if text in haystack:
+                score += 5
+            if score:
+                scored.append((score, row))
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+        return [row for _score, row in scored[:max(1, int(limit))]]
+
     def tool_catalog(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for ext in sorted(self.extensions.values(), key=lambda e: e.id):
@@ -948,14 +1032,54 @@ class ScriptExtensionManager:
                 })
         return rows
 
-    def prompts(self) -> list[str]:
+    def prompts(self, context_text: str = "", *, stable_only: bool = False) -> list[str]:
+        """所有启用拓展的提示词。
+
+        三种用法：
+        - `stable_only=True`：只要**不随聊天内容变化**的那部分（系统提示词用）。
+          自学习技能一律不参与——它们的内容取决于这一轮在聊什么，放进 system
+          会把上游缓存的前缀打碎。
+        - 给了 `context_text`：自学习技能按相关度挑（用户消息用）。
+        - 都不给：全量（控制台统计等离线场景）。
+        """
+        if not context_text and not stable_only:
+            rows: list[str] = []
+            for ext in sorted(self.extensions.values(), key=lambda e: e.id):
+                if ext.module is None and ext.error:
+                    continue
+                if not self.is_enabled(ext.id):
+                    continue
+                rows.extend(ext.prompts())
+            return rows
+        context_terms = _skill_terms(context_text) if context_text else set()
         rows: list[str] = []
+        learned: list[tuple[int, str, list[str]]] = []
         for ext in sorted(self.extensions.values(), key=lambda e: e.id):
             if ext.module is None and ext.error:
                 continue
             if not self.is_enabled(ext.id):
                 continue
-            rows.extend(ext.prompts())
+            if ext.origin != "learned":
+                rows.extend(ext.prompts())
+                continue
+            if stable_only:
+                continue          # 自学习技能的内容每轮都可能不同，不进 system
+            picked = ext.prompts(context_text)
+            if not picked:
+                continue
+            profile = " ".join(str(ext.manifest.get(key) or "") for key in
+                               ("display_name", "description", "when_to_use"))
+            score = len(context_terms & _skill_terms(profile))
+            learned.append((score, ext.id, picked))
+        # 相关度高的先上；同样相关时按 id 稳定排序，避免每轮顺序抖动把前缀打乱
+        learned.sort(key=lambda item: (-item[0], item[1]))
+        budget = _LEARNED_PROMPT_MAX_CHARS
+        for _score, _ext_id, picked in learned[:_LEARNED_PROMPT_MAX_SKILLS]:
+            block = "\n".join(picked)
+            if len(block) > budget:
+                break
+            budget -= len(block)
+            rows.extend(picked)
         return rows
 
     async def call(self, ext_id: str, tool: str, params: dict[str, Any]) -> str:

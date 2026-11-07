@@ -321,7 +321,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.9"
+PLUGIN_VERSION = "1.2.0"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -384,6 +384,9 @@ class LongMemoryAgentPlugin(Star):
         self._humanization: HumanizationConfig | None = None
         self._known_scopes: dict[str, str] = {}
         self._send_locks: dict[str, asyncio.Lock] = {}
+        # 每会话一把压缩锁：新消息触发、心跳巡检、定时任务三条路径可能同时压
+        # 同一个会话，不串行就会把同一批消息压成两份
+        self._compress_locks: dict[str, asyncio.Lock] = {}
         self._pending_counts: dict[str, int] = {}
         # 每会话最近一次压缩的墙钟时间：新消息积压够久就立刻压，
         # 不必等攒满 compression_batch_size（跨会话的记忆要及时）。
@@ -925,13 +928,16 @@ class LongMemoryAgentPlugin(Star):
                 await self.media.close()
         except Exception as error:
             logger.warning("长程记忆：关闭媒体归档失败：%s", str(error)[:120])
+        # 退出前不收尾压缩：未压缩的消息本来就留在库里（pending 由 seq 水位决定），
+        # 下次启动照常接着压，压不压得完只影响"这次退出快不快"。以前这里对每个
+        # 会话各跑一轮完整压缩，群一多、积压一大，停机就要卡十几分钟（宿主那边
+        # 表现为插件一直停在 Terminating，重载/更新都被拖住）；压缩本身是每次
+        # 都要调模型的慢操作，不该放在停机路径上。
         try:
             if self.compression and self.storage:
-                for scope_id in list(dict.fromkeys((getattr(self, "_known_scopes", {}) or {}).values())):
-                    if scope_id:
-                        await self._compress_scope(scope_id, rounds=1)
-        except Exception as error:
-            logger.warning("长程记忆：退出前压缩失败：%s", str(error)[:120])
+                logger.info("长程记忆：停机跳过收尾压缩（未压消息留待下次启动继续）")
+        except Exception:  # pragma: no cover - 仅日志
+            pass
         # The database MUST close: this is what lets the host delete the data dir.
         try:
             if self._extensions is not None:
@@ -1364,6 +1370,14 @@ class LongMemoryAgentPlugin(Star):
             base = 16000
         return max(4000, min(int(round(base * self._detail_factor())), 240000))
 
+    def _background_char_budget(self) -> int:
+        """后台动作（自我总结、闲时消遣、规划）的字符预算：回复预算的四分之一。
+
+        这些动作只需要"大概发生了什么"就能决定做什么，不需要回复时那份完整记忆；
+        而它们一天要跑很多轮，预算和回复一样大的话，省下来的就是纯浪费。
+        """
+        return max(2000, min(self._context_char_budget() // 4, 32000))
+
     def _detail_level_info(self) -> dict[str, Any]:
         level = self._detail_level()
         name, factor = CONTEXT_DETAIL_LEVELS[level]
@@ -1712,13 +1726,15 @@ class LongMemoryAgentPlugin(Star):
                 if agent:
                     logger.warning("长程记忆：Agent 最终输出为空，交调用方兜底")
                     return text
-                last_error = RuntimeError("LLM返回空输出")
+                # 空输出不重试同一个 prompt。上游既然已经完整读了一遍上下文却
+                # 一个字都没吐，把同一份内容原样再发一遍基本不会换出不同结果；
+                # 而这份上下文往往是几万 token（实测中位数 9.7k、最大 10 万），
+                # 连着发五遍就是几十万 token 换一个空字符串。空输出按"这次没答上来"
+                # 处理，直接交调用方兜底（parse_json_object("")→None→{}）。
+                self._record_usage(response)   # 空输出照样计费，用量要记准
                 logger.warning(
-                    "长程记忆：LLM 返回空输出（第%d/%d次尝试）", attempt, max_attempts,
+                    "长程记忆：LLM 返回空输出，本轮不再重试（避免重复计费同一份上下文）",
                 )
-                if attempt < max_attempts:
-                    await asyncio.sleep(min(2 ** (attempt - 1), 8))
-                    continue
                 return text
             except asyncio.CancelledError:
                 raise
@@ -1728,6 +1744,16 @@ class LongMemoryAgentPlugin(Star):
                 ) from None
             except Exception as error:
                 last_error = error
+                # agent 循环绝对不能整轮重跑：它可能已经发过消息、点过赞、改过档案。
+                # 重跑 = 副作用重复一遍（重复发言/重复点赞），而且每一轮都要重新
+                # 带上完整上下文（实测一次 40~60k 输入 token），一个空输出就能连着
+                # 烧五次、发五次。这里的失败一律交调用方兜底，不再重试。
+                if agent:
+                    logger.warning(
+                        "长程记忆：Agent 循环失败（不重跑，避免重复副作用）：%s",
+                        str(error)[:200],
+                    )
+                    raise
                 # 内容审核拦截（400 prompt_blocked / PROHIBITED_CONTENT）：重试毫无意义，
                 # 只会连着烧 5 轮 token（已知问题：同一条被拦 3 次以上）。直接放弃这一轮。
                 if self._looks_like_prompt_blocked(error):
@@ -1784,6 +1810,11 @@ class LongMemoryAgentPlugin(Star):
         output），其中 `input_cached` 就是上游报回来的"命中缓存"的输入量。
         分开记，面板才能算出真实的缓存命中率——只记总数的话，看着数字很大
         却分不清是"真的在用"还是"大部分走了缓存便宜通道"。
+
+        另外还要分清"没命中"和"上游没报"：不少中转/自建推理后端的
+        `prompt_tokens_details` 恒为 null（vLLM 常见），这时 cached=0 只代表
+        我们没有数据。混在一起算，面板会显示成"缓存命中率 0%"，看着像插件
+        把缓存吃掉了，其实是这个通道根本不给这个字段。
         """
         if self.storage is None or self._stopping:
             return
@@ -1792,24 +1823,34 @@ class LongMemoryAgentPlugin(Star):
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         cached_tokens = int(getattr(usage, "cached_tokens", 0) or 0)
+        cache_reported = False
         # OpenAI 原始响应：命中量在 prompt_tokens_details.cached_tokens 里
         details = getattr(usage, "prompt_tokens_details", None)
         if details is not None:
-            cached_tokens = cached_tokens or int(
-                getattr(details, "cached_tokens", 0) or 0)
+            hit = getattr(details, "cached_tokens", None)
+            if hit is not None:
+                cache_reported = True
+                cached_tokens = cached_tokens or int(hit or 0)
         # Anthropic 原始响应：cache_read_input_tokens
-        cached_tokens = cached_tokens or int(
-            getattr(usage, "cache_read_input_tokens", 0) or 0)
-        # 新结构（TokenUsage）：input = input_other + input_cached
+        anthro = getattr(usage, "cache_read_input_tokens", None)
+        if anthro is not None:
+            cache_reported = True
+            cached_tokens = cached_tokens or int(anthro or 0)
+        # 新结构（TokenUsage）：input = input_other + input_cached。
+        # input_cached 只有在调用方真的解析到上游缓存字段时才会非零，
+        # 所以"非零"本身就是"上游报了"的证据。
         if not prompt_tokens:
             input_other = int(getattr(usage, "input_other", 0) or 0)
             input_cached = int(getattr(usage, "input_cached", 0) or 0)
             prompt_tokens = input_other + input_cached
-            cached_tokens = cached_tokens or input_cached
+            if input_cached:
+                cache_reported = True
+                cached_tokens = cached_tokens or input_cached
             completion_tokens = int(getattr(usage, "output", 0) or 0) or completion_tokens
         try:
             self._spawn(self.storage.add_usage(
-                1, prompt_tokens, completion_tokens, cached_tokens=cached_tokens))
+                1, prompt_tokens, completion_tokens, cached_tokens=cached_tokens,
+                cache_reported=cache_reported))
         except Exception:
             pass
 
@@ -2095,6 +2136,18 @@ class LongMemoryAgentPlugin(Star):
         """
         if not self.compression or not self.storage:
             return 0
+        # 同一个会话同一时刻只能有一个压缩在跑。三条路径都会进来——新消息攒够
+        # 一批、心跳巡检、定时任务——它们都是"先查待压消息、再调模型、最后落库"，
+        # 并发时两边会读到同一批消息，各自压出一份 L1：库里因此出现同一 seq 区间
+        # 的重复节点，既多花一次模型调用，又让后面的聚合在重复内容上再算一遍。
+        lock = self._compress_locks.get(scope_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._compress_locks[scope_id] = lock
+        async with lock:
+            return await self._compress_scope_locked(scope_id, rounds)
+
+    async def _compress_scope_locked(self, scope_id: str, rounds: int) -> int:
         created = 0
         batch = max(4, self.settings.compression_batch_size // 2)
         for _ in range(max(1, rounds)):
@@ -3019,6 +3072,11 @@ class LongMemoryAgentPlugin(Star):
             payload["message_type"] = "image"
             payload["note"] = "你看不到这张图片的内容；只做符合当前情绪的最简短回应，或改用表情/戳一戳表达。"
         prompt = compact_json(payload, self._context_char_budget())
+        # 和这句话相关的接话经验放进用户消息（不放 system：它每轮都不同，
+        # 进 system 会让上游缓存的前缀整段失效，反而更贵）。
+        related = self._script_context_block(str(payload.get("current_message") or ""))
+        if related:
+            prompt = f"{related}\n\n{prompt}"
         # agent 循环走专用系统提示词（不强制 JSON、不重复注入工具清单）；
         # 旧 _compose_reply_prompt 的【最终输出】JSON 只服务无工具两段式。
         # 最终回应的形状：模型循环里可以直接说话，也可能带计划 JSON——
@@ -3915,7 +3973,8 @@ class LongMemoryAgentPlugin(Star):
             provider,
             prompt=(f"现在是 {timeutil.text('%Y-%m-%d %H:%M %A')}。"
                     f"当前会话氛围与最近聊天：见下。要你回应的事：{text}"),
-            system_prompt=await self._agent_reply_system_prompt(await self._persona_prompt()),
+            system_prompt=await self._agent_reply_system_prompt(
+                await self._persona_prompt(), text),
             event=None,
         )
         answer = str(answer or "").strip()
@@ -6660,7 +6719,7 @@ class LongMemoryAgentPlugin(Star):
             if loop_warning:
                 payload_data["loop_warning"] = loop_warning
                 loop_warning = ""
-            payload = compact_json(payload_data, self._context_char_budget())
+            payload = compact_json(payload_data, self._background_char_budget())
             provider = self.settings.reply_provider_id or ""
             persona = await self._persona_prompt()
             script_block = self._script_prompts_block()
@@ -6672,6 +6731,10 @@ class LongMemoryAgentPlugin(Star):
                      await self._injections_block()) if part
                 )
             )
+            # 和这一步任务相关的接话经验跟着用户消息走（每轮内容不同，放 system 会打碎前缀缓存）
+            related = self._script_context_block(task_name + "\n" + instruction)
+            if related:
+                payload = f"{related}\n\n{payload}"
             raw = await self._llm_text(provider, prompt=payload, system_prompt=task_prompt)
             plan = parse_json_object(raw) or {}
             actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
@@ -8148,22 +8211,31 @@ class LongMemoryAgentPlugin(Star):
         return "【常备指令（主人授予你的长期行动授权，每次对话都生效）】" + text[:2000]
 
     def _script_prompts_block(self) -> str:
-        """拓展提示词段落（**渐进式披露**）。
+        """拓展提示词段落（**渐进式披露**，只放稳定内容）。
 
-        两层：
-        - **能力卡**：每个启用的拓展一张（名字 + 一句话 + 何时用 + 工具列表）——
-          常驻，让模型知道"有这么个东西、什么时候用它"；
-        - **常驻小注入**：manifest `prompts` 里的一两句硬性说明（如"尚未完工"）。
+        这里进的是系统提示词，而系统提示词是上游输入缓存的前缀：只要它每轮都变，
+        缓存就整段失效。所以这里只放**不随聊天内容变化**的东西：
 
-        完整使用说明（manual）**不在这里**——按需用 `extension_manual` 工具取，
-        免得几个拓展的手册把系统提示词撑爆。
+        - **能力卡**：插件自带的拓展每个一张（名字 + 一句话 + 何时用 + 工具）；
+        - **自学习技能只报数量**：这类技能会一直长（服务器上已经上百个），
+          逐个列卡光标题就是上万字符，而模型面对上百条同类卡也挑不出该用哪个。
+          给数量 + 检索入口，需要哪个再用 `extension_manual` / `script_list` 取。
+
+        跟当前话题相关的那几条提示词**不在这里**（见 `_script_context_block`）：
+        它们每轮都不一样，放进 system 会把前缀打碎，放进用户消息则天然只算一次。
+
+        完整使用说明（manual）也不在这里——按需用 `extension_manual` 工具取。
         """
         manager = self._script_manager()
         cards: list[str] = []
+        learned = 0
         for ext in sorted(manager.extensions.values(), key=lambda e: e.id):
             if ext.error and ext.module is None:
                 continue
             if not manager.is_enabled(ext.id):
+                continue
+            if getattr(ext, "origin", "builtin") == "learned":
+                learned += 1
                 continue
             card = ext.capability_card()
             if card.strip():
@@ -8174,10 +8246,31 @@ class LongMemoryAgentPlugin(Star):
                 "【可用的 scripts 拓展】下面的拓展各有完整使用说明"
                 "（用 extension_manual(script=\"id\") 按需读取，别凭感觉瞎调）：\n"
                 + "\n".join(cards))
-        always_on = [t.strip() for t in manager.prompts() if t.strip()]
+        if learned:
+            sections.append(
+                f"【自学习技能】另有 {learned} 个从聊天里学来的接话技能（各自的触发条件、"
+                "话术、例子都存在里面）。它们不逐条列出——用 script_list 按关键词查，"
+                "命中后用 extension_manual(script=\"id\") 读完整说明再照着说；"
+                "和眼前这句话明显无关的就不用查。")
+        always_on = [t.strip() for t in manager.prompts(stable_only=True) if t.strip()]
         if always_on:
             sections.append("\n\n".join(always_on))
         return "\n\n".join(sections)
+
+    def _script_context_block(self, context_text: str) -> str:
+        """和眼前这句话相关的自学习技能提示词（随语境变化，放用户消息里）。"""
+        if not context_text:
+            return ""
+        try:
+            picked = [t.strip() for t in
+                      self._script_manager().prompts(context_text) if t.strip()]
+        except Exception as error:
+            logger.info("长程记忆：筛选拓展提示词失败：%s", str(error)[:120])
+            return ""
+        if not picked:
+            return ""
+        return ("【跟你现在这句话有关的接话经验】按这些说法接，别照念：\n"
+                + "\n\n".join(picked))
 
     async def load_script_extensions(self) -> None:
         problems = await self._script_manager().load_all()
@@ -8758,21 +8851,29 @@ class LongMemoryAgentPlugin(Star):
             return
         self._bind_gateway_client()
         for group_id, scope in list(self._known_scopes.items()):
+            # 自我总结是"回顾群里的日子"：私聊只有一个人、一条线，回顾出来的
+            # 东西跟普通压缩的结果高度重复，随后那轮自主动作在私聊里也只剩
+            # "主动找人说话"这一种可能（那件事由主动聊天循环负责）。私聊照样
+            # 正常压缩记忆，只是不参加自我总结——省掉的是每次一整轮完整输入。
+            if str(group_id).startswith("private:"):
+                continue
             recent = await self.storage.recent_messages(scope, 5)
             if not recent:
                 continue
             # 群里这几天没有任何新消息时，"自我总结"只会把同样的内容再总结一遍：
-            # 每个群一轮完整调用，一天下来就是纯浪费。按"最后一条消息"判断。
-            if str(recent[-1].message_id) == getattr(
-                    self, "_reflect_seen", {}).get(scope):
+            # 每个群一轮完整调用，一天下来就是纯浪费。
+            # 判据放在库里而不是内存里：以前记在进程内的 `_reflect_seen` 一重载就没了，
+            # 每次更新插件都会把所有群"最近 40 条"重新写成一条新的 L3——同一个 seq
+            # 区间能攒出上百条内容几乎一样的节点，还会把注入用的那几个摘要名额占满。
+            try:
+                covered_to = await self.storage.latest_summary_end(
+                    scope, 3, title_prefix="自我总结")
+            except Exception:
+                covered_to = 0
+            if covered_to >= int(recent[-1].scope_seq):
                 continue
             try:
                 result = await self._self_reflect(scope, group_id)
-                seen = getattr(self, "_reflect_seen", None)
-                if not isinstance(seen, dict):
-                    seen = {}
-                    self._reflect_seen = seen
-                seen[scope] = str(recent[-1].message_id)
                 logger.info(
                     "长程记忆：群%s自我总结完成，随后行动%s个",
                     group_id, result.get("actions", 0),
@@ -8802,7 +8903,7 @@ class LongMemoryAgentPlugin(Star):
                     {"title": s.title, "body": s.body[:400]} for s in summaries
                 ],
             },
-            self.settings.context_char_budget,
+            self._background_char_budget(),
         )
         provider = self.settings.reply_provider_id or ""
         persona = await self._persona_prompt()
@@ -13676,16 +13777,25 @@ class LongMemoryAgentPlugin(Star):
         return str(result)[:4000]
 
     @filter.llm_tool(name="script_list")
-    async def script_list_tool(self, event: AstrMessageEvent):
-        """列出已加载的 scripts 拓展与它们提供的工具（含参数说明、何时用）。"""
+    async def script_list_tool(self, event: AstrMessageEvent, query: str = ""):
+        """查已加载的 scripts 拓展与它们提供的工具（含参数说明、何时用）。
+
+        自学习技能可能上百个，一次全倒出来会淹没上下文：给它 query（话题关键词）
+        就只返回相关的那些，不给就返回前若干个。
+
+        Args:
+            query(string): 话题关键词，比如「安卓 root」「MC 指令」「数学题」；留空则列前若干个。
+        """
         manager = self._script_manager()
+        rows = manager.search(query, limit=20 if query else 12)
         return compact_json({
             "scripts": [
                 {key: value for key, value in item.items()
                  if key not in {"config", "config_template"}}
-                for item in manager.list()
+                for item in rows
             ],
-            "tools": manager.tool_catalog(),
+            "total": len(manager.extensions),
+            "tools": manager.tool_catalog() if not query else [],
         }, self.settings.context_char_budget // 2)
 
     @filter.llm_tool(name="extension_manual")
