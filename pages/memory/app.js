@@ -1292,7 +1292,7 @@ window.SparkingWeb = (() => {
       case "groups": return loadGroups();
       case "schedule": return loadSchedule();
       case "caps": return loadCaps();
-      case "inject": return Promise.all([loadInjections(), loadContextDetail()]);
+      case "inject": return Promise.all([loadInjections(), loadContextDetail(), loadIdleActivity()]);
       case "culture": return loadCulture();
       case "learn": return loadLearn();
       case "backup": return loadBackup();
@@ -1379,7 +1379,14 @@ window.SparkingWeb = (() => {
     const totalCalls = totals.calls ?? usage.total_calls ?? usage.calls ?? 0;
     const promptTokens = totals.prompt_tokens ?? usage.prompt_tokens ?? 0;
     const completionTokens = totals.completion_tokens ?? usage.completion_tokens ?? 0;
-    usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens · 输出 ${completionTokens} tokens`));
+    const cachedTokens = Number(totals.cached_tokens ?? 0) || 0;
+    // 缓存命中率 = 命中缓存的输入 / 全部输入。命中部分按上游折扣计费，
+    // 所以这个数字比"总 token"更能说明钱花在哪。
+    const cacheRate = Number(totals.cache_rate
+      ?? (promptTokens > 0 ? cachedTokens / promptTokens : 0)) || 0;
+    const cachePct = (cacheRate * 100).toFixed(1) + "%";
+    usageBox.appendChild(el("div", "", `总调用 ${totalCalls} 次 · 输入 ${promptTokens} tokens`
+      + `（其中命中缓存 ${cachedTokens}，${cachePct}）· 输出 ${completionTokens} tokens`));
     const daily = (usage.daily || usage.days || []).slice(-7);
     const peak = daily.reduce((top, row) => Math.max(top, Number(row.calls) || 0), 0) || 1;
     daily.forEach((row) => {
@@ -1393,7 +1400,12 @@ window.SparkingWeb = (() => {
       bar.style.width = Math.max(2, Math.round(((Number(row.calls) || 0) / peak) * 100)) + "%";
       track.appendChild(bar);
       line.appendChild(track);
-      line.appendChild(el("span", "usage-count", `${row.calls} 次`));
+      const dayRate = Number(row.cache_rate ?? 0) || 0;
+      const dayCached = Number(row.cached_tokens ?? 0) || 0;
+      const count = el("span", "usage-count", `${row.calls} 次`);
+      count.title = `输入 ${row.prompt_tokens || 0} tokens，命中缓存 ${dayCached}`
+        + `（${(dayRate * 100).toFixed(0)}%）`;
+      line.appendChild(count);
       usageBox.appendChild(line);
     });
     if (!daily.length && !totalCalls) usageBox.appendChild(el("div", "muted", "近 7 天暂无调用记录"));
@@ -2711,6 +2723,61 @@ window.SparkingWeb = (() => {
     }
   }
 
+  // 空闲活跃度：只影响后台自主动作，正常回复不受影响
+  async function loadIdleActivity() {
+    const select = $("idle-level");
+    const hint = $("idle-hint");
+    const facts = $("idle-facts");
+    try {
+      const data = await get("idle_activity");
+      if (select) select.value = String(data.level || 3);
+      if (hint) {
+        hint.textContent = "当前：" + (data.name || "")
+          + "（" + (data.desc || "") + "）";
+      }
+      if (facts) {
+        facts.textContent = "";
+        const rows = [
+          ["闲时动作上限", (data.idle_actions_per_hour || 0) + " 次/小时"],
+          ["心跳周期", (data.heartbeat_seconds || 0)
+            ? data.heartbeat_seconds + " 秒" : "关闭"],
+          ["排日程", (data.plan_interval_hours || 0)
+            ? "每 " + data.plan_interval_hours + " 小时" : "关闭"],
+          ["自我总结", (data.reflect_interval_hours || 0)
+            ? "每 " + data.reflect_interval_hours + " 小时" : "关闭"],
+          ["情绪刷新", (data.mood_update_minutes || 0)
+            ? "每 " + data.mood_update_minutes + " 分钟" : "关闭"],
+          ["风格学习", (data.style_learn_hours || 0)
+            ? "每 " + data.style_learn_hours + " 小时" : "关闭"],
+          ["主动巡查", (data.proactive_interval_minutes || 0)
+            ? "每 " + data.proactive_interval_minutes + " 分钟" : "关闭"],
+        ];
+        if (data.requires_activity_minutes) {
+          rows.push(["静默闸门", "群里超过 " + data.requires_activity_minutes
+            + " 分钟没人说话就只潜水"]);
+        }
+        rows.forEach(([key, value]) => {
+          facts.appendChild(el("b", "", key));
+          facts.appendChild(el("span", "", String(value ?? "")));
+        });
+      }
+    } catch (error) {
+      if (hint) hint.textContent = String(error.message || error);
+    }
+  }
+
+  async function saveIdleActivity() {
+    const select = $("idle-level");
+    if (!select) return;
+    try {
+      const out = await post("idle_activity_set", { level: Number(select.value) });
+      toast("空闲活跃度已切到「" + (out.name || "") + "」", "ok");
+      loadIdleActivity();
+    } catch (error) {
+      toast(String(error.message || error), "error");
+    }
+  }
+
   async function loadInjections() {
     const box = $("injections");
     if (!box) return;
@@ -3184,6 +3251,7 @@ window.SparkingWeb = (() => {
     $("btn-ext-upload").addEventListener("click", runExtensionUpload);
     $("btn-refresh-inject").addEventListener("click", loadInjections);
     $("btn-detail-save").addEventListener("click", saveContextDetail);
+    $("btn-idle-save").addEventListener("click", saveIdleActivity);
     $("btn-refresh-culture").addEventListener("click", loadCulture);
     $("btn-learn-run").addEventListener("click", runImport);
     $("btn-learn-refresh").addEventListener("click", loadLearn);

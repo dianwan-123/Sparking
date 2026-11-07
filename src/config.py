@@ -97,6 +97,7 @@ class PluginConfig:
     proactive_interval_minutes: int
     heartbeat_interval_seconds: int
     idle_actions_per_hour: int
+    idle_activity_level: int
     plan_interval_hours: int
     origin_wake_prefixes: str
     style_learn_hours: int
@@ -223,6 +224,7 @@ class PluginConfig:
             proactive_interval_minutes=_int(d.get("proactive_interval_minutes"), 15, 0, 720),
             heartbeat_interval_seconds=_int(d.get("heartbeat_interval_seconds"), 120, 0, 3600),
             idle_actions_per_hour=_int(d.get("idle_actions_per_hour"), 4, 0, 30),
+            idle_activity_level=_int(d.get("idle_activity_level"), 3, 1, 4),
             plan_interval_hours=_int(d.get("plan_interval_hours"), 6, 1, 24),
             origin_wake_prefixes=str(d.get("origin_wake_prefixes", "/") or "/"),
             style_learn_hours=_int(d.get("style_learn_hours"), 3, 0, 168),

@@ -249,6 +249,23 @@
           </div>
         </div>
         <div class="card">
+          <h2>空闲活跃度 <span class="muted">没人找它说话时，后台自己找事做的开销</span></h2>
+          <p class="muted">只影响<b>闲时</b>——既不主动聊天、也没人找它回复的时候，它多久自己找一次事做、
+            一次能做多少（排日程 / 闲时消遣 / 自我总结 / 情绪刷新 / 风格学习 / 主动巡查）。
+            <b>有人跟它说话时的正常回复完全不受影响</b>。档位越低越省 token，静默档只潜水看群、只记消息。</p>
+          <div class="row wrap">
+            <select id="idle-level">
+              <option value="1">1 · 静默（最省）</option>
+              <option value="2">2 · 克制</option>
+              <option value="3">3 · 标准</option>
+              <option value="4">4 · 活跃</option>
+            </select>
+            <button class="btn primary" id="btn-idle-save">应用</button>
+            <span class="muted" id="idle-hint"></span>
+          </div>
+          <div id="idle-facts" class="kv"></div>
+        </div>
+        <div class="card">
           <h2>提示词注入 <span class="muted">勾选即生效，以【强制规则】追加到系统提示</span></h2>
           <p class="muted">自带预设可以直接启用、也可以改内容；自己的规则点「新增」。
             注入内容写成硬性要求（「每条消息必须 ≤15 字」）效果最好——它们会以

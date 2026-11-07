@@ -140,7 +140,15 @@ from .src.prompts import (
 )
 from .src.qq_services import QQService, QzoneError, QzoneService
 from .src.retrieval import RetrievalService
-from .src.rhythm import build_plan_prompt, idle_choice, parse_plan_response
+from .src.rhythm import (
+    IDLE_LEVELS,
+    build_plan_prompt,
+    idle_choice,
+    idle_level_info,
+    idle_profile,
+    idle_should_run,
+    parse_plan_response,
+)
 from .src.scheduler import ScheduledTask, TaskRunner, TaskScheduler
 from .src.skill_manager import SkillManager, SkillValidationError
 from .src.stickers import StickerError, StickerManager
@@ -313,7 +321,7 @@ def _bubble_text(text: str, limit: int = 1200) -> str:
     return " ".join(cleaned.split()).rstrip(". ")
 
 
-PLUGIN_VERSION = "1.1.8"
+PLUGIN_VERSION = "1.1.9"
 
 
 def _binary_response(payload: bytes, filename: str) -> Any:
@@ -349,6 +357,8 @@ class LongMemoryAgentPlugin(Star):
         super().__init__(context, config)
         self.raw_config = config or {}
         self.settings = PluginConfig.from_mapping(self.raw_config)
+        # 面板页脚/概览显示的版本号（以前没设，概览里 version 一直是空串）
+        self._version = PLUGIN_VERSION
         self._config_signature_seen = self._config_signature()
         self.storage: Storage | None = None
         self.ingest: IngestService | None = None
@@ -415,6 +425,8 @@ class LongMemoryAgentPlugin(Star):
         self._next_plan_at = float("inf")
         self._idle_budget: tuple[int, int] = (0, 0)
         self._lurk_cursor: int = 0
+        # 情绪/状态自更新的"生活指纹"：输入没变就不重复叫模型
+        self._mood_fingerprint: tuple[Any, ...] | None = None
         self._pending_forward_ids: list[str] = []
         self._provider_fallback_warned: set[str] = set()
         self._last_signature_at = -6 * 3600.0  # cooldown long expired at boot
@@ -941,6 +953,11 @@ class LongMemoryAgentPlugin(Star):
 
     def _spawn(self, coroutine: Awaitable[Any]) -> None:
         if self._stopping:
+            # 停机时不再起新任务，但要把它关掉——否则协程从未被 await，
+            # 每次停机都留一条 RuntimeWarning（真正的泄漏会被它淹掉）。
+            closer = getattr(coroutine, "close", None)
+            if callable(closer):
+                closer()
             return
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
@@ -1253,6 +1270,73 @@ class LongMemoryAgentPlugin(Star):
 
     def _detail_factor(self) -> float:
         return CONTEXT_DETAIL_LEVELS[self._detail_level()][1]
+
+    # ------------------------------------------------ 空闲活跃度（四档）
+    def _idle_level(self) -> int:
+        """当前空闲活跃度档位（1 静默 / 2 克制 / 3 标准 / 4 活跃）。"""
+        try:
+            level = int(getattr(self.settings, "idle_activity_level", 3) or 3)
+        except (TypeError, ValueError):
+            level = 3
+        return level if level in IDLE_LEVELS else 3
+
+    def _idle(self) -> dict[str, Any]:
+        """本档生效的闲时节流参数（只影响后台自主动作，不动正常回复）。"""
+        return idle_profile(self._idle_level())
+
+    def _idle_level_info(self) -> dict[str, Any]:
+        """控制台/工具共用：当前档位 + 该档实际生效的节奏。"""
+        info = idle_level_info(
+            self._idle_level(),
+            configured_actions=self.settings.idle_actions_per_hour)
+        profile = self._idle()
+        base_heartbeat = int(self.settings.heartbeat_interval_seconds or 0)
+        info["heartbeat_seconds"] = (0 if base_heartbeat <= 0 else int(round(
+            max(30.0, float(base_heartbeat)) * float(profile["heartbeat_scale"]))))
+        info["plan_interval_hours"] = self._scaled_interval(
+            self.settings.plan_interval_hours, profile["plan_scale"], 1)
+        info["reflect_interval_hours"] = self._scaled_interval(
+            self.settings.self_reflect_interval_hours, profile["reflect_scale"], 0)
+        info["mood_update_minutes"] = self._scaled_interval(
+            self.settings.mood_update_minutes, profile["mood_scale"], 0)
+        info["style_learn_hours"] = self._scaled_interval(
+            self.settings.style_learn_hours, profile["style_scale"], 0)
+        info["proactive_interval_minutes"] = self._scaled_interval(
+            self.settings.proactive_interval_minutes, profile["proactive_scale"], 0)
+        info["note"] = (
+            "只调后台自主动作的频率与预算：正常回复（有人找它说话）完全不受影响。"
+            "档位越低，叫模型的次数越少；「静默」档只潜水与记消息。")
+        return info
+
+    @staticmethod
+    def _scaled_interval(value: Any, scale: float, minimum: int) -> int:
+        """按档位缩放一个周期（0 表示该功能关闭，缩放后仍为 0）。"""
+        try:
+            base = int(value or 0)
+        except (TypeError, ValueError):
+            base = 0
+        if base <= 0 or scale <= 0:
+            return 0
+        return max(minimum, int(round(base * float(scale))))
+
+    def _set_idle_level(self, level: int) -> dict[str, Any]:
+        """切换空闲活跃度（控制台快捷入口）：改配置本身，立即生效。"""
+        level = int(level)
+        if level not in IDLE_LEVELS:
+            raise ValueError("空闲活跃度只能是 1~4")
+        previous = self._idle_level()
+        self.raw_config["idle_activity_level"] = level
+        self.settings = PluginConfig.from_mapping(self.raw_config)
+        self._config_signature_seen = self._config_signature()
+        self._persist_raw_config()
+        if level != previous:
+            logger.info("长程记忆：空闲活跃度 %s → %s（%s）",
+                        IDLE_LEVELS[previous]["name"],
+                        IDLE_LEVELS[level]["name"],
+                        IDLE_LEVELS[level]["desc"])
+        info = self._idle_level_info()
+        info["previous"] = previous
+        return info
 
     def _context_limits(self) -> dict[str, int]:
         """本轮注入的记忆规模：档次 × 各项配置（只缩放注入量，不改配置本身）。"""
@@ -1694,15 +1778,38 @@ class LongMemoryAgentPlugin(Star):
         return await self._llm_text(provider, prompt=prompt, system_prompt=system_prompt)
 
     def _record_usage(self, response: Any) -> None:
-        """记录一次 LLM 调用（openclaw usage-tracking 移植）：调用数 + token 数。"""
+        """记录一次 LLM 调用（openclaw usage-tracking 移植）：调用数 + token 数。
+
+        AstrBot 4.28+ 起 `usage` 是 `TokenUsage`（input_other / input_cached /
+        output），其中 `input_cached` 就是上游报回来的"命中缓存"的输入量。
+        分开记，面板才能算出真实的缓存命中率——只记总数的话，看着数字很大
+        却分不清是"真的在用"还是"大部分走了缓存便宜通道"。
+        """
         if self.storage is None or self._stopping:
             return
         raw = getattr(response, "raw_completion", None)
-        usage = getattr(raw, "usage", None)
+        usage = getattr(raw, "usage", None) or getattr(response, "usage", None)
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        cached_tokens = int(getattr(usage, "cached_tokens", 0) or 0)
+        # OpenAI 原始响应：命中量在 prompt_tokens_details.cached_tokens 里
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached_tokens = cached_tokens or int(
+                getattr(details, "cached_tokens", 0) or 0)
+        # Anthropic 原始响应：cache_read_input_tokens
+        cached_tokens = cached_tokens or int(
+            getattr(usage, "cache_read_input_tokens", 0) or 0)
+        # 新结构（TokenUsage）：input = input_other + input_cached
+        if not prompt_tokens:
+            input_other = int(getattr(usage, "input_other", 0) or 0)
+            input_cached = int(getattr(usage, "input_cached", 0) or 0)
+            prompt_tokens = input_other + input_cached
+            cached_tokens = cached_tokens or input_cached
+            completion_tokens = int(getattr(usage, "output", 0) or 0) or completion_tokens
         try:
-            self._spawn(self.storage.add_usage(1, prompt_tokens, completion_tokens))
+            self._spawn(self.storage.add_usage(
+                1, prompt_tokens, completion_tokens, cached_tokens=cached_tokens))
         except Exception:
             pass
 
@@ -2812,12 +2919,23 @@ class LongMemoryAgentPlugin(Star):
 
         已知问题：下午 13:15 说"晚上好"——因为主动发言/追问那些路径压根没带时间，
         模型只能猜。这里统一给，并要求寒暄必须按它对上。
+
+        注意这里**不带具体时间**：它被拼进 system 提示词，而上游的输入缓存
+        按"前缀完全一致"命中——分钟级的动态值写在这里，等于每分钟让整段
+        system 前缀失效。具体时钟由 `_now_payload()` 放进用户消息
+        （消息本来就每次都变，不影响缓存）。
         """
+        return "**打招呼/寒暄（早安、晚安、下午好…）必须按当前时间说，说错很出戏**；" \
+               "判断「隔了多久」「是不是该睡了」也以当前时间为准（时间在 now 字段里）。"
+
+    @staticmethod
+    def _now_payload() -> dict[str, str]:
+        """当前时间的具体值（放进用户消息的 payload，不进 system）。"""
         moment = timeutil.now()
-        return (f"现在是 {moment.strftime('%Y-%m-%d %H:%M')}（{timeutil.weekday_name(moment)}，"
-                f"本地时间，{self._time_of_day(moment.hour)}）。"
-                "**打招呼/寒暄（早安、晚安、下午好…）必须按这个时间说，说错很出戏**；"
-                "判断「隔了多久」「是不是该睡了」也以它为准。")
+        return {
+            "now": timeutil.text("%Y-%m-%d %H:%M %A", at=moment),
+            "time_of_day": LongMemoryAgentPlugin._time_of_day(moment.hour),
+        }
 
     async def _agent_reply_system_prompt(self, persona: str = "") -> str:
         """agent 循环（tool_loop_agent）专用系统提示词：最终回应不再强制 JSON。
@@ -6500,28 +6618,24 @@ class LongMemoryAgentPlugin(Star):
         forced_done = False
         last_thought = ""
         watermark = 0
+        # 空闲活跃度：档位越低，一次自主动作允许的轮数与单轮动作数越少。
+        # 这是闲时开销的主要来源（每轮都是一次完整的模型调用）。
+        idle = self._idle()
+        max_rounds = max(1, min(3, int(idle["loop_rounds"])))
+        max_actions = max(1, min(5, int(idle["max_actions"])))
         if scope and self.storage is not None:
             try:
                 tail = await self.storage.recent_messages(scope, 1)
                 watermark = tail[-1].scope_seq if tail else 0
             except Exception:
                 watermark = 0
-        for round_index in range(3):
+        for round_index in range(max_rounds):
             mood = self.mood.get().as_prompt() if self.mood else ""
-            memory = "{}"
-            if scope and self.context_builder:
-                memory = await self.context_builder.build(
-                    scope, instruction, runtime_manifest={"mood": mood},
-                    **self._context_limits(),
-                    cross_scope_ids=self._shared_scope_ids(scope),
-                    cross_labels={v: k for k, v in self._known_scopes.items()},
-                )
             payload_data: dict[str, Any] = {
                 "task": task_name, "instruction": instruction,
                 "previous_results": results[-6:], "transcript": transcript[-4:],
                 # 主动发言也要知道现在几点（已知问题：下午一点说"晚上好"）
-                "now": timeutil.text("%Y-%m-%d %H:%M %A"),
-                "time_of_day": self._time_of_day(timeutil.now().hour),
+                **self._now_payload(),
             }
             # steering（openclaw 移植）：任务开始后群里的新消息可能含新指示，
             # 每轮带上让 agent 及时调整，而不是做完已经过时的步骤
@@ -6561,7 +6675,7 @@ class LongMemoryAgentPlugin(Star):
             raw = await self._llm_text(provider, prompt=payload, system_prompt=task_prompt)
             plan = parse_json_object(raw) or {}
             actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
-            for item in actions[:5]:
+            for item in actions[:max_actions]:
                 if not isinstance(item, dict):
                     continue
                 tool_name = str(item.get("tool", ""))
@@ -6590,11 +6704,45 @@ class LongMemoryAgentPlugin(Star):
         return {"ok": True, "actions": len(results), "results": results,
                 "last_thought": last_thought}
 
+    async def _silent_minutes(self) -> float:
+        """全体会话里"最近一次有人说话"距今多少分钟（没有任何会话时按无限久）。
+
+        只算**别人**说的话：自己刚发的消息不算"群里有动静"——否则它自己一开口，
+        闸门就以为群里很热闹，接着又去做下一件事，越做越停不下来。
+        """
+        self_id = str(self._self_id() or "")
+        newest = 0.0
+        for scope_id in dict.fromkeys(self._known_scopes.values()):
+            if not scope_id or self.storage is None:
+                continue
+            try:
+                tail = await self.storage.recent_messages(scope_id, 8)
+            except Exception:
+                continue
+            for message in reversed(tail):
+                if str(message.upstream_message_id or "").startswith("self:"):
+                    continue
+                if self_id and str(message.sender_id or "") == self_id:
+                    continue
+                try:
+                    when = datetime.fromisoformat(
+                        str(message.occurred_at)).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                newest = max(newest, when)
+                break
+        if newest <= 0:
+            return float("inf")
+        return max(0.0, time.time() - newest)
+
     async def _heartbeat_loop(self) -> None:
         """Human-like tick: scheduled plans first, idle pastimes, silent lurking."""
         await asyncio.sleep(90)
         while not self._stopping:
             interval = max(30.0, self.settings.heartbeat_interval_seconds)
+            # 空闲活跃度直接缩放心跳周期：静默档可以间隔很远才醒一次，
+            # 睡眠本身不烧 token，真正省下的是"醒来之后要不要叫模型"。
+            interval *= max(0.3, float(self._idle()["heartbeat_scale"]))
             interval *= random.uniform(0.75, 1.35)
             try:
                 await self._heartbeat_tick()
@@ -6608,33 +6756,52 @@ class LongMemoryAgentPlugin(Star):
         if not self._ready() or self.interactions.is_quiet():
             return
         self._bind_gateway_client()
+        idle = self._idle()
+        level = self._idle_level()
         # 0) 记忆维护先做：压缩原来排在计划/消遣/潜水之后，而前面每个分支都会
         # return——计划一到期或随手消遣一次，这一轮就轮不到压缩，积压的消息
         # 迟迟不成摘要（跨会话问起来"它不知道刚才聊过什么"）。记忆是每轮都要
         # 保鲜的东西，所以提到最前面，且与后续动作互不挤占。
+        # 压缩本身要调模型，静默档把它降到"有积压才压、且一次只压一批"。
         try:
-            await self._compress_all_scopes()
+            await self._compress_all_scopes(rounds=1 if level == 1 else 2)
         except Exception as error:
             logger.warning("长程记忆：心跳压缩异常：%s", str(error)[:150])
         if self.memory_web is not None:
             try:
-                await self.memory_web.sync_pending()
+                await self.memory_web.sync_pending(
+                    limit=60 if level == 1 else 200)
             except Exception as error:
                 logger.warning("长程记忆：记忆网同步异常：%s", str(error)[:150])
-        # 1) 自我规划到期：把未来几小时排成日程
-        if time.monotonic() >= self._next_plan_at:
-            self._next_plan_at = time.monotonic() + max(1, self.settings.plan_interval_hours) * 3600
+        # 0.5) 太久没人说话就别自己找事做（低档位专属闸门）。
+        # 这是"一天没人聊天却烧掉几百万 token"的直接原因之一：群里静悄悄，
+        # 那边还在按小时排日程、逛空间、写总结——每一次都是一轮完整输入。
+        # 只有配了静默闸门的档位才去查"多久没人说话"（标准/活跃档不必多这一次查询）。
+        if int(idle["requires_activity_minutes"]) > 0:
+            silent = await self._silent_minutes()
+            if not idle_should_run(level, silent_minutes=silent):
+                logger.info("长程记忆：已静默 %.0f 分钟（空闲活跃度=%s档），本轮只潜水",
+                            silent, idle["name"])
+                await self._lurk_round()
+                return
+        # 1) 自我规划到期：把未来几小时排成日程（静默档不排）
+        if idle["plan_scale"] > 0 and time.monotonic() >= self._next_plan_at:
+            hours = self._scaled_interval(
+                self.settings.plan_interval_hours, idle["plan_scale"], 1)
+            self._next_plan_at = time.monotonic() + max(1, hours) * 3600
             await self._planning_round()
             return
-        # 2) 到点的计划事项
-        if self.storage:
+        # 2) 到点的计划事项（静默档不执行——只留着，等调高档次再跑）
+        if idle["plan_scale"] > 0 and self.storage:
             due = await self.storage.due_plans(limit=1)
             if due:
                 await self._run_plan_item(due[0])
                 return
         # 2.5) 话说到一半没人回？按节奏追问（需要的「聊天生动性」）
+        # 静默档不追问：那也是一次完整的模型调用
         try:
-            await self._follow_up_round()
+            if level > 1:
+                await self._follow_up_round()
         except Exception as error:
             logger.info("长程记忆：追问轮异常：%s", str(error)[:150])
         # 3) 闲时消遣（每小时限额，概率触发，别让人看起来像挂机脚本）
@@ -6643,11 +6810,14 @@ class LongMemoryAgentPlugin(Star):
         if hour_key != now.hour:
             self._idle_budget = (now.hour, 0)
             used = 0
-        if used >= self.settings.idle_actions_per_hour:
+        cap = idle["idle_actions_per_hour"]
+        per_hour = (int(self.settings.idle_actions_per_hour) if cap is None
+                    else int(cap))
+        if per_hour <= 0 or used >= per_hour:
             await self._lurk_round()
             return
         if random.random() < 0.35:
-            kind = idle_choice(now.hour)
+            kind = idle_choice(now.hour, level=level)
             if kind == "none":
                 await self._lurk_round()
                 return
@@ -8083,14 +8253,20 @@ class LongMemoryAgentPlugin(Star):
             logger.warning("长程记忆：SSH 环境：%s", self._ssh_env["error"])
 
     async def _style_learn_loop(self) -> None:
-        interval = max(1, self.settings.style_learn_hours) * 3600
         await asyncio.sleep(300)
         while not self._stopping:
+            # 档位缩放：静默档不学风格（每个群要喂上百条消息做一次长推断）
+            hours = self._scaled_interval(
+                self.settings.style_learn_hours,
+                float(self._idle()["style_scale"]), 1)
+            if hours <= 0:
+                await asyncio.sleep(600)
+                continue
             try:
                 await self._learn_styles_round()
             except Exception as error:
                 logger.warning("长程记忆：风格学习异常：%s", str(error)[:150])
-            await asyncio.sleep(interval + random.uniform(0, interval * 0.2))
+            await asyncio.sleep(hours * 3600 + random.uniform(0, hours * 720))
 
     async def _learn_group_culture(self, scope_id: str, provider: str,
                                    messages: "list[Any] | None" = None) -> dict[str, int]:
@@ -8307,6 +8483,17 @@ class LongMemoryAgentPlugin(Star):
                 messages = await self.storage.recent_messages(scope_id, 160)
             except Exception:
                 continue
+            # 窗口里最后一条没变过 → 学的还是同一批样本，跳过（一次要喂上百条）
+            fingerprint = str(messages[-1].message_id) if messages else ""
+            seen = getattr(self, "_style_seen", None)
+            if not isinstance(seen, dict):
+                seen = {}
+                self._style_seen = seen
+            if fingerprint and fingerprint == seen.get(scope_id):
+                continue
+            # 先记下：这一窗样本已经学过。写库/模型偶发失败不重学同一窗，
+            # 等群里来了新消息自然会再触发（否则一次失败会每小时重烧一遍）。
+            seen[scope_id] = fingerprint
             if provider:
                 # 群层面的文化（说话风格规律 + 黑话）——这块以前**从来没被调用过**，
                 # 所以"学来的风格/黑话"一直是空的；每轮顺手把这个群的也学一遍。
@@ -8470,7 +8657,12 @@ class LongMemoryAgentPlugin(Star):
         via a ~4% idle lottery — in practice both never moved on their own."""
         await asyncio.sleep(240)
         while not self._stopping:
-            interval = max(1, self.settings.mood_update_minutes) * 60
+            # 静默档关掉情绪自更新（每次都是一整轮模型调用，而它只是"换心情"）
+            scale = float(self._idle()["mood_scale"])
+            if scale <= 0:
+                await asyncio.sleep(600)
+                continue
+            interval = max(1, self.settings.mood_update_minutes) * 60 * scale
             try:
                 await self._mood_status_tick()
             except Exception as error:
@@ -8493,6 +8685,13 @@ class LongMemoryAgentPlugin(Star):
         )
         if not recent and not events:
             return
+        # 生活没变化就别再问一遍：情绪刷新的输入无外乎"最近几条消息 + 待处理事件"，
+        # 它们都没动的时候重问一次，答案只会一样——但每次都是一整轮输入 token。
+        fingerprint = (tuple(m.message_id for m in recent[-8:]),
+                       tuple(e.message_id for e in events[:5]))
+        if fingerprint == getattr(self, "_mood_fingerprint", None):
+            return
+        self._mood_fingerprint = fingerprint
         mood = self.mood.get()
         payload = compact_json(
             {
@@ -8537,14 +8736,20 @@ class LongMemoryAgentPlugin(Star):
                 logger.info("长程记忆：签名更新失败：%s", str(error)[:150])
 
     async def _reflection_loop(self) -> None:
-        interval = max(self.settings.self_reflect_interval_hours, 1) * 3600
         await asyncio.sleep(120)
         while not self._stopping:
+            # 档位缩放：静默档不做自我总结（每个群各一轮模型调用，很贵）
+            hours = self._scaled_interval(
+                self.settings.self_reflect_interval_hours,
+                float(self._idle()["reflect_scale"]), 1)
+            if hours <= 0:
+                await asyncio.sleep(600)
+                continue
             try:
                 await self._self_reflect_all()
             except Exception as error:
                 logger.warning("长程记忆：自我总结异常：%s\n%s", error, traceback.format_exc())
-            await asyncio.sleep(interval)
+            await asyncio.sleep(hours * 3600)
 
     async def _self_reflect_all(self) -> None:
         if not self._still_current_instance():
@@ -8556,8 +8761,18 @@ class LongMemoryAgentPlugin(Star):
             recent = await self.storage.recent_messages(scope, 5)
             if not recent:
                 continue
+            # 群里这几天没有任何新消息时，"自我总结"只会把同样的内容再总结一遍：
+            # 每个群一轮完整调用，一天下来就是纯浪费。按"最后一条消息"判断。
+            if str(recent[-1].message_id) == getattr(
+                    self, "_reflect_seen", {}).get(scope):
+                continue
             try:
                 result = await self._self_reflect(scope, group_id)
+                seen = getattr(self, "_reflect_seen", None)
+                if not isinstance(seen, dict):
+                    seen = {}
+                    self._reflect_seen = seen
+                seen[scope] = str(recent[-1].message_id)
                 logger.info(
                     "长程记忆：群%s自我总结完成，随后行动%s个",
                     group_id, result.get("actions", 0),
@@ -9482,9 +9697,16 @@ class LongMemoryAgentPlugin(Star):
         logger.info("长程记忆：%s", compact)
 
     async def _proactive_loop(self) -> None:
-        interval = max(self.settings.proactive_interval_minutes, 1) * 60
         await asyncio.sleep(120)
         while not self._stopping:
+            # 巡查本身是闲时开销：档位越低间隔越长，「静默」档完全不巡查
+            minutes = self._scaled_interval(
+                self.settings.proactive_interval_minutes,
+                float(self._idle()["proactive_scale"]), 1)
+            if minutes <= 0:
+                await asyncio.sleep(600)
+                continue
+            interval = minutes * 60
             try:
                 await self._proactive_round()
             except Exception as error:
@@ -11036,8 +11258,7 @@ class LongMemoryAgentPlugin(Star):
                     "conversation": dangling.conversation,
                     "last_thing_we_said": dangling.topic,
                     "how_long_they_are_silent": why,
-                    "now": timeutil.text("%Y-%m-%d %H:%M %A"),
-                    "time_of_day": self._time_of_day(timeutil.now().hour),
+                    **self._now_payload(),
                 }, 2000), system_prompt=brief + "\n\n" + self._now_brief())
             line = _bubble_text(self._sanitize_outgoing(raw))
         except Exception as error:

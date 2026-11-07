@@ -146,9 +146,128 @@ def part_of_day(hour: int) -> str:
     return "night"
 
 
-def idle_choice(hour: int, rng: random.Random | None = None) -> str:
-    """Weighted idle-kind pick for the current hour; 'none' means do nothing."""
+def idle_choice(hour: int, rng: random.Random | None = None,
+                *, level: int = 3) -> str:
+    """Weighted idle-kind pick for the current hour; 'none' means do nothing.
+
+    档位越省，抽到 'none' 的概率越高——它决定的是"闲时这一步到底要不要
+    真的叫一次模型"，而不是"少做点事"。
+    """
     rng = rng or random
-    weights = _IDLE_WEIGHTS[part_of_day(hour)]
-    kinds = list(weights)
+    weights = dict(_IDLE_WEIGHTS[part_of_day(hour)])
+    idle = idle_profile(level)
+    if idle["none_bias"]:
+        # 负偏置最多把 none 压到 0（choices 不接受负权重）
+        weights["none"] = max(0, weights.get("none", 0) + idle["none_bias"])
+    kinds = [kind for kind in weights if weights[kind] > 0] or ["none"]
     return rng.choices(kinds, weights=[weights[k] for k in kinds], k=1)[0]
+
+
+# ------------------------------------------------------------------ 空闲活跃度
+# 四档：闲时（既不主动聊天、也没人找它说话）这一路允许花掉多少。它不改
+# "正常回复"的任何行为——只决定后台那些自主动作（日程执行、闲时消遣、
+# 自我总结、情绪刷新、风格学习）多久跑一次、跑的时候能烧几轮。
+IDLE_LEVELS: dict[int, dict[str, Any]] = {
+    1: {
+        "name": "静默",
+        "desc": "只潜水与记消息，不主动做事；记忆照常压缩",
+        "idle_actions_per_hour": 0,
+        "none_bias": 1000,
+        "heartbeat_scale": 1.0,
+        "plan_scale": 0.0,
+        "reflect_scale": 0.0,
+        "mood_scale": 0.0,
+        "style_scale": 0.0,
+        "proactive_scale": 0.0,
+        "requires_activity_minutes": 0,
+        "loop_rounds": 1,
+        "max_actions": 1,
+    },
+    2: {
+        "name": "克制",
+        "desc": "偶尔做点小事，频率约为标准的一半",
+        "idle_actions_per_hour": 1,
+        "none_bias": 60,
+        "heartbeat_scale": 2.0,
+        "plan_scale": 2.0,
+        "reflect_scale": 2.0,
+        "mood_scale": 2.0,
+        "style_scale": 2.0,
+        "proactive_scale": 2.0,
+        "requires_activity_minutes": 60,
+        "loop_rounds": 1,
+        "max_actions": 2,
+    },
+    3: {
+        "name": "标准",
+        "desc": "按配置的节奏正常生活（默认）",
+        "idle_actions_per_hour": None,    # None = 跟随配置里的 idle_actions_per_hour
+        "none_bias": 0,
+        "heartbeat_scale": 1.0,
+        "plan_scale": 1.0,
+        "reflect_scale": 1.0,
+        "mood_scale": 1.0,
+        "style_scale": 1.0,
+        "proactive_scale": 1.0,
+        "requires_activity_minutes": 0,
+        "loop_rounds": 3,
+        "max_actions": 5,
+    },
+    4: {
+        "name": "活跃",
+        "desc": "更频繁地自己找事做，消耗也最高",
+        "idle_actions_per_hour": 8,
+        "none_bias": -10,                  # 抵消一部分 'none' 权重
+        "heartbeat_scale": 0.7,
+        "plan_scale": 0.75,
+        "reflect_scale": 0.75,
+        "mood_scale": 0.75,
+        "style_scale": 0.75,
+        "proactive_scale": 1.0,
+        "requires_activity_minutes": 0,
+        "loop_rounds": 3,
+        "max_actions": 5,
+    },
+}
+
+
+def idle_should_run(level: Any, *, silent_minutes: float) -> bool:
+    """这一档现在该不该真的叫模型去做闲时的事。
+
+    `silent_minutes` 是"最近一次有人说话距今多久"：档位低的配置只在群里
+    刚热闹过的时候才自己找事做——彻底没人聊的时候，它不该继续按小时烧 token。
+    """
+    profile = idle_profile(level)
+    limit = int(profile["requires_activity_minutes"])
+    if limit <= 0:
+        return True
+    return float(silent_minutes) <= float(limit)
+
+
+def idle_profile(level: Any) -> dict[str, Any]:
+    """把配置里的档位数字换成可用的节奏参数（越界一律按标准）。"""
+    try:
+        key = int(level)
+    except (TypeError, ValueError):
+        key = 3
+    return IDLE_LEVELS.get(key, IDLE_LEVELS[3])
+
+
+def idle_level_info(level: Any, *, configured_actions: int = 0) -> dict[str, Any]:
+    """控制台/工具共用的档位说明（含该档实际生效的每小时闲时上限）。"""
+    profile = idle_profile(level)
+    cap = profile["idle_actions_per_hour"]
+    effective = int(configured_actions or 0) if cap is None else int(cap)
+    return {
+        "level": int(level) if str(level).strip().isdigit() else 3,
+        "name": profile["name"],
+        "desc": profile["desc"],
+        "idle_actions_per_hour": effective,
+        "requires_activity_minutes": profile["requires_activity_minutes"],
+        "loop_rounds": profile["loop_rounds"],
+        "max_actions": profile["max_actions"],
+        "levels": [
+            {"level": key, "name": value["name"], "desc": value["desc"]}
+            for key, value in sorted(IDLE_LEVELS.items())
+        ],
+    }

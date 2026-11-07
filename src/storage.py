@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS user_styles(scope_id TEXT NOT NULL REFERENCES scopes(
 CREATE TABLE IF NOT EXISTS standing_intents(intent_id TEXT PRIMARY KEY,scope_id TEXT REFERENCES scopes(scope_id) ON DELETE CASCADE,instruction TEXT NOT NULL,keywords_json TEXT NOT NULL,remaining INTEGER NOT NULL DEFAULT -1,cooldown_seconds INTEGER NOT NULL DEFAULT 0,last_fired TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_todos(todo_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL,content TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',position INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_agent_todos_scope ON agent_todos(scope_id,status,position);
-CREATE TABLE IF NOT EXISTS usage_stats(day TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',calls INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(day,scope_id));
+CREATE TABLE IF NOT EXISTS usage_stats(day TEXT NOT NULL,scope_id TEXT NOT NULL DEFAULT '',calls INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,cached_tokens INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(day,scope_id));
 CREATE INDEX IF NOT EXISTS idx_revision_sender_time ON message_revisions(sender_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_summary_scope_level ON summary_nodes(scope_id,level,status,start_seq,end_seq);
 CREATE INDEX IF NOT EXISTS idx_catalog_scope_updated ON catalog_entries(scope_id,updated_at);
@@ -122,6 +122,7 @@ class Storage:
         await self.db.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
         await self._add_scope_tag_column()
+        await self._add_usage_cached_column()
         await self._load_table_columns()
         return self
 
@@ -384,37 +385,56 @@ class Storage:
 
     # ---- 用量统计（openclaw usage-tracking 移植） ----
     async def add_usage(self, calls: int = 1, prompt_tokens: int = 0,
-                        completion_tokens: int = 0, scope_id: str = "") -> None:
+                        completion_tokens: int = 0, scope_id: str = "",
+                        cached_tokens: int = 0) -> None:
+        """记一次调用。
+
+        `cached_tokens` 是**输入里命中缓存的那些**（OpenAI 的
+        prompt_tokens_details.cached_tokens / Anthropic 的
+        cache_read_input_tokens）：它不计入 prompt_tokens 之外，只是把
+        输入拆成"命中/未命中"两半，用来算缓存命中率。
+        """
         day = time.strftime("%Y-%m-%d", time.gmtime())
+        cached = max(0, int(cached_tokens))
+        prompt = max(0, int(prompt_tokens))
         async with self._write_lock:
             await self._conn().execute(
-                "INSERT INTO usage_stats(day,scope_id,calls,prompt_tokens,completion_tokens,updated_at) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(day,scope_id) DO UPDATE SET "
+                "INSERT INTO usage_stats(day,scope_id,calls,prompt_tokens,"
+                "completion_tokens,cached_tokens,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(day,scope_id) DO UPDATE SET "
                 "calls=usage_stats.calls+excluded.calls,"
                 "prompt_tokens=usage_stats.prompt_tokens+excluded.prompt_tokens,"
                 "completion_tokens=usage_stats.completion_tokens+excluded.completion_tokens,"
+                "cached_tokens=usage_stats.cached_tokens+excluded.cached_tokens,"
                 "updated_at=excluded.updated_at",
-                (day, scope_id, max(0, int(calls)), max(0, int(prompt_tokens)),
-                 max(0, int(completion_tokens)), utc_now()))
+                (day, scope_id, max(0, int(calls)), prompt, max(0, int(completion_tokens)),
+                 min(cached, prompt), utc_now()))
             await self._conn().commit()
 
     async def usage_summary(self, days: int = 7) -> dict[str, Any]:
         limit = min(max(int(days), 1), 90)
         rows = await self._fetchall(
             "SELECT day,SUM(calls) AS calls,SUM(prompt_tokens) AS pt,"
-            "SUM(completion_tokens) AS ct FROM usage_stats GROUP BY day "
-            "ORDER BY day DESC LIMIT ?", (limit,))
+            "SUM(completion_tokens) AS ct,SUM(cached_tokens) AS cached "
+            "FROM usage_stats GROUP BY day ORDER BY day DESC LIMIT ?", (limit,))
         daily = [
             {"day": str(row["day"]), "calls": int(row["calls"] or 0),
-             "prompt_tokens": int(row["pt"] or 0), "completion_tokens": int(row["ct"] or 0)}
+             "prompt_tokens": int(row["pt"] or 0),
+             "completion_tokens": int(row["ct"] or 0),
+             "cached_tokens": int(row["cached"] or 0),
+             "cache_rate": _cache_rate(int(row["cached"] or 0), int(row["pt"] or 0))}
             for row in rows
         ]
+        prompt_total = sum(d["prompt_tokens"] for d in daily)
+        cached_total = sum(d["cached_tokens"] for d in daily)
         return {
             "daily": daily,
             "totals": {
                 "calls": sum(d["calls"] for d in daily),
-                "prompt_tokens": sum(d["prompt_tokens"] for d in daily),
+                "prompt_tokens": prompt_total,
                 "completion_tokens": sum(d["completion_tokens"] for d in daily),
+                "cached_tokens": cached_total,
+                "cache_rate": _cache_rate(cached_total, prompt_total),
             },
         }
 
@@ -2190,6 +2210,18 @@ class Storage:
         except Exception:
             pass
 
+    async def _add_usage_cached_column(self) -> None:
+        """老库补 `usage_stats.cached_tokens`（输入里命中缓存的部分）。"""
+        try:
+            await self._conn().execute(
+                "ALTER TABLE usage_stats ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass          # 列已存在
+        try:
+            await self._conn().commit()
+        except Exception:
+            pass
+
     # ---------------------------------------------------------- 群配置（每群一套参数）
     _GROUP_FIELDS = ("tag", "activity", "reply_rate", "cooldown_scale",
                      "quiet_hours", "max_actions_per_hour", "note")
@@ -2477,6 +2509,13 @@ def _ledger_entry(row: Any) -> Any:
 
 def _limit(value: int, high: int) -> int:
     return min(max(int(value), 1), high)
+
+
+def _cache_rate(cached: int, prompt: int) -> float:
+    """输入缓存命中率（0~1，两位小数；没有输入时按 0）。"""
+    if prompt <= 0 or cached <= 0:
+        return 0.0
+    return round(min(1.0, float(cached) / float(prompt)), 2)
 
 
 def _escape_like(value: str) -> str:

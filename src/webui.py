@@ -53,6 +53,7 @@ READ_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("tasks", "任务队列"),
     ("injections", "提示词注入"),
     ("context_detail", "上下文详细程度"),
+    ("idle_activity", "空闲活跃度"),
     ("memory_web", "记忆网（MemoryWeb）"),
     ("memory_web_node", "记忆网节点详情"),
     ("memory_web_neighbourhood", "记忆网邻域子图"),
@@ -93,6 +94,7 @@ WRITE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("injection_toggle", "开关提示词注入"),
     ("injection_delete", "删除自定义注入"),
     ("context_detail_set", "切换上下文详细程度（压缩档次）"),
+    ("idle_activity_set", "切换空闲活跃度（闲时消耗档位）"),
     ("web_node_update", "修改记忆网节点（标签/权重/状态/备注）"),
     ("web_rebuild", "重建记忆网"),
     ("web_branch_create", "创建记忆分支"),
@@ -738,6 +740,28 @@ class PageAPI:
         if not callable(getter):
             raise WebUIError("上下文详细程度不可用")
         return getter()
+
+    async def _read_idle_activity(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        """空闲活跃度：当前档位 + 该档实际生效的闲时节流节奏。"""
+        getter = getattr(self.host, "_idle_level_info", None)
+        if not callable(getter):
+            raise WebUIError("空闲活跃度不可用")
+        return getter()
+
+    async def _do_idle_activity_set(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """切换空闲活跃度（只影响后台自主动作，不动正常回复）。"""
+        setter = getattr(self.host, "_set_idle_level", None)
+        if not callable(setter):
+            raise WebUIError("空闲活跃度不可用")
+        try:
+            level = int(body.get("level"))
+        except (TypeError, ValueError):
+            raise WebUIError("level 要是 1~4 的整数")
+        try:
+            info = setter(level)
+        except ValueError as error:
+            raise WebUIError(str(error)[:120])
+        return {"ok": True, **info}
 
     async def _do_web_node_update(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """改节点：标签 / 权重 / 状态 / 备注（只动展示层，不动来源与检索）。"""
